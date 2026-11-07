@@ -446,6 +446,23 @@ fn protect_extracted_tree(_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// `ly build` and `ly dev` build with `docker buildx`, which some distribution
+/// packages (Ubuntu's `docker.io`) leave out; without it they fail with an
+/// unhelpful `unknown flag: --builder`.
+fn buildx_version(docker: &Path) -> std::result::Result<String, String> {
+    const HINT: &str = "Docker Buildx is missing; install docker-buildx (or Docker's own packages)";
+    let output = std::process::Command::new(docker)
+        .args(["buildx", "version"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|error| format!("{HINT}: {error}"))?;
+    if !output.status.success() {
+        return Err(HINT.to_owned());
+    }
+    let version = String::from_utf8_lossy(&output.stdout);
+    Ok(version.lines().next().unwrap_or("available").trim().to_owned())
+}
+
 pub fn doctor(root: Option<&Path>) -> Result<()> {
     use std::io::IsTerminal;
 
@@ -498,7 +515,18 @@ pub fn doctor(root: Option<&Path>) -> Result<()> {
     }
     for tool in ["docker", "kubectl"] {
         match which::which(tool) {
-            Ok(path) => report(true, tool, &path.display().to_string()),
+            Ok(path) => {
+                report(true, tool, &path.display().to_string());
+                if tool == "docker" {
+                    match buildx_version(&path) {
+                        Ok(version) => report(true, "buildx", &version),
+                        Err(error) => {
+                            report(false, "buildx", &error);
+                            failures += 1;
+                        }
+                    }
+                }
+            }
             Err(_) => {
                 report(false, tool, "not on PATH");
                 failures += 1;
@@ -539,6 +567,39 @@ mod tests {
     use std::io::{BufRead, BufReader};
     use std::net::TcpListener;
     use std::time::Instant;
+
+    #[cfg(unix)]
+    fn fake_docker(directory: &Path, script: &str) -> Result<PathBuf> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = directory.join("docker");
+        std::fs::write(&path, format!("#!/bin/sh\n{script}\n"))?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+        Ok(path)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn buildx_check_reports_the_version_or_the_fix() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let present = fake_docker(
+            directory.path(),
+            r#"[ "$1 $2" = "buildx version" ] && echo "github.com/docker/buildx v0.30.1 abc" && exit 0; exit 1"#,
+        )?;
+        assert_eq!(
+            buildx_version(&present).unwrap(),
+            "github.com/docker/buildx v0.30.1 abc"
+        );
+        let other = directory.path().join("missing");
+        std::fs::create_dir(&other)?;
+        let missing = fake_docker(
+            &other,
+            "echo \"docker: unknown command: docker buildx\" >&2; exit 1",
+        )?;
+        let error = buildx_version(&missing).unwrap_err();
+        assert!(error.contains("install docker-buildx"), "{error}");
+        Ok(())
+    }
 
     #[cfg(unix)]
     #[test]
