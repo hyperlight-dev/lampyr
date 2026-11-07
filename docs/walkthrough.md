@@ -27,7 +27,7 @@ Output:
 
 ```expected-contains
 Lampyr doctor
-[ok] ly 0.1.0
+[ok] ly 0.1.1
 [ok] platform $REPO_ROOT
 Ready.
 ```

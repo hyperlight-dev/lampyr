@@ -4,6 +4,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Prerelease] - Unreleased
 
+## [0.1.1] - 2026-11-07
+
 ### Fixed
 
 - `ly doctor` checks for Docker Buildx, which `ly build` and `ly dev` need and Ubuntu's `docker.io` package leaves out, instead of reporting Ready and leaving them to fail with `unknown flag: --builder`.
