@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Fixed
 
 - `ly doctor` checks for Docker Buildx, which `ly build` and `ly dev` need and Ubuntu's `docker.io` package leaves out, instead of reporting Ready and leaving them to fail with `unknown flag: --builder`.
+- `ly --version` (and `-V`) prints the version and build commit, as `ly doctor` does, instead of failing with `unexpected argument`.
 
 ## [0.1.0] - 2026-11-07
 

@@ -7,7 +7,18 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "ly", about = "Create, deploy, and operate Lampyr Services")]
+#[command(
+    name = "ly",
+    about = "Create, deploy, and operate Lampyr Services",
+    version = concat!(
+        env!("CARGO_PKG_VERSION"),
+        " (commit ",
+        env!("LAMPYR_BUILD_COMMIT"),
+        ", ",
+        env!("LAMPYR_BUILD_STATE"),
+        ")"
+    )
+)]
 struct Cli {
     #[arg(long, global = true)]
     verbose: bool,

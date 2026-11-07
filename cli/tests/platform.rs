@@ -27,6 +27,22 @@ fn doctor_reports_build_commit_and_dirty_state() {
 }
 
 #[test]
+fn version_flag_prints_the_version_and_build() {
+    for flag in ["--version", "-V"] {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_ly"))
+            .arg(flag)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{flag}: {output:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.starts_with(&format!("ly {} (commit ", env!("CARGO_PKG_VERSION"))),
+            "{flag}: {stdout}"
+        );
+    }
+}
+
+#[test]
 fn build_metadata_does_not_watch_missing_tracked_directories() {
     use std::process::Command;
 
