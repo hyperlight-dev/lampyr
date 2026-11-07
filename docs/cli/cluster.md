@@ -35,8 +35,8 @@ build/ly cluster uninstall --context customer
 ```
 
 The defaults are `ghcr.io/hyperlight-dev/lampyr/fiberd:preview` and
-`ghcr.io/hyperlight-dev/lampyr/fiber-router:preview`. Authenticate the cluster
-to the private preview registry or preload those images before installation.
+`ghcr.io/hyperlight-dev/lampyr/fiber-router:preview`. The images are public on
+GHCR; an offline cluster can preload them before installation.
 The local ingress defaults use NodePorts `30080` and `30443`; use
 `--provider-config platform.yaml` to override the images, ingress, domain, or
 HTTPS port for a managed cluster.

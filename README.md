@@ -1,7 +1,7 @@
 <div align="center">
   <img src="site/src/assets/lampyr-mark.svg" alt="Lampyr firefly mark" width="96" height="96" />
   <h1>Lampyr</h1>
-  <p><strong>Lightweight services with fast, hardware-isolated activation.</strong></p>
+  <p><strong>Serverless on Kubernetes where every request runs in its own hardware-isolated micro-VM, restored from a snapshot in milliseconds.</strong></p>
   <p>Lampyr is part of <a href="https://github.com/hyperlight-dev/hyperlight">Hyperlight</a>, a <a href="https://cncf.io/">Cloud Native Computing Foundation</a> sandbox project.</p>
   <p>
     <a href="docs/walkthrough.md">Walkthrough</a>
@@ -37,15 +37,20 @@ short-lived, hardware-isolated microVMs when work arrives.
 
 ## Getting started
 
-### Build the CLI
+### Install the CLI
 
-Release binaries are not published yet. Build `ly` from a checkout:
+Install `ly` and its platform bundle from the latest release on Linux/amd64 or
+macOS/arm64. The installer checks every archive's checksum and GitHub
+attestation; see [`ly setup`](docs/cli/setup.md) for the verified install.
 
 ```bash
-git clone https://github.com/hyperlight-dev/lampyr.git
-cd lampyr
-just build-ly
+gh release download v0.1.0 --repo hyperlight-dev/lampyr --pattern install-ly.sh
+bash install-ly.sh v0.1.0
+export PATH="$HOME/.local/bin:$PATH"
+ly doctor
 ```
+
+To build `ly` from a checkout instead, run `just build-ly`.
 
 ### Walkthrough
 

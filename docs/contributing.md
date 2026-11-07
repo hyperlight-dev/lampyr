@@ -256,9 +256,9 @@ checksummed and attested release asset; it similarly checks strict SHA-256 files
 and exact-commit GitHub attestations for the CLI and platform archives before
 installation.
 
-To consume the images from another registry, authenticate `gh` to the private
-repository and attestations, authenticate Docker to private GHCR and to the
-destination registry, and use Docker Buildx:
+To consume the images from another registry, authenticate `gh` for
+attestations, authenticate Docker to the destination registry, and use Docker
+Buildx:
 
 ```bash
 gh auth status --hostname github.com
