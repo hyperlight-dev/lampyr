@@ -13,15 +13,31 @@ ly doctor
 
 ## Required locally
 
-- **Docker** builds service filesystems and OCI images. The Kind and k3d providers
-  also use the Docker daemon through Lampyr's authenticated bridge.
+- **Docker with Buildx** builds service filesystems and OCI images. The Kind and
+  k3d providers also use the Docker daemon through Lampyr's authenticated
+  bridge. Ubuntu's `docker.io` package does not include Buildx; install
+  `docker-buildx` as well, or use Docker's own packages.
 - **KVM** must be available read/write at `/dev/kvm` for `ly dev`, local
-  snapshots, and local Kind/k3d workloads.
+  snapshots, and local Kind/k3d workloads. On most Linux distributions
+  `/dev/kvm` belongs to the `kvm` group, so add your user to it.
+- **gh**, the GitHub CLI, authenticated with `gh auth login`, to install a
+  release: the installer downloads it and verifies its GitHub attestations.
 - **kubectl** must be available for Kubernetes lifecycle and service
   operations.
 
 Host Kind and k3d are not required. Each provider packages its own cluster and
 Docker clients.
+
+On Ubuntu 24.04, for example:
+
+```bash
+sudo apt-get install -y docker.io docker-buildx gh jq curl
+sudo snap install kubectl --classic
+sudo usermod -aG docker,kvm "$USER"
+```
+
+Log out and back in so the new groups apply, then run `gh auth login` and
+`ly doctor`.
 
 ## Kubernetes
 

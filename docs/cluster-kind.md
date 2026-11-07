@@ -20,6 +20,14 @@ silently delete or replace it.
 
 ## Install
 
+With `ly` installed from a release (see the
+[README](../README.md#install-the-cli)), the platform already carries the
+provider, runtime images and fiberd-k8s-controller inputs:
+
+```bash
+ly cluster install --provider kind --allow-docker
+```
+
 From a repository checkout:
 
 ```bash

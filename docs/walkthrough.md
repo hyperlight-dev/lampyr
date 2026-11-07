@@ -11,11 +11,11 @@ Create a Lampyr Service, run it locally, and deploy it to Kind.
 
 ## Before you start
 
-The `ly` CLI must be on your `PATH`. Follow
-[Build from source](contributing.md#build-from-source) to build it or install it from
-the releases page. The [local requirements](requirements.md)
-include Docker and read/write access to KVM; `ly doctor` checks those and the
-remaining build requirements.
+The `ly` CLI must be on your `PATH`. Install it from a release as the
+[README](../README.md#install-the-cli) shows, or follow
+[Build from source](contributing.md#build-from-source). The
+[local requirements](requirements.md) include Docker with Buildx and read/write
+access to KVM; `ly doctor` checks those and the remaining build requirements.
 
 Check the local prerequisites first:
 
@@ -32,7 +32,7 @@ Lampyr doctor
 Ready.
 ```
 
-Scaffold a temporary Workspace inside the checkout:
+Scaffold a temporary Workspace in the current directory:
 
 ```bash markmason
 workspace=$(mktemp -d "$PWD/.lampyr-walkthrough.XXXXXX")
@@ -44,6 +44,9 @@ printf 'registryPort: %s\n' "$registry_port" > provider.yaml
 ```
 
 ## Create a Kind cluster
+
+With `ly` installed from a release, skip to `ly cluster install` below: the
+release's platform carries everything the cluster needs.
 
 From a checkout, prepare the guest and runtime images once, outside installation:
 
