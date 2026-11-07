@@ -1,0 +1,109 @@
+# The Hyperlight device plugin from hyperlight-dev/hyperlight-on-kubernetes,
+# with its names, so a cluster that already runs it reconciles the same objects.
+# It shares /dev/kvm: each Grant home requests one hyperlight.dev/hypervisor,
+# and DEVICE_COUNT of them fit on a node. Devices reach Pods through CDI.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: hyperlight-system
+  labels:
+    app.kubernetes.io/name: hyperlight-system
+    app.kubernetes.io/part-of: hyperlight
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: hyperlight-device-plugin
+  namespace: hyperlight-system
+  labels:
+    app.kubernetes.io/name: hyperlight-device-plugin
+    app.kubernetes.io/part-of: hyperlight
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: hyperlight-device-plugin
+  namespace: hyperlight-system
+  labels:
+    app.kubernetes.io/name: hyperlight-device-plugin
+    app.kubernetes.io/part-of: hyperlight
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: hyperlight-device-plugin
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: hyperlight-device-plugin
+        app.kubernetes.io/part-of: hyperlight
+    spec:
+      serviceAccountName: hyperlight-device-plugin
+      nodeSelector:
+        kubernetes.io/os: linux
+        kubernetes.io/arch: amd64
+      priorityClassName: system-node-critical
+      containers:
+        - name: device-plugin
+          image: ghcr.io/hyperlight-dev/hyperlight-device-plugin:cc35896@sha256:a290a5087d6afe28cf7d469e0ea34e8831e52d39a0f63be097b2398341f0f5fd
+          imagePullPolicy: IfNotPresent
+          env:
+            # Allocations per node, not devices: every allocation is the same /dev/kvm.
+            - name: DEVICE_COUNT
+              value: "2000"
+            # Grant homes run as root; the device node in them is owned to match.
+            - name: DEVICE_UID
+              value: "0"
+            - name: DEVICE_GID
+              value: "0"
+          securityContext:
+            privileged: false
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            # Writes the kubelet socket and the CDI spec, in root-owned host directories.
+            runAsUser: 0
+          volumeMounts:
+            - name: device-plugin
+              mountPath: /var/lib/kubelet/device-plugins
+            - name: cdi
+              mountPath: /var/run/cdi
+            # Only /dev/kvm, not all of /dev: the plugin then serves KVM (it
+            # prefers /dev/mshv when it sees one), and on Kind the kubelet can
+            # still write the termination log under /dev.
+            - name: kvm
+              mountPath: /dev/kvm
+              readOnly: true
+          resources:
+            requests:
+              memory: 32Mi
+              cpu: 10m
+            limits:
+              memory: 64Mi
+              cpu: 100m
+          livenessProbe:
+            exec:
+              command:
+                - test
+                - -S
+                - /var/lib/kubelet/device-plugins/hyperlight.sock
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            timeoutSeconds: 5
+      volumes:
+        - name: device-plugin
+          hostPath:
+            path: /var/lib/kubelet/device-plugins
+            type: Directory
+        - name: cdi
+          hostPath:
+            path: /var/run/cdi
+            type: DirectoryOrCreate
+        - name: kvm
+          hostPath:
+            path: /dev/kvm
+            type: CharDevice
+      terminationGracePeriodSeconds: 30

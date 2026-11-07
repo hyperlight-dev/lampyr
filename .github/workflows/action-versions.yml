@@ -1,0 +1,29 @@
+name: Action versions
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  current:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Verify action versions
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [[ "${GITHUB_EVENT_NAME}" == "pull_request" ]]; then
+            ./hack/update-actions.sh --check-added "origin/${GITHUB_BASE_REF}...HEAD"
+          else
+            ./hack/update-actions.sh --check
+          fi

@@ -1,0 +1,48 @@
+# kube-prometheus-stack settings for the tour: Prometheus, Grafana,
+# kube-state-metrics and cAdvisor (through the kubelet). Not for production.
+alertmanager:
+  enabled: false
+nodeExporter:
+  enabled: false
+prometheus:
+  prometheusSpec:
+    scrapeInterval: 5s
+    evaluationInterval: 5s
+    retention: 6h
+    podMonitorSelectorNilUsesHelmValues: false
+    serviceMonitorSelectorNilUsesHelmValues: false
+    resources:
+      requests:
+        memory: 256Mi
+grafana:
+  adminPassword: lampyr-demo
+  grafana.ini:
+    auth.anonymous:
+      enabled: true
+      org_role: Viewer
+    dashboards:
+      default_home_dashboard_path: /tmp/dashboards/lampyr.json
+  sidecar:
+    dashboards:
+      enabled: true
+      label: grafana_dashboard
+      searchNamespace: monitoring
+    datasources:
+      # Alertmanager is disabled above, so don't provision its datasource.
+      alertmanager:
+        enabled: false
+# Home pods are found by label, not name: cAdvisor's memory series are joined
+# with kube_pod_labels, which only carries allowlisted labels.
+kube-state-metrics:
+  metricLabelsAllowlist:
+    - pods=[lampyr.dev/home,serving.knative.dev/service]
+defaultRules:
+  create: false
+kubeEtcd:
+  enabled: false
+kubeControllerManager:
+  enabled: false
+kubeScheduler:
+  enabled: false
+kubeProxy:
+  enabled: false

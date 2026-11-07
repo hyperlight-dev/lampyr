@@ -1,0 +1,19 @@
+FROM mcr.microsoft.com/dotnet/sdk:9.0-alpine AS build
+
+WORKDIR /src
+COPY .lampyr-adapter/LampyrService.csproj .lampyr-adapter/Program.cs .lampyr-adapter/Types.cs ./.lampyr-adapter/
+COPY Handler.cs ./
+RUN dotnet publish -c Release -r linux-musl-x64 --self-contained \
+  -p:PublishTrimmed=true \
+  -p:InvariantGlobalization=true \
+  -p:AssemblyName=LampyrService \
+  .lampyr-adapter/LampyrService.csproj \
+  -o /out
+RUN /out/LampyrService --check
+
+FROM hluk-dotnet-aot-rootfs:latest AS rootfs
+COPY --from=build /out/ /app/
+COPY --from=build /usr/lib/libstdc++.so.6 /usr/lib/libstdc++.so.6
+COPY --from=build /usr/lib/libgcc_s.so.1 /usr/lib/libgcc_s.so.1
+COPY --from=build /usr/lib/libssl.so.3 /usr/lib/libssl.so.3
+COPY --from=build /usr/lib/libcrypto.so.3 /usr/lib/libcrypto.so.3

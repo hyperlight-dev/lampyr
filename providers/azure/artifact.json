@@ -1,0 +1,43 @@
+{
+  "protocolVersion": 1,
+  "id": "azure",
+  "version": "0.3.0",
+  "runtimeVersion": "0.21.0",
+  "memoryMiB": 2048,
+  "environment": {
+    "PATH": "/usr/local/bin:/usr/bin:/bin",
+    "HOME": "/root",
+    "AZURE_CONFIG_DIR": "/auth",
+    "AZURE_CORE_COLLECT_TELEMETRY": "no",
+    "AZURE_CORE_LOGIN_EXPERIENCE_V2": "off",
+    "AZURE_EXTENSION_USE_DYNAMIC_INSTALL": "no",
+    "AZURE_BICEP_USE_BINARY_FROM_PATH": "true",
+    "DOTNET_SYSTEM_GLOBALIZATION_INVARIANT": "1",
+    "DOTNET_BUNDLE_EXTRACT_BASE_DIR": "/tmp/lampyr-dotnet-bundles",
+    "DOTNET_EnableWriteXorExecute": "0",
+    "COMPlus_EnableDiagnostics": "0",
+    "DOTNET_GCHeapHardLimitPercent": "0x32",
+    "DOTNET_gcServer": "0",
+    "DOTNET_gcConcurrent": "0",
+    "DOTNET_DefaultStackSize": "0x40000",
+    "DOTNET_ThreadPool_ForceMinWorkerThreads": "1",
+    "DOTNET_ThreadPool_ForceMaxWorkerThreads": "4"
+  },
+  "networkHosts": ["management.azure.com", "login.microsoftonline.com", "login.windows.net"],
+  "sourceKinds": [
+    {"apiVersion": "eventing.knative.dev/v1", "kind": "Broker"},
+    {"apiVersion": "eventing.knative.dev/v1", "kind": "Trigger"},
+    {"apiVersion": "sources.lampyr.dev/v1alpha1", "kind": "AzureEventGridSource"}
+  ],
+  "operations": {
+    "describe": [],
+    "init": ["workspace-read", "workspace-scaffold", "state", "network", "auth-cache"],
+    "apply": ["workspace-read", "state", "network", "auth-cache", "provider-manifests"],
+    "inspect": ["workspace-read", "state", "network", "auth-cache"],
+    "connect": ["workspace-read", "state", "network", "auth-cache"],
+    "delete": ["workspace-read", "state", "network", "auth-cache"],
+    "source-create": ["workspace-read", "state"],
+    "source-status": [],
+    "source-delete": []
+  }
+}

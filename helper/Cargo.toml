@@ -1,0 +1,39 @@
+[package]
+name = "lampyr-hluk-helper"
+# Part of every park's platform: change it when the park layout or the
+# protocol this helper speaks changes, not with Lampyr's release.
+version = "0.3.0"
+edition = "2024"
+rust-version = "1.91"
+publish = false
+description = "fiberd helper that runs Lampyr snapshots as hyperlight-unikraft micro-VM fibers"
+
+[[bin]]
+name = "lampyr-hluk-helper"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+# sock_diag, and SO_COOKIE, SO_ACCEPTCONN and fstat on the guest's
+# listening sockets; already in the tree through hyperlight-unikraft.
+rustix = { version = "1", features = ["fs", "net"] }
+# SO_BINDTODEVICE, which rustix does not read, and pthread_kill and
+# sigaction, to wake a fiber's thread out of a step's wait (src/nudge.rs);
+# already in the tree through hyperlight.
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# The library alone: the CLI's registry, TOML and archive clients are not
+# needed to restore a snapshot. The tag is the one `ly build` snapshots with
+# (cli/src/assets.rs), and the helper refuses snapshots from any other. Git,
+# not crates.io, because build.rs takes that commit from Cargo.lock.
+hyperlight-unikraft = { git = "https://github.com/hyperlight-dev/hyperlight-unikraft", tag = "v0.21.0", default-features = false }
+
+[dev-dependencies]
+# setrlimit, for the test that holds thousands of descriptors, and poll,
+# for the one that wakes a thread out of it.
+rustix = { version = "1", features = ["event", "process"] }
+tempfile = "3"
+
+[profile.release]
+opt-level = 2

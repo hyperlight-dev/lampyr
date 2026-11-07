@@ -1,0 +1,40 @@
+# Lets Prometheus scrape fiber-router's metrics port. The platform's
+# NetworkPolicy admits only the kourier-system and knative-eventing
+# namespaces and two controllers in knative-serving (Kourier's and
+# Lampyr's) to the router, on port 8080; this adds the monitoring namespace,
+# for port 9090 only.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: fiber-router-metrics
+  namespace: lampyr-system
+spec:
+  podSelector:
+    matchLabels:
+      app: fiber-router
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - protocol: TCP
+          port: 9090
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: fiber-router
+  namespace: monitoring
+spec:
+  namespaceSelector:
+    matchNames:
+      - lampyr-system
+  selector:
+    matchLabels:
+      app: fiber-router
+  podMetricsEndpoints:
+    - port: metrics
+      interval: 5s

@@ -1,0 +1,9 @@
+{
+  "schemaVersion": "lampyr.dev/service-template/v1alpha1",
+  "runtime": "nodejs",
+  "templateVersion": "0.1.1",
+  "entrypoint": "/app/server.js",
+  "userOwned": [".gitignore", "Dockerfile", "Dockerfile.rootfs", "lampyr.yaml", "package.json", "package-lock.json", "application.js", "server.js"],
+  "adapterOwned": [],
+  "machineState": [".lampyr/"]
+}

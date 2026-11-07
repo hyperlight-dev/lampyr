@@ -1,0 +1,87 @@
+set shell := ["bash", "-euo", "pipefail", "-c"]
+
+project-root := source_directory()
+oras-version := "1.3.6"
+oras-sha256 := "66fb0ad7206f3f6fa77ed5b552049d364ccf4b50b1684554f731f76302b52ca0"
+
+# Install the checksum-pinned ORAS binary used by the offline graph test.
+install-oras:
+    if [ -x "{{project-root}}/../build/tools/oras" ] && \
+        "{{project-root}}/../build/tools/oras" version | grep -Eq '^Version:[[:space:]]+{{oras-version}}$'; then exit 0; fi; \
+    [ "$(uname -sm)" = "Linux x86_64" ] || { echo "install-oras supports linux-amd64 only" >&2; exit 1; }; \
+    dir=$(mktemp -d); \
+    trap 'rm -rf "$dir"' EXIT; \
+    curl --fail --silent --show-error --location --output "$dir/oras.tar.gz" \
+        "https://github.com/oras-project/oras/releases/download/v{{oras-version}}/oras_{{oras-version}}_linux_amd64.tar.gz"; \
+    echo "{{oras-sha256}}  $dir/oras.tar.gz" | sha256sum --check; \
+    mkdir -p "{{project-root}}/../build/tools"; \
+    tar --extract --gzip --file "$dir/oras.tar.gz" --directory "{{project-root}}/../build/tools" oras
+
+# Assemble available native variants into a portable provider artifact, without network access.
+[positional-arguments]
+[no-cd]
+snapshot-assemble artifact output *variants:
+    artifact="$1"; output="$2"; shift 2; \
+    args=(); for variant in "$@"; do args+=(--variant "$variant"); done; \
+    python3 "{{project-root}}/snapshot_oci.py" assemble --artifact "$artifact" --output "$output" "${args[@]}"
+
+# Explicitly publish an assembled index and emit a provider with the complete local OCI layout.
+[positional-arguments]
+[no-cd]
+snapshot-publish artifact repository tag output:
+    python3 "{{project-root}}/snapshot_oci.py" publish --artifact "$1" --repository "$2" --tag "$3" --output "$4"
+
+# Attach an assembled snapshot OCI layout to another platform's cold provider artifact.
+[positional-arguments]
+[no-cd]
+snapshot-bind artifact index-artifact repository output:
+    python3 "{{project-root}}/snapshot_oci.py" bind --artifact "$1" --index-artifact "$2" --repository "$3" --output "$4"
+
+# Build every maintained provider cold artifact for one host/guest platform.
+[positional-arguments]
+[no-cd]
+build-platform-artifacts output guest-platform cold-os cold-architecture:
+    test ! -e "$1"
+    mkdir -p "$1"
+    just --justfile "{{project-root}}/kind/Justfile" build none "$2" "$3" "$4"
+    cp -a "{{project-root}}/kind/build/rootfs" "$1/kind"
+    just --justfile "{{project-root}}/k3d/Justfile" build none "$2" "$3" "$4"
+    cp -a "{{project-root}}/k3d/build/rootfs" "$1/k3d"
+    just --justfile "{{project-root}}/azure/Justfile" build rootfs none "$2" "$3" "$4"
+    cp -a "{{project-root}}/azure/build/rootfs" "$1/azure"
+
+# Build one provider cold artifact so CI can fan cross-platform work out by provider.
+[positional-arguments]
+[no-cd]
+build-platform-artifact provider output guest-platform cold-os cold-architecture:
+    test ! -e "$2"
+    mkdir -p "$2"
+    case "$1" in \
+      kind) just --justfile "{{project-root}}/kind/Justfile" build none "$3" "$4" "$5" ;; \
+      k3d) just --justfile "{{project-root}}/k3d/Justfile" build none "$3" "$4" "$5" ;; \
+      azure) just --justfile "{{project-root}}/azure/Justfile" build rootfs none "$3" "$4" "$5" ;; \
+      *) echo "unsupported provider: $1" >&2; exit 1 ;; \
+    esac
+    cp -a "{{project-root}}/$1/build/rootfs" "$2/$1"
+
+# Capture every maintained provider variant from prebuilt cold artifacts.
+[positional-arguments]
+[no-cd]
+capture-platform-variants artifacts output cold-os cold-architecture:
+    test ! -e "$2"
+    mkdir -p "$2"
+    if [ "$3" = macos ]; then \
+        just --justfile "{{project-root}}/../Justfile" cli::build-provider-snapshot-macos; \
+        export LAMPYR_PROVIDER_SNAPSHOT="{{project-root}}/../cli/target/debug/provider-snapshot"; \
+    fi; \
+    for provider in kind k3d azure; do \
+        test ! -e "{{project-root}}/$provider/build/rootfs"; \
+        mkdir -p "{{project-root}}/$provider/build"; \
+        cp -a "$1/$provider" "{{project-root}}/$provider/build/rootfs"; \
+        just --justfile "{{project-root}}/$provider/Justfile" snapshot "$3" "$4"; \
+        cp -a "{{project-root}}/$provider/build/rootfs" "$2/$provider"; \
+    done
+
+# Check deterministic packaging and publication without a hypervisor or registry.
+test-snapshots: install-oras
+    PATH="{{project-root}}/../build/tools:$PATH" python3 "{{project-root}}/tests/test_snapshot_oci.py"

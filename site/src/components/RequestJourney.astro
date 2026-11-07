@@ -1,0 +1,629 @@
+<figure class="journey" data-request-journey>
+	<button
+		class="motion-toggle"
+		type="button"
+		aria-pressed="false"
+		aria-label="Stop request path animation"
+		data-motion-toggle
+	>
+		<svg class="pause-icon" viewBox="0 0 18 18" aria-hidden="true">
+			<path d="M5 4v10M13 4v10" />
+		</svg>
+		<svg class="play-icon" viewBox="0 0 18 18" aria-hidden="true">
+			<path d="m5 3 10 6-10 6Z" />
+		</svg>
+		<span data-motion-label>Stop motion</span>
+	</button>
+
+	<svg
+		class="journey-diagram"
+		viewBox="0 0 900 420"
+		role="img"
+		aria-labelledby="journey-title journey-description"
+	>
+		<title id="journey-title">Follow a request through Lampyr</title>
+		<desc id="journey-description">
+			A request begins with a user, travels through ingress, fiber-router, and fiberd, then
+			lights a restored service microVM. The response returns quickly in amber and the microVM
+			goes dark as the active instance reaches zero.
+		</desc>
+		<defs>
+			<filter id="request-glow" x="-80%" y="-80%" width="260%" height="260%">
+				<feGaussianBlur stdDeviation="7" result="blur" />
+				<feMerge>
+					<feMergeNode in="blur" />
+					<feMergeNode in="SourceGraphic" />
+				</feMerge>
+			</filter>
+		</defs>
+
+		<rect class="field" x="1" y="1" width="898" height="418" rx="20" />
+		<path
+			class="arc"
+			d="M60 170Q140 70 220 170Q305 70 390 170Q475 70 560 170Q655 70 750 170"
+		/>
+		<path
+			class="arc-segment segment-one path-pulse"
+			d="M60 170Q140 70 220 170"
+			pathLength="100"
+		/>
+		<path
+			class="arc-segment segment-two path-pulse"
+			d="M220 170Q305 70 390 170"
+			pathLength="100"
+		/>
+		<path
+			class="arc-segment segment-three path-pulse"
+			d="M390 170Q475 70 560 170"
+			pathLength="100"
+		/>
+		<path
+			class="arc-segment segment-four path-pulse"
+			d="M560 170Q655 70 750 170"
+			pathLength="100"
+		/>
+		<path class="arc return-path" d="M750 170Q650 315 530 315Q260 315 60 170" />
+		<path
+			class="arc return-pulse"
+			d="M750 170Q650 315 530 315Q260 315 60 170"
+		/>
+
+		<g class="waypoint client" transform="translate(60 170)">
+			<rect class="client-shell user-response-state" x="-43" y="-28" width="86" height="56" rx="10" />
+			<rect class="client-screen" x="-29" y="-15" width="42" height="28" rx="3" />
+			<path class="client-cursor" d="m-21-7 7 6-7 6M-10 6H4" />
+			<path class="client-signal" d="M20-10h11M20 0h7M20 10h11" />
+			<text class="waypoint-index" x="-41" y="-47">USER / CLIENT</text>
+			<text class="waypoint-name" x="-44" y="60">Send request</text>
+		</g>
+		<g class="waypoint" transform="translate(220 170)">
+			<circle r="24" />
+			<text class="waypoint-index" x="-25" y="-43">01</text>
+			<text class="waypoint-name" x="-48" y="55">Ingress</text>
+		</g>
+		<g class="waypoint" transform="translate(390 170)">
+			<circle r="24" />
+			<text class="waypoint-index" x="-25" y="-43">02</text>
+			<text class="waypoint-name" x="-30" y="55">Router</text>
+		</g>
+		<g class="waypoint" transform="translate(560 170)">
+			<circle r="24" />
+			<text class="waypoint-index" x="-25" y="-43">03</text>
+			<text class="waypoint-name" x="-29" y="55">fiberd</text>
+		</g>
+		<g class="waypoint microvm" transform="translate(750 170)">
+			<circle class="microvm-halo microvm-state" r="55" />
+			<circle class="microvm-shell microvm-state" r="46" />
+			<path class="microvm-core microvm-state" d="m0-28-18 22L0 30 18-6Z" />
+			<text class="waypoint-index" x="-25" y="-63">04</text>
+			<text class="waypoint-name" x="-32" y="76">microVM</text>
+		</g>
+
+		<circle class="moving" cx="60" cy="170" r="8" />
+		<circle class="response-static" cx="60" cy="185" r="6" />
+
+		<g class="readout" transform="translate(65 326)">
+			<text class="readout-label">Request, startup, response</text>
+			<text class="readout-value" y="25">The user request activates the microVM.</text>
+			<text class="readout-value" y="46">
+				The response returns quickly and execution reaches zero.
+			</text>
+		</g>
+		<g class="shared-readout" transform="translate(550 342)">
+			<text>Shared infrastructure stays ready</text>
+			<text y="22">routing · activation · placement · node runtime</text>
+		</g>
+	</svg>
+
+</figure>
+
+<script>
+	for (const journey of document.querySelectorAll('[data-request-journey]')) {
+		const button = journey.querySelector('[data-motion-toggle]');
+		const label = journey.querySelector('[data-motion-label]');
+		if (!(button instanceof HTMLButtonElement) || !(label instanceof HTMLElement)) continue;
+
+		button.addEventListener('click', () => {
+			const paused = journey.toggleAttribute('data-paused');
+			button.setAttribute('aria-pressed', String(paused));
+			button.setAttribute(
+				'aria-label',
+				paused ? 'Resume request path animation' : 'Stop request path animation',
+			);
+			label.textContent = paused ? 'Resume motion' : 'Stop motion';
+		});
+	}
+</script>
+
+<style>
+	.journey {
+		position: relative;
+		margin: 0;
+		padding: var(--focal-padding);
+		border: 1px solid var(--line);
+		border-radius: var(--focal-radius);
+		background: var(--focal-background);
+		box-shadow: var(--focal-shadow);
+	}
+
+	.motion-toggle {
+		position: absolute;
+		z-index: 2;
+		top: clamp(1.75rem, 4vw, 3rem);
+		right: clamp(1.75rem, 4vw, 3rem);
+		display: inline-flex;
+		align-items: center;
+		gap: 0.55rem;
+		min-height: 2.65rem;
+		padding: 0.55rem 0.8rem;
+		border: 1px solid var(--line-strong);
+		border-radius: 0.45rem;
+		color: var(--text);
+		background: color-mix(in srgb, var(--night) 86%, transparent);
+		font: 700 var(--type-compact)/1.25 var(--font-mono);
+		letter-spacing: 0.04em;
+		cursor: pointer;
+		transition:
+			color 160ms ease,
+			border-color 160ms ease,
+			background 160ms ease;
+	}
+
+	.motion-toggle:hover {
+		border-color: var(--amber);
+		color: var(--amber);
+	}
+
+	.motion-toggle:focus-visible {
+		outline: 3px solid var(--amber);
+		outline-offset: 3px;
+	}
+
+	.motion-toggle svg {
+		width: 1rem;
+		height: 1rem;
+		fill: none;
+		stroke: currentColor;
+		stroke-width: 2;
+		stroke-linecap: round;
+		stroke-linejoin: round;
+	}
+
+	.play-icon {
+		display: none;
+	}
+
+	[data-paused] .pause-icon {
+		display: none;
+	}
+
+	[data-paused] .play-icon {
+		display: block;
+		fill: currentColor;
+		stroke: none;
+	}
+
+	.journey-diagram {
+		--night: #08150f;
+		--panel: #102219;
+		--panel-strong: #12251b;
+		--glow: #d5ff5f;
+		--amber: #ffbe55;
+		--text: #f1f5df;
+		--muted: #a8b6a4;
+		--line: rgb(168 182 164 / 16%);
+		--line-strong: rgb(168 182 164 / 32%);
+		display: block;
+		width: 100%;
+		height: auto;
+		border-radius: 20px;
+		color: #f1f5df;
+		background: #102219;
+		pointer-events: all;
+	}
+
+	.journey-diagram > * {
+		pointer-events: none;
+	}
+
+	.field {
+		fill: color-mix(in srgb, var(--panel) 94%, transparent);
+		stroke: var(--line);
+	}
+
+	.arc {
+		fill: none;
+		stroke: var(--line-strong);
+		stroke-width: 2;
+		stroke-dasharray: 3 8;
+	}
+
+	.arc-segment {
+		fill: none;
+		stroke: var(--glow);
+		stroke-width: 2.5;
+		stroke-linecap: round;
+		stroke-dasharray: 100;
+		stroke-dashoffset: 100;
+		filter: url(#request-glow);
+	}
+
+	.segment-one {
+		animation: trace-one 6.4s linear infinite;
+	}
+
+	.segment-two {
+		animation: trace-two 6.4s linear infinite;
+	}
+
+	.segment-three {
+		animation: trace-three 6.4s linear infinite;
+	}
+
+	.segment-four {
+		animation: trace-four 6.4s linear infinite;
+	}
+
+	.return-path {
+		stroke: color-mix(in srgb, var(--amber) 32%, var(--line-strong));
+	}
+
+	.return-pulse {
+		stroke: var(--amber);
+		stroke-width: 3;
+		stroke-linecap: round;
+		stroke-dasharray: 90 820;
+		opacity: 0;
+		animation: return-flash 6.4s linear infinite;
+	}
+
+	.waypoint circle {
+		fill: var(--panel-strong);
+		stroke: var(--line-strong);
+		stroke-width: 2;
+	}
+
+	.waypoint-index {
+		fill: var(--muted);
+		font-family: var(--font-mono);
+		font-size: 12px;
+		letter-spacing: 0.08em;
+	}
+
+	.waypoint-name {
+		fill: var(--text);
+		font-family: var(--font-sans);
+		font-size: 15px;
+	}
+
+	.microvm circle {
+		stroke: var(--line-strong);
+	}
+
+	.microvm-halo {
+		fill: color-mix(in srgb, var(--glow) 12%, transparent);
+		opacity: 0;
+		filter: url(#request-glow);
+	}
+
+	.microvm-shell {
+		fill: var(--panel-strong);
+	}
+
+	.microvm-core {
+		fill: var(--field-muted, var(--muted));
+		stroke: var(--night);
+		stroke-width: 3;
+	}
+
+	.microvm-state {
+		animation: microvm-startup 6.4s linear infinite;
+	}
+
+	.client-shell {
+		fill: var(--panel-strong);
+		stroke: var(--line-strong);
+		stroke-width: 2;
+	}
+
+	.user-response-state {
+		animation: user-response 6.4s linear infinite;
+	}
+
+	.client-screen {
+		fill: color-mix(in srgb, var(--night) 72%, var(--panel));
+		stroke: var(--muted);
+		stroke-width: 1.5;
+	}
+
+	.client-cursor,
+	.client-signal {
+		fill: none;
+		stroke: var(--text);
+		stroke-width: 2;
+		stroke-linecap: round;
+		stroke-linejoin: round;
+	}
+
+	.client-signal {
+		stroke: var(--glow);
+		stroke-width: 1.5;
+	}
+
+	.moving {
+		fill: var(--glow);
+		filter: url(#request-glow);
+		animation: request-cycle 6.4s cubic-bezier(0.18, 0.8, 0.18, 1) infinite;
+	}
+
+	.response-static {
+		fill: var(--amber);
+		opacity: 0;
+	}
+
+	.readout-label,
+	.shared-readout text {
+		fill: var(--muted);
+		font-family: var(--font-mono);
+		font-size: 12px;
+		letter-spacing: 0.04em;
+	}
+
+	.readout-value {
+		fill: var(--text);
+		font-family: var(--font-sans);
+		font-size: 14px;
+	}
+
+	.shared-readout text {
+		letter-spacing: 0;
+	}
+
+	[data-paused] .moving,
+	[data-paused] .path-pulse,
+	[data-paused] .return-pulse,
+	[data-paused] .microvm-state,
+	[data-paused] .user-response-state {
+		animation-play-state: paused;
+	}
+
+	@keyframes request-cycle {
+		0%,
+		7% {
+			transform: translate(0, 0);
+			fill: var(--glow);
+		}
+		12% {
+			transform: translate(80px, -24px);
+		}
+		18%,
+		22% {
+			transform: translate(160px, 0);
+		}
+		27% {
+			transform: translate(245px, -24px);
+		}
+		32%,
+		36% {
+			transform: translate(330px, 0);
+		}
+		41% {
+			transform: translate(415px, -24px);
+		}
+		46%,
+		50% {
+			transform: translate(500px, 0);
+		}
+		55% {
+			transform: translate(595px, -24px);
+		}
+		60%,
+		79% {
+			transform: translate(690px, 0);
+			fill: var(--glow);
+		}
+		82% {
+			transform: translate(540px, 145px);
+			fill: var(--amber);
+		}
+		84% {
+			transform: translate(330px, 145px);
+			fill: var(--amber);
+		}
+		87% {
+			transform: translate(0, 0);
+			fill: var(--amber);
+		}
+		100% {
+			transform: translate(0, 0);
+			fill: var(--glow);
+		}
+	}
+
+	@keyframes trace-one {
+		0% {
+			stroke-dashoffset: 100;
+			opacity: 0.25;
+		}
+		18%,
+		79% {
+			stroke-dashoffset: 0;
+			opacity: 1;
+		}
+		82% {
+			opacity: 0.2;
+		}
+		100% {
+			stroke-dashoffset: 100;
+			opacity: 0.2;
+		}
+	}
+
+	@keyframes trace-two {
+		0%,
+		18% {
+			stroke-dashoffset: 100;
+			opacity: 0.25;
+		}
+		32%,
+		79% {
+			stroke-dashoffset: 0;
+			opacity: 1;
+		}
+		82%,
+		100% {
+			stroke-dashoffset: 100;
+			opacity: 0.2;
+		}
+	}
+
+	@keyframes trace-three {
+		0%,
+		32% {
+			stroke-dashoffset: 100;
+			opacity: 0.25;
+		}
+		46%,
+		79% {
+			stroke-dashoffset: 0;
+			opacity: 1;
+		}
+		82%,
+		100% {
+			stroke-dashoffset: 100;
+			opacity: 0.2;
+		}
+	}
+
+	@keyframes trace-four {
+		0%,
+		46% {
+			stroke-dashoffset: 100;
+			opacity: 0.25;
+		}
+		60%,
+		79% {
+			stroke-dashoffset: 0;
+			opacity: 1;
+		}
+		82%,
+		100% {
+			stroke-dashoffset: 100;
+			opacity: 0.2;
+		}
+	}
+
+	@keyframes return-flash {
+		0%,
+		78% {
+			stroke-dashoffset: 0;
+			opacity: 0;
+		}
+		80% {
+			opacity: 1;
+		}
+		88% {
+			stroke-dashoffset: -760;
+			opacity: 1;
+		}
+		91%,
+		100% {
+			stroke-dashoffset: -820;
+			opacity: 0;
+		}
+	}
+
+	@keyframes microvm-startup {
+		0%,
+		56% {
+			fill: var(--panel-strong);
+			stroke: var(--line-strong);
+			opacity: 0.35;
+		}
+		62% {
+			fill: color-mix(in srgb, var(--glow) 32%, var(--panel-strong));
+			stroke: var(--glow);
+			opacity: 0.75;
+		}
+		68%,
+		79% {
+			fill: var(--glow);
+			stroke: var(--glow);
+			opacity: 1;
+		}
+		83%,
+		100% {
+			fill: var(--panel-strong);
+			stroke: var(--line-strong);
+			opacity: 0.25;
+		}
+	}
+
+	@keyframes user-response {
+		0%,
+		84% {
+			stroke: var(--line-strong);
+			opacity: 1;
+		}
+		87%,
+		94% {
+			stroke: var(--amber);
+			opacity: 1;
+		}
+		100% {
+			stroke: var(--line-strong);
+			opacity: 1;
+		}
+	}
+
+	@media (max-width: 600px) {
+		.motion-toggle {
+			top: 1.25rem;
+			right: 1.25rem;
+			min-height: 2.4rem;
+			padding: 0.45rem 0.65rem;
+		}
+
+		.motion-toggle span {
+			position: absolute;
+			width: 1px;
+			height: 1px;
+			overflow: hidden;
+			clip: rect(0, 0, 0, 0);
+			white-space: nowrap;
+		}
+	}
+
+	@media (prefers-reduced-motion: reduce) {
+		.moving,
+		.path-pulse,
+		.return-pulse,
+		.microvm-state,
+		.user-response-state {
+			animation: none;
+		}
+
+		.moving {
+			transform: translate(690px, 0);
+		}
+
+		.microvm-halo {
+			opacity: 0.45;
+		}
+
+		.microvm-shell,
+		.microvm-core {
+			fill: var(--glow);
+			stroke: var(--glow);
+			opacity: 1;
+		}
+
+		.response-static {
+			opacity: 1;
+		}
+
+		.motion-toggle {
+			display: none;
+		}
+	}
+</style>

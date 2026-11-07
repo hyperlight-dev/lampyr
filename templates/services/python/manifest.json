@@ -1,0 +1,9 @@
+{
+  "schemaVersion": "lampyr.dev/service-template/v1alpha1",
+  "runtime": "python",
+  "templateVersion": "0.2.1",
+  "entrypoint": "/entrypoint.py",
+  "userOwned": [".gitignore", "Dockerfile", "handler.py", "lampyr.yaml"],
+  "adapterOwned": ["Dockerfile.rootfs", "requirements.in", "requirements.txt", "server.py", "lampyr_types.py"],
+  "machineState": [".lampyr/"]
+}

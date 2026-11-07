@@ -1,0 +1,475 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: azureeventgridsources.sources.lampyr.dev
+spec:
+  group: sources.lampyr.dev
+  scope: Namespaced
+  names:
+    plural: azureeventgridsources
+    singular: azureeventgridsource
+    kind: AzureEventGridSource
+    shortNames:
+      - aegs
+    categories:
+      - all
+      - knative
+      - sources
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Sink
+          type: string
+          jsonPath: .status.sinkUri
+        - name: Ready
+          type: string
+          jsonPath: '.status.conditions[?(@.type=="Ready")].status'
+        - name: Reason
+          type: string
+          jsonPath: '.status.conditions[?(@.type=="Ready")].reason'
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+      schema:
+        openAPIV3Schema:
+          type: object
+          required:
+            - spec
+          properties:
+            spec:
+              type: object
+              required:
+                - sourceResourceID
+                - sink
+              properties:
+                sourceResourceID:
+                  type: string
+                  minLength: 1
+                  x-kubernetes-validations:
+                    - rule: self == oldSelf
+                      message: sourceResourceID is immutable; delete and recreate the source to change publishers
+                eventSubscription:
+                  type: object
+                  properties:
+                    includedEventTypes:
+                      type: array
+                      items:
+                        type: string
+                    subjectBeginsWith:
+                      type: string
+                    subjectEndsWith:
+                      type: string
+                    advancedFilters:
+                      type: array
+                      items:
+                        type: object
+                        required:
+                          - operatorType
+                          - key
+                        properties:
+                          operatorType:
+                            type: string
+                          key:
+                            type: string
+                          values:
+                            type: array
+                            items:
+                              x-kubernetes-preserve-unknown-fields: true
+                    retryPolicy:
+                      type: object
+                      properties:
+                        maxDeliveryAttempts:
+                          type: integer
+                          format: int32
+                          minimum: 1
+                          maximum: 30
+                        eventTimeToLiveMinutes:
+                          type: integer
+                          format: int32
+                          minimum: 1
+                          maximum: 1440
+                delivery:
+                  type: object
+                  properties:
+                    maxConcurrentDeliveries:
+                      type: integer
+                      format: int32
+                      minimum: 1
+                      maximum: 32
+                      default: 1
+                sink:
+                  type: object
+                  anyOf:
+                    - required:
+                        - ref
+                    - required:
+                        - uri
+                  properties:
+                    ref:
+                      type: object
+                      required:
+                        - apiVersion
+                        - kind
+                        - name
+                      properties:
+                        apiVersion:
+                          type: string
+                        kind:
+                          type: string
+                        namespace:
+                          type: string
+                        name:
+                          type: string
+                    uri:
+                      type: string
+                ceOverrides:
+                  type: object
+                  properties:
+                    extensions:
+                      type: object
+                      additionalProperties:
+                        x-kubernetes-preserve-unknown-fields: true
+            status:
+              type: object
+              properties:
+                observedGeneration:
+                  type: integer
+                  format: int64
+                sinkUri:
+                  type: string
+                adapterConfig:
+                  type: object
+                  required:
+                    - name
+                    - namespace
+                    - version
+                    - digest
+                  properties:
+                    name:
+                      type: string
+                    namespace:
+                      type: string
+                    version:
+                      type: string
+                    digest:
+                      type: string
+                azureResources:
+                  type: object
+                  required:
+                    - sourceUid
+                    - publisherResourceId
+                    - forwardingSubscriptionName
+                  properties:
+                    sourceUid:
+                      type: string
+                    publisherResourceId:
+                      type: string
+                    forwardingSubscriptionName:
+                      type: string
+                conditions:
+                  type: array
+                  x-kubernetes-list-type: map
+                  x-kubernetes-list-map-keys:
+                    - type
+                  items:
+                    type: object
+                    required:
+                      - type
+                      - status
+                      - lastTransitionTime
+                      - reason
+                      - message
+                    properties:
+                      type:
+                        type: string
+                      status:
+                        type: string
+                        enum:
+                          - "True"
+                          - "False"
+                          - Unknown
+                      observedGeneration:
+                        type: integer
+                        format: int64
+                      lastTransitionTime:
+                        type: string
+                        format: date-time
+                      reason:
+                        type: string
+                      message:
+                        type: string
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: eventgrid-controller
+  namespace: lampyr-system
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: eventgrid-adapter
+  namespace: lampyr-system
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: eventgrid-webhook-auth
+  namespace: lampyr-system
+  annotations:
+    lampyr.dev/create-only: "true"
+type: Opaque
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: lampyr-eventgrid-controller
+rules:
+  - apiGroups:
+      - sources.lampyr.dev
+    resources:
+      - azureeventgridsources
+    verbs:
+      - get
+      - list
+      - watch
+      - update
+      - patch
+  - apiGroups:
+      - sources.lampyr.dev
+    resources:
+      - azureeventgridsources/status
+    verbs:
+      - get
+      - update
+      - patch
+  - apiGroups:
+      - eventing.knative.dev
+      - serving.knative.dev
+      - messaging.knative.dev
+      - flows.knative.dev
+    resources:
+      - "*"
+    verbs:
+      - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: lampyr-eventgrid-controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: lampyr-eventgrid-controller
+subjects:
+  - kind: ServiceAccount
+    name: eventgrid-controller
+    namespace: lampyr-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: lampyr-eventgrid-controller-config
+  namespace: lampyr-system
+rules:
+  - apiGroups:
+      - ""
+    resources:
+      - configmaps
+    verbs:
+      - get
+      - create
+      - update
+      - patch
+      - delete
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: lampyr-eventgrid-controller-config
+  namespace: lampyr-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: lampyr-eventgrid-controller-config
+subjects:
+  - kind: ServiceAccount
+    name: eventgrid-controller
+    namespace: lampyr-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: lampyr-eventgrid-controller-webhook-auth
+  namespace: lampyr-system
+rules:
+  - apiGroups:
+      - ""
+    resources:
+      - secrets
+    resourceNames:
+      - eventgrid-webhook-auth
+    verbs:
+      - get
+      - patch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: lampyr-eventgrid-controller-webhook-auth
+  namespace: lampyr-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: lampyr-eventgrid-controller-webhook-auth
+subjects:
+  - kind: ServiceAccount
+    name: eventgrid-controller
+    namespace: lampyr-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: lampyr-eventgrid-adapter
+  namespace: lampyr-system
+rules:
+  - apiGroups:
+      - ""
+    resources:
+      - configmaps
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: lampyr-eventgrid-adapter
+  namespace: lampyr-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: lampyr-eventgrid-adapter
+subjects:
+  - kind: ServiceAccount
+    name: eventgrid-adapter
+    namespace: lampyr-system
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: eventgrid-controller
+  namespace: lampyr-system
+  labels:
+    app.kubernetes.io/name: eventgrid-controller
+    app.kubernetes.io/part-of: lampyr-eventgrid-source
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: eventgrid-controller
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: eventgrid-controller
+        app.kubernetes.io/part-of: lampyr-eventgrid-source
+    spec:
+      serviceAccountName: eventgrid-controller
+      containers:
+        - name: controller
+          image: ghcr.io/hyperlight-dev/lampyr/eventgrid-controller:preview
+          imagePullPolicy: Never
+          args:
+            - --health-address=:8080
+          ports:
+            - name: health
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            runAsNonRoot: true
+            seccompProfile:
+              type: RuntimeDefault
+          resources:
+            requests:
+              cpu: 20m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+      terminationGracePeriodSeconds: 15
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: eventgrid-adapter
+  namespace: lampyr-system
+  labels:
+    app.kubernetes.io/name: eventgrid-adapter
+    app.kubernetes.io/part-of: lampyr-eventgrid-source
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: eventgrid-adapter
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: eventgrid-adapter
+        app.kubernetes.io/part-of: lampyr-eventgrid-source
+    spec:
+      serviceAccountName: eventgrid-adapter
+      containers:
+        - name: adapter
+          image: ghcr.io/hyperlight-dev/lampyr/eventgrid-adapter:preview
+          imagePullPolicy: Never
+          args:
+            - --health-address=:8080
+            - --max-in-flight=64
+          ports:
+            - name: health
+              containerPort: 8080
+            - name: webhook
+              containerPort: 8081
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            runAsNonRoot: true
+            seccompProfile:
+              type: RuntimeDefault
+          resources:
+            requests:
+              cpu: 20m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+      terminationGracePeriodSeconds: 15

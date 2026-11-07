@@ -1,0 +1,10 @@
+apiVersion: lampyr.dev/v1alpha1
+kind: Project
+name: worker-processor
+runtime: nodejs
+application:
+  type: standalone
+  command: /app/server.js
+resources:
+  memory: 512Mi
+  cpu: 250m

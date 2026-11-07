@@ -1,0 +1,14 @@
+[
+  {"path": "/value", "status": 201, "body": {"ok": true}, "header": ["x-contract", "value"]},
+  {"path": "/bytes", "status": 200, "text": "raw\u0000bytes"},
+  {"path": "/text", "status": 200, "text": "plain text", "header": ["content-type", "text/plain"]},
+  {"path": "/array", "status": 200, "body": [1, 2, 3]},
+  {"path": "/stream", "status": 200, "text": "one\ntwo\nthree\n"},
+  {"path": "/typed-error", "status": 422},
+  {"path": "/error", "status": 500},
+  {"path": "/serialize-error", "status": 500},
+  {"path": "/empty", "status": 204, "text": ""},
+  {"path": "/headers", "status": 500},
+  {"path": "/unicode-header", "status": 500},
+  {"path": "/not-modified", "status": 304, "text": ""}
+]

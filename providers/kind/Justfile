@@ -1,0 +1,29 @@
+set shell := ["bash", "-euo", "pipefail", "-c"]
+
+mod runtime '../runtime/Justfile'
+
+project-root := source_directory()
+
+# Check provider-owned orchestration without Docker, KVM, or credentials.
+test-unit:
+    python3 -m venv "{{project-root}}/build/test-venv"
+    "{{project-root}}/build/test-venv/bin/python" -m pip install --quiet --require-hashes -r "{{project-root}}/../test-requirements.txt"
+    "{{project-root}}/build/test-venv/bin/python" -m unittest discover --start-directory "{{project-root}}/tests" --pattern 'test_*.py'
+
+# Build and package Kind independently of the ly binary.
+[positional-arguments]
+build snapshot-mode="auto" guest-platform="linux/amd64" cold-os="linux" cold-architecture="x86_64":
+    bash "{{project-root}}/../build-rootfs.sh" "{{project-root}}/Dockerfile" rootfs "$2"
+    python3 "{{project-root}}/../package.py" "{{project-root}}" rootfs --snapshot-mode "$1" --cold-os "$3" --cold-architecture "$4"
+
+# Capture a native variant from an existing canonical rootfs without rebuilding it.
+[positional-arguments]
+snapshot cold-os="linux" cold-architecture="x86_64":
+    python3 "{{project-root}}/../package.py" "{{project-root}}" rootfs --snapshot-mode variant --cold-os "$1" --cold-architecture "$2"
+
+# Exercise initialization, ownership, connection and teardown on a disposable cluster.
+test: test-unit build
+    LAMPYR_TEST_KIND_ARTIFACT="{{project-root}}/build/rootfs" \
+        "{{project-root}}/../../scripts/cargo-test-some.sh" --locked --manifest-path "{{project-root}}/../../cli/Cargo.toml" --test kind_provider external_kind -- --test-threads=1
+    LAMPYR_TEST_KIND_ARTIFACT="{{project-root}}/build/rootfs" \
+        cargo test --locked --manifest-path "{{project-root}}/../../cli/Cargo.toml" --test docker_guest -- --test-threads=1

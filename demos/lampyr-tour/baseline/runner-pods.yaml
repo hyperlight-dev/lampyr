@@ -1,0 +1,155 @@
+# The same runner server, run the usual way: one container per replica.
+# Used to compare against Lampyr on the same node; not part of Lampyr.
+# node:22-alpine matches the Node.js major version (22) in Lampyr's Node.js
+# runtime.
+# The runner runs any code it is sent, so the replicas run unprivileged,
+# without a service account token, admit traffic only from the prober, and
+# send none.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: baseline
+  labels:
+    # Kubernetes refuses any pod here that isn't locked down this far.
+    pod-security.kubernetes.io/enforce: restricted
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: runner
+  namespace: baseline
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      app: runner
+  template:
+    metadata:
+      labels:
+        app: runner
+      annotations:
+        # bin/setup.sh fills in server.js's checksum, so a changed server
+        # rolls the replicas.
+        lampyr-tour/server-sha256: SERVER_SHA256
+    spec:
+      terminationGracePeriodSeconds: 1
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: runner
+          image: node:22-alpine@sha256:fe4f6d74e20370acb04ad889077d14d0f64a9c8ea6a42bc60cddf1e844699914
+          command: ["node", "/app/server.js"]
+          env:
+            - name: PORT
+              value: "8080"
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 8080
+            periodSeconds: 1
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          # Generous limits, like a runner Fiber's 512 MiB, so they bound a
+          # runaway snippet without slowing a normal start.
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          volumeMounts:
+            - name: app
+              mountPath: /app
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: app
+          configMap:
+            name: runner
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+---
+# Only the prober reaches the replicas, and the replicas reach nothing, like
+# a runner micro-VM, which has no outbound destination. Enforced where the
+# cluster's network plugin supports NetworkPolicy, as Kind's kindnet does.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: runner
+  namespace: baseline
+spec:
+  podSelector:
+    matchLabels:
+      app: runner
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: prober
+      ports:
+        - port: 8080
+  egress: []
+---
+# Polls each new replica from inside the cluster, for bin/cold-start, which
+# tells it their pod IPs as they are assigned. A Deployment, so a changed
+# spec replaces the pod.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prober
+  namespace: baseline
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: prober
+  template:
+    metadata:
+      labels:
+        app: prober
+    spec:
+      terminationGracePeriodSeconds: 1
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: prober
+          image: busybox:1.37@sha256:a7dbc319b1438115a207e11930dc4bb3e643dcb3ec0bdd694bb36cd8fad289ec
+          # A shell as PID 1 reaps the probes cold-start leaves behind if its
+          # connection drops; `sleep infinity` would leave them as zombies.
+          command: ["sh", "-c", "trap 'exit 0' TERM; while :; do sleep 3600 & wait; done"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 8Mi
+            limits:
+              memory: 64Mi
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 16Mi

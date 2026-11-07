@@ -1,0 +1,20 @@
+{
+  "protocolVersion": 1,
+  "id": "k3d",
+  "version": "0.1.0",
+  "runtimeVersion": "0.21.0",
+  "memoryMiB": 2048,
+  "environment": {
+    "PATH": "/usr/local/bin:/usr/bin:/bin",
+    "K3D_IMAGE_TOOLS": "ghcr.io/k3d-io/k3d-tools:5.9.0@sha256:c57abce697e66feeb826922718738fe186b47779312d49d4e51e6fb9b8a6f34d"
+  },
+  "networkHosts": [],
+  "operations": {
+    "describe": [],
+    "init": ["workspace-read", "workspace-scaffold", "state"],
+    "apply": ["workspace-read", "state", "docker"],
+    "inspect": ["state", "docker"],
+    "connect": ["state", "docker"],
+    "delete": ["state", "docker"]
+  }
+}

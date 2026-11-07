@@ -1,0 +1,55 @@
+---
+import '@fontsource-variable/albert-sans';
+import '../styles/home.css';
+
+interface Props {
+	title: string;
+	description: string;
+	noindex?: boolean;
+}
+
+const { title, description, noindex = false } = Astro.props;
+const base = import.meta.env.BASE_URL;
+const canonical = new URL(Astro.url.pathname, Astro.site);
+const socialImage = new URL(`${base}social-card.svg`, Astro.site);
+---
+
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="UTF-8" />
+		<meta name="viewport" content="width=device-width" />
+		<meta name="generator" content={Astro.generator} />
+		<meta name="description" content={description} />
+		<meta name="theme-color" content="#08150f" />
+		{noindex && <meta name="robots" content="noindex" />}
+		<link rel="icon" type="image/svg+xml" href={`${base}favicon.svg`} />
+		<link rel="canonical" href={canonical} />
+		<meta property="og:type" content="website" />
+		<meta property="og:site_name" content="Lampyr" />
+		<meta property="og:title" content={title} />
+		<meta property="og:description" content={description} />
+		<meta property="og:url" content={canonical} />
+		<meta property="og:image" content={socialImage} />
+		<meta property="og:image:alt" content="Lampyr: hardware-isolated services" />
+		<meta name="twitter:card" content="summary_large_image" />
+		<title>{title}</title>
+	</head>
+	<body>
+		<a class="skip-link" href="#main-content">Skip to content</a>
+		<header class="site-header">
+			<a class="brand" href={base} aria-label="Lampyr home">
+				<img src={`${base}favicon.svg`} alt="" width="42" height="42" />
+				<span>Lampyr</span>
+			</a>
+			<nav aria-label="Primary navigation">
+				<a href={`${base}docs/`}>Docs</a>
+				<a href={`${base}walkthrough/`}>Get started</a>
+				<a href="https://github.com/hyperlight-dev/lampyr">GitHub</a>
+			</nav>
+		</header>
+		<main id="main-content">
+			<slot />
+		</main>
+	</body>
+</html>

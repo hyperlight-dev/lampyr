@@ -1,0 +1,41 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: lampyr-kvm-setup
+  namespace: kube-system
+spec:
+  selector:
+    matchLabels:
+      app: lampyr-kvm-setup
+  template:
+    metadata:
+      labels:
+        app: lampyr-kvm-setup
+    spec:
+      automountServiceAccountToken: false
+      nodeSelector:
+        kubernetes.io/os: linux
+        kubernetes.io/arch: amd64
+      initContainers:
+        - name: prepare-kvm
+          image: ghcr.io/hyperlight-dev/lampyr/azure-node-setup:preview
+          imagePullPolicy: IfNotPresent
+          args: [install]
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: host-root
+              mountPath: /host
+              readOnly: true
+      containers:
+        - name: ready
+          image: registry.k8s.io/pause:3.10
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+      volumes:
+        - name: host-root
+          hostPath:
+            path: /
+            type: Directory

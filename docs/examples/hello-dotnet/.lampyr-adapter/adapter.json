@@ -1,0 +1,15 @@
+{
+  "schemaVersion": "lampyr.dev/runtime-adapter/v1alpha1",
+  "runtime": "dotnet",
+  "templateVersion": "0.3.1",
+  "entrypoint": "/app/LampyrService",
+  "files": {
+    "Dockerfile.rootfs": "sha256:3b94af88ee2f7d54f776a6cdba57fe7aa44f8ce6ff39fc0bae6612cbdcc08b65",
+    "LampyrService.csproj": "sha256:708b24567127ca5a021761e3b65a62e5f5555a1886b1f35a93cd73fd7a1fcc6a",
+    "Program.cs": "sha256:763e0331a94458821114dabdd5cfbffd830f541e627d9948ecb028bb273e7556",
+    "Types.cs": "sha256:c56a8c1d86979d3480281fe44f1bf815e8b47ad1ca75afb3841eb1a206276a3e"
+  },
+  "pristine": {
+    "entrypoint": "/app/LampyrService"
+  }
+}

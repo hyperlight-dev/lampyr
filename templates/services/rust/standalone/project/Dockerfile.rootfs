@@ -1,0 +1,11 @@
+FROM rust:1.91-alpine AS build
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY src/ ./src/
+ENV RUSTFLAGS="-C target-feature=+crt-static -C relocation-model=pie -C link-arg=-static-pie"
+RUN target="$(rustc -vV | sed -n 's/^host: //p')" \
+    && cargo build --locked --release --target "$target" --target-dir /build \
+    && cp "/build/$target/release/service" /service
+
+FROM hluk-rust-rootfs:latest AS rootfs
+COPY --from=build /service /app/service

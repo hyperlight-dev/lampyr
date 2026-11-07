@@ -1,0 +1,10 @@
+apiVersion: lampyr.dev/v1alpha1
+kind: Project
+name: hello-go
+runtime: go
+application:
+    type: standalone
+    command: /app/service
+resources:
+    memory: 256Mi
+    cpu: 250m

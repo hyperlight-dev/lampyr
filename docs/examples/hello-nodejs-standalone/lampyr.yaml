@@ -1,0 +1,10 @@
+apiVersion: lampyr.dev/v1alpha1
+kind: Project
+name: hello-nodejs-standalone
+runtime: nodejs
+application:
+    type: standalone
+    command: /app/server.js
+resources:
+    memory: 768Mi
+    cpu: 250m

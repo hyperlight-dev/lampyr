@@ -1,0 +1,88 @@
+# Grouped version updates once a month, one pull request per group.
+# Anything that has to move in step with something Dependabot cannot see is
+# left out and bumped by hand. Go, npm and action security updates still come,
+# listed directories or not, except for ignored dependencies; Docker has none.
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 7
+    groups:
+      gomod:
+        patterns: ["*"]
+        update-types: [minor, patch]
+    ignore:
+      # The Knative modules are pseudo-versions matching the Serving and
+      # Eventing release manifests pinned in cli/src/{bootstrap,eventing}.rs.
+      - dependency-name: knative.dev/*
+      # Fiberd has no release; the router's client is pinned to the commit
+      # whose protocol the grant image and the helper speak.
+      - dependency-name: github.com/Azure/fiberd*
+      # The Kubernetes minor is held at the one github.com/Azure/fiberd
+      # requires, which is ahead of the Kind node image, kubectl in the
+      # workflows and the Knative release. Move it by hand with fiberd, and
+      # with those once they catch up.
+      - dependency-name: k8s.io/*
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+
+  - package-ecosystem: npm
+    directory: /site
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 7
+    groups:
+      # A Starlight minor usually needs a new Astro major, and the
+      # integrations follow both: all versions together, majors included.
+      astro:
+        patterns: [astro, astro-*, "@astrojs/*", starlight-*]
+      site:
+        patterns: ["*"]
+        update-types: [minor, patch]
+    ignore:
+      # @astrojs/check 0.9 does not accept TypeScript 7 yet. Dependabot
+      # would open a failing pull request every month; bump TypeScript by
+      # hand once the plugin supports it.
+      - dependency-name: typescript
+        update-types: ["version-update:semver-major"]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 7
+    groups:
+      actions:
+        patterns: ["*"]
+        update-types: [minor, patch]
+
+  # Patch releases and digest refreshes only, so only images pinned to a
+  # patch version or a digest move: the golang image tracks the Go version in
+  # go.mod, and a new Ubuntu or Debian release changes the base of every
+  # platform image. Not docs/examples: generated from the templates in
+  # cli/src/project.rs, and examples-check fails on drift. Not app:
+  # its rootfs image is built locally. Not kind: the node image is the one
+  # made for the pinned Kind release. Not k8s: most of its images are Lampyr's
+  # own, set by the installer, and the rest move by hand.
+  - package-ecosystem: docker
+    directories:
+      - /activator
+      - /fiberd
+      - /helper
+      - /providers/azure/eventgrid
+      - /providers/azure/node-setup
+      - /upstream
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 7
+    groups:
+      images:
+        patterns: ["*"]
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]

@@ -1,0 +1,17 @@
+{
+  "protocolVersion": 1,
+  "id": "kind",
+  "version": "0.3.0",
+  "runtimeVersion": "0.21.0",
+  "memoryMiB": 2048,
+  "environment": {"PATH": "/usr/local/bin:/usr/bin:/bin", "KIND_EXPERIMENTAL_PROVIDER": "docker"},
+  "networkHosts": [],
+  "operations": {
+    "describe": [],
+    "init": ["workspace-read", "workspace-scaffold", "state"],
+    "apply": ["workspace-read", "state", "docker"],
+    "inspect": ["state", "docker"],
+    "connect": ["state", "docker"],
+    "delete": ["state", "docker"]
+  }
+}

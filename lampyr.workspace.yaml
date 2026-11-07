@@ -1,0 +1,2 @@
+apiVersion: lampyr.dev/v1alpha1
+kind: Workspace

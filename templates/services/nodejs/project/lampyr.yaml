@@ -1,0 +1,14 @@
+apiVersion: lampyr.dev/v1alpha1
+kind: Project
+name: hello-nodejs
+runtime: nodejs
+application:
+    type: handler
+events:
+    maxRetries: 3
+    initialBackoff: 100ms
+    attemptTimeout: 30s
+    deadLetter: .lampyr/dead-letter.jsonl
+resources:
+    memory: 512Mi
+    cpu: 250m

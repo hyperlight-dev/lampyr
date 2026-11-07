@@ -1,0 +1,1602 @@
+name: CI
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  # A pull request's runs share a group, so a newer push replaces the older
+  # run; every other run (each commit on main) gets a group of its own.
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  no-skipped-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+      - name: Reject disabled tests
+        run: just check-no-skipped-tests
+
+  typos:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: crate-ci/typos@4c8b7f51ca60df14e3c5ca82770dfbbe6c3dae85 # v1.52.0
+      - name: Check license headers
+        run: hack/check-license-headers.sh
+
+  runtime-assets:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            cli/target
+            build/hluk
+            build/kernel
+            providers/runtime/build/elfloader_hyperlight-x86_64
+          # Exact hits are immutable; misses start cold instead of carrying stale
+          # artifacts into the next generation. v2 excludes inflated old caches.
+          key: cargo-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('cli/Cargo.lock', 'cli/Cargo.toml', 'cli/rust-toolchain.toml') }}
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: "**/go.sum"
+
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+
+      - name: Validate runtime asset builds
+        run: just build
+
+  rust-cli:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            cli/target
+            build/hluk
+            build/kernel
+            providers/runtime/build/elfloader_hyperlight-x86_64
+          key: cargo-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('cli/Cargo.lock', 'cli/Cargo.toml', 'cli/rust-toolchain.toml') }}
+
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+
+      - name: Check and test the Rust CLI
+        run: just cli::test
+
+      # Hosted runners' primary group is shared, so give the runner user a
+      # private group first, as Ubuntu and Debian create for every user.
+      - name: Test permission checks under umask 002
+        run: |
+          sudo groupadd --force "$USER"
+          sudo usermod --gid "$USER" "$USER"
+          sudo --preserve-env --user "$USER" --group "$USER" env "PATH=$PATH" just cli::test-group-umask
+
+      - name: Check the unchanged CLI intent against Rust
+        run: just cli::test-intent
+
+  macos-cli:
+    runs-on: [self-hosted, macos, arm64, hvf]
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: hyperlight-dev/ci-setup-workflow@59673866360458f8dd035f4a9fa766aeebad2038 # v2.3.1
+        with:
+          additional-toolchain-directory: cli
+          just-version: "1.43"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check and test the macOS CLI
+        run: just cli::test-macos
+
+      - name: Build the macOS CLI
+        run: just cli::build-macos
+
+  hluk-helper:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            cli/target
+            helper/target
+            build/hluk
+            build/kernel
+          key: helper-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('cli/Cargo.lock', 'cli/Cargo.toml', 'cli/rust-toolchain.toml', 'helper/Cargo.lock', 'helper/Cargo.toml', 'helper/rust-toolchain.toml') }}
+
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+
+      - name: Check and test the helper
+        run: just helper::test
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm || true
+          sudo chmod 0666 /dev/kvm
+
+      - name: Build templates to drive the helper with
+        run: |
+          just cli::build cli::setup-hluk
+          cli/target/debug/ly build docs/examples/hello-rust --output build/helper-template
+          just helper::incarnation-template cli/target/debug/ly build/helper-incarnation-template
+
+      - name: Drive the helper over fiberd's protocol
+        env:
+          LAMPYR_HELPER_INCARNATION_TEMPLATE: build/helper-incarnation-template
+        run: just helper::test-kvm build/helper-template
+
+      - name: Prepare the helper image context
+        run: just helper::prepare-image
+
+  # Builds what the cluster suites install in place of the published
+  # controller inputs: the stock fiberd, helper and fiberd-k8s-controller
+  # images and the controller's manifest, from upstream/pins.env's commits
+  # and this checkout's helper, once for every suite.
+  cluster-inputs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Cargo builds only the helper here, so this job caches apart from
+      # hluk-helper, which also builds the CLI and runtime assets.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            helper/target
+          key: cluster-inputs-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('helper/Cargo.lock', 'helper/Cargo.toml', 'helper/rust-toolchain.toml') }}
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: "**/go.sum"
+
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+
+      - uses: azure/setup-kubectl@bda439f5f36b99b262ebdcd3613869bddb064c8e # v5.2.0
+        with:
+          version: v1.35.0
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          name: lampyr-ci-cache
+
+      - name: Check out the pinned fiberd
+        run: just upstream::prepare-fiberd-image
+
+      # The cluster inputs build fiberd as go.mod's version, which fiberd
+      # -version prints, so the cache is warmed with it too.
+      - name: Read the fiberd version
+        id: fiberd-version
+        # A failure inside $(...) as an argument would not stop the step.
+        run: |
+          version=$(just upstream::fiberd-version)
+          [[ -n $version ]] || { echo "just upstream::fiberd-version printed nothing" >&2; exit 1; }
+          printf 'version=%s\n' "$version" >>"$GITHUB_OUTPUT"
+
+      # fiberd's image builds criu and its zygote library, so keep every
+      # stage; the pin changes rarely.
+      - name: Warm the stock fiberd build cache
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          builder: lampyr-ci-cache
+          context: build/upstream/fiberd
+          file: build/upstream/fiberd/docker/fiberd/Dockerfile
+          target: fiberd
+          build-args: VERSION=${{ steps.fiberd-version.outputs.version }}
+          platforms: linux/amd64
+          provenance: false
+          cache-from: type=gha,scope=ci-upstream-fiberd,timeout=2m
+          cache-to: type=gha,mode=max,scope=ci-upstream-fiberd,ignore-error=true,timeout=2m
+
+      - name: Build the cluster suites' controller inputs
+        env:
+          BUILDX_BUILDER: lampyr-ci-cache
+        run: just upstream::cluster-inputs build/cluster-inputs
+
+      - name: Upload the cluster suites' controller inputs
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cluster-inputs-${{ github.sha }}
+          path: build/cluster-inputs
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  provider-arm64-guests:
+    name: provider-arm64-guests (${{ matrix.provider }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        provider: [kind, k3d, azure]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        with:
+          platforms: arm64
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+
+      - name: Install provider packaging tools
+        run: sudo apt-get update -q && sudo apt-get install -y --no-install-recommends cpio
+
+      - name: Build macOS ARM64 provider rootfs
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ./providers/${{ matrix.provider }}
+          file: ./providers/${{ matrix.provider }}/Dockerfile
+          target: rootfs
+          platforms: linux/arm64
+          build-contexts: |
+            platform=./k8s
+            common=./providers/common
+            kind=./providers/kind
+          load: true
+          tags: lampyr-provider-${{ matrix.provider }}-rootfs-arm64:0.1.0
+          provenance: false
+          cache-from: type=gha,scope=ci-provider-${{ matrix.provider }}-linux-arm64,timeout=2m
+          cache-to: type=gha,mode=max,scope=ci-provider-${{ matrix.provider }}-linux-arm64,ignore-error=true,timeout=2m
+
+      - name: Package macOS ARM64 provider guest
+        env:
+          LAMPYR_PROVIDER_PREBUILT_IMAGE: lampyr-provider-${{ matrix.provider }}-rootfs-arm64:0.1.0
+        run: |
+          just providers::build-platform-artifact \
+            "${{ matrix.provider }}" \
+            "$RUNNER_TEMP/provider-${{ matrix.provider }}" \
+            linux/arm64 macos aarch64
+
+      - name: Upload macOS ARM64 provider guests
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: provider-guests-darwin-arm64-${{ matrix.provider }}-${{ github.sha }}
+          path: ${{ runner.temp }}/provider-${{ matrix.provider }}
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  macos-provider-snapshots:
+    needs:
+      - provider-arm64-guests
+    runs-on: [self-hosted, macos, arm64, hvf]
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: hyperlight-dev/ci-setup-workflow@59673866360458f8dd035f4a9fa766aeebad2038 # v2.3.1
+        with:
+          additional-toolchain-directory: cli
+          just-version: "1.43"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download macOS ARM64 provider guests
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: provider-guests-darwin-arm64-*-${{ github.sha }}
+          path: ${{ runner.temp }}/providers-darwin-arm64
+          merge-multiple: true
+
+      - name: Capture and restore macOS provider snapshots
+        run: |
+          just providers::capture-platform-variants \
+            "$RUNNER_TEMP/providers-darwin-arm64" \
+            "$RUNNER_TEMP/provider-variants-hvf" \
+            macos aarch64
+
+  azure-provider:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+
+      - name: Check the Azure provider without cloud credentials
+        run: just azure::test-unit
+
+      - name: Build the Azure node setup image
+        run: just azure::node-setup-image
+
+  azure-guest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            cli/target
+            providers/runtime/build/elfloader_hyperlight-x86_64
+          key: cargo-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('cli/Cargo.lock', 'cli/Cargo.toml', 'cli/rust-toolchain.toml') }}
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: "**/go.sum"
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+      - name: Install rootfs tools and enable KVM
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends cpio
+          sudo chmod 0666 /dev/kvm
+      - name: Test the Azure guest without cloud credentials
+        run: just azure::test
+
+  kind-provider:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+      - name: Check the Kind provider without a cluster
+        run: just kind::test-unit
+      - name: Check the k3d provider without a cluster
+        run: just k3d::test-unit
+
+  kind-provider-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            cli/target
+            providers/runtime/build/elfloader_hyperlight-x86_64
+          key: cargo-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('cli/Cargo.lock', 'cli/Cargo.toml', 'cli/rust-toolchain.toml') }}
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          name: lampyr-kind-provider-cache
+      - name: Warm the Kind provider rootfs build cache
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          builder: lampyr-kind-provider-cache
+          context: ./providers/kind
+          file: ./providers/kind/Dockerfile
+          target: rootfs
+          platforms: linux/amd64
+          build-contexts: |
+            platform=./k8s
+            common=./providers/common
+          provenance: false
+          cache-from: type=gha,scope=ci-provider-kind-rootfs,timeout=2m
+          cache-to: type=gha,mode=min,scope=ci-provider-kind-rootfs,ignore-error=true,timeout=2m
+      - name: Install rootfs tools and enable KVM
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends cpio
+          sudo chmod 0666 /dev/kvm
+      - name: Exercise Kind guest ownership and lifecycle
+        env:
+          BUILDX_BUILDER: lampyr-kind-provider-cache
+        run: just kind::test
+      - name: Test CLI runtime and provider boundaries
+        run: |
+          LAMPYR_TEST_ROOTFS="$PWD/providers/kind/build/rootfs/rootfs.cpio" \
+            just cli::test-runtime
+
+  k3d-integration:
+    name: k3d-integration (${{ matrix.name }})
+    needs: [cluster-inputs]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: nodejs
+            examples: hello-nodejs
+            lifecycle_only: "0"
+            runtime_only: "1"
+          - name: python
+            examples: hello-python
+            lifecycle_only: "0"
+            runtime_only: "1"
+          - name: go
+            examples: hello-go
+            lifecycle_only: "0"
+            runtime_only: "1"
+          - name: rust
+            examples: hello-rust
+            lifecycle_only: "0"
+            runtime_only: "1"
+          - name: dotnet
+            examples: hello-dotnet
+            lifecycle_only: "0"
+            runtime_only: "1"
+          - name: lifecycle
+            examples: ""
+            lifecycle_only: "1"
+            runtime_only: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Free unused preinstalled SDK space on the hosted runner
+        # A single compiled example can consume about 8 GB before cleanup.
+        run: |
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          df -h /
+          for unused in /usr/local/lib/android /usr/share/dotnet /usr/local/.ghcup /opt/hostedtoolcache/CodeQL; do
+            if [ -d "$unused" ]; then
+              sudo du -sh "$unused"
+              sudo rm --recursive --force -- "$unused"
+            fi
+          done
+          df -h /
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            cli/target
+            build/hluk
+            build/kernel
+            providers/runtime/build/elfloader_hyperlight-x86_64
+          key: cargo-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('cli/Cargo.lock', 'cli/Cargo.toml', 'cli/rust-toolchain.toml') }}
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: "**/go.sum"
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+      - uses: azure/setup-kubectl@bda439f5f36b99b262ebdcd3613869bddb064c8e # v5.2.0
+        with:
+          version: v1.35.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          name: lampyr-k3d-cache
+      - name: Warm the k3d provider build cache
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          builder: lampyr-k3d-cache
+          context: ./providers/k3d
+          file: ./providers/k3d/Dockerfile
+          target: rootfs
+          platforms: linux/amd64
+          build-contexts: |
+            common=./providers/common
+            kind=./providers/kind
+          provenance: false
+          cache-from: type=gha,scope=ci-provider-k3d-rootfs,timeout=2m
+          cache-to: type=gha,mode=min,scope=ci-provider-k3d-rootfs,ignore-error=true,timeout=2m
+      - name: Download the cluster suites' controller inputs
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: cluster-inputs-${{ github.sha }}
+          path: build/cluster-inputs
+      - name: Install test tools and enable KVM
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends cpio jq
+          sudo chmod 0666 /dev/kvm
+      - name: Deploy and test every runtime example on k3d
+        env:
+          BUILDX_BUILDER: lampyr-k3d-cache
+          LAMPYR_CI_EXAMPLES: ${{ matrix.examples }}
+          LAMPYR_CI_RUNTIME_ONLY: ${{ matrix.runtime_only }}
+          LAMPYR_CI_LIFECYCLE_ONLY: ${{ matrix.lifecycle_only }}
+          LAMPYR_CLUSTER_INPUTS: ${{ github.workspace }}/build/cluster-inputs
+        run: just test-k3d-integration
+
+  k3d-provider-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            cli/target
+            providers/runtime/build/elfloader_hyperlight-x86_64
+          key: cargo-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('cli/Cargo.lock', 'cli/Cargo.toml', 'cli/rust-toolchain.toml') }}
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          name: lampyr-k3d-provider-cache
+      - name: Warm the k3d provider build cache
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          builder: lampyr-k3d-provider-cache
+          context: ./providers/k3d
+          file: ./providers/k3d/Dockerfile
+          target: rootfs
+          platforms: linux/amd64
+          build-contexts: |
+            common=./providers/common
+            kind=./providers/kind
+          provenance: false
+          cache-from: type=gha,scope=ci-provider-k3d-rootfs,timeout=2m
+          cache-to: type=gha,mode=min,scope=ci-provider-k3d-rootfs,ignore-error=true,timeout=2m
+      - name: Install rootfs tools and enable KVM
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends cpio
+          sudo chmod 0666 /dev/kvm
+      - name: Exercise k3d guest ownership and lifecycle
+        env:
+          BUILDX_BUILDER: lampyr-k3d-provider-cache
+        run: just k3d::test
+
+  unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Free unused preinstalled SDK space on the hosted runner
+        # The handler contracts build each runtime's rootfs in Docker on top of
+        # the restored cargo cache, which fills the root disk. Nothing here uses
+        # the Android, Haskell or CodeQL bundles. The host .NET SDK stays: the
+        # native contracts compile and run the dotnet adapter with it.
+        run: |
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          df -h /
+          for unused in /usr/local/lib/android /usr/local/.ghcup /opt/hostedtoolcache/CodeQL; do
+            if [ -d "$unused" ]; then
+              sudo du -sh "$unused"
+              sudo rm --recursive --force -- "$unused"
+            fi
+          done
+          df -h /
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            cli/target
+            build/hluk
+            build/kernel
+            providers/runtime/build/elfloader_hyperlight-x86_64
+          key: cargo-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('cli/Cargo.lock', 'cli/Cargo.toml', 'cli/rust-toolchain.toml') }}
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: "**/go.sum"
+
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+
+      - name: Install preview test dependency
+        run: sudo apt-get update -q && sudo apt-get install -y --no-install-recommends python3-yaml
+
+      - name: Vet
+        run: just lint-go
+
+      - name: Run unit tests
+        run: just test-unit
+
+      - name: Check executable CLI intent
+        run: just test-cli
+
+      - name: Check generated examples
+        run: just examples-check
+
+      - name: Check preview release tooling
+        run: just test-preview-release
+
+  local-runtime:
+    name: local-runtime (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: nodejs
+            examples: hello-nodejs hello-nodejs-standalone
+            contracts: "0"
+          - name: python
+            examples: hello-python hello-python-standalone
+            contracts: "0"
+          - name: go
+            examples: hello-go hello-go-standalone
+            contracts: "0"
+          - name: rust
+            examples: hello-rust hello-rust-standalone
+            contracts: "0"
+          - name: systems
+            examples: hello-dotnet hello-dotnet-standalone
+            contracts: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Free unused Android SDK space on the hosted runner
+        run: |
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          df -h /
+          if [ -d /usr/local/lib/android ]; then
+            sudo du -sh /usr/local/lib/android
+            sudo rm --recursive --force -- /usr/local/lib/android
+          fi
+          df -h /
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            cli/target
+            build/hluk
+            build/kernel
+            providers/runtime/build/elfloader_hyperlight-x86_64
+          key: cargo-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('cli/Cargo.lock', 'cli/Cargo.toml', 'cli/rust-toolchain.toml') }}
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: "**/go.sum"
+
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+
+      - name: Build runtime assets
+        run: just build
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm || true
+          sudo chmod 0666 /dev/kvm
+
+      - name: Run local runtime examples
+        env:
+          LAMPYR_CI_EXAMPLES: ${{ matrix.examples }}
+          LAMPYR_CI_CONTRACTS: ${{ matrix.contracts }}
+        run: just test-examples-local-prebuilt
+
+      - name: Validate standalone CLI diagnostics
+        if: matrix.name == 'nodejs'
+        run: |
+          just build-ly
+          build/ly doctor
+
+  local-contracts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            cli/target
+            build/hluk
+            build/kernel
+            providers/runtime/build/elfloader_hyperlight-x86_64
+          key: cargo-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('cli/Cargo.lock', 'cli/Cargo.toml', 'cli/rust-toolchain.toml') }}
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+      - name: Build the CLI and runtime assets
+        run: just setup-hluk build-ly
+      - name: Enable KVM
+        run: sudo chmod 0666 /dev/kvm
+      - name: Run VM handler contracts
+        run: python3 tests/contracts/test_contract.py --ly build/ly --vm
+
+  kind-runtime-integration:
+    name: kind-runtime-integration (${{ matrix.name }})
+    needs: [cluster-inputs]
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: node
+            suite: runtime
+            examples: hello-nodejs hello-nodejs-standalone
+            eventing: "0"
+            extras: "0"
+            release_gates: "0"
+          - name: node-eventing
+            suite: runtime
+            examples: hello-nodejs
+            eventing: "1"
+            eventing_only: "1"
+            extras: "0"
+            release_gates: "0"
+          - name: python
+            suite: runtime
+            examples: hello-python hello-python-standalone
+            eventing: "0"
+            extras: "0"
+            release_gates: "0"
+          - name: go
+            suite: runtime
+            examples: hello-go hello-go-standalone
+            eventing: "0"
+            extras: "0"
+            release_gates: "0"
+          - name: rust
+            suite: runtime
+            examples: hello-rust hello-rust-standalone
+            eventing: "0"
+            extras: "0"
+            release_gates: "0"
+          - name: dotnet
+            suite: runtime
+            examples: hello-dotnet hello-dotnet-standalone
+            eventing: "0"
+            extras: "0"
+            release_gates: "0"
+          - name: release-gates
+            suite: runtime
+            examples: hello-nodejs
+            eventing: "0"
+            extras: "0"
+            release_gates: "1"
+          - name: fresh-mode
+            suite: modes
+            examples: ""
+            eventing: "0"
+            extras: "1"
+            release_gates: "0"
+            mode_checks: fresh
+          - name: reuse-mode
+            suite: modes
+            examples: ""
+            eventing: "0"
+            extras: "1"
+            release_gates: "0"
+            mode_checks: reuse
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Free unused preinstalled SDK space on the hosted runner
+        # Building every runtime example and running Kind fills the runner's
+        # root disk without this headroom. .NET builds run inside Docker, so
+        # the host SDKs are unused here.
+        run: |
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          df -h /
+          for unused in /usr/local/lib/android /usr/share/dotnet /usr/local/.ghcup /opt/hostedtoolcache/CodeQL; do
+            if [ -d "$unused" ]; then
+              sudo du -sh "$unused"
+              sudo rm --recursive --force -- "$unused"
+            fi
+          done
+          df -h /
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            cli/target
+            build/hluk
+            build/kernel
+            providers/runtime/build/elfloader_hyperlight-x86_64
+          key: cargo-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('cli/Cargo.lock', 'cli/Cargo.toml', 'cli/rust-toolchain.toml') }}
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: "**/go.sum"
+
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+
+      - uses: azure/setup-kubectl@bda439f5f36b99b262ebdcd3613869bddb064c8e # v5.2.0
+        with:
+          version: v1.35.0
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          name: lampyr-ci-cache
+
+      - name: Build runtime assets
+        run: just build
+
+      - name: Warm the Kind provider rootfs build cache
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          builder: lampyr-ci-cache
+          context: ./providers/kind
+          file: ./providers/kind/Dockerfile
+          target: rootfs
+          platforms: linux/amd64
+          build-contexts: |
+            platform=./k8s
+            common=./providers/common
+          provenance: false
+          cache-from: type=gha,scope=ci-provider-kind-rootfs,timeout=2m
+          cache-to: type=gha,mode=min,scope=ci-provider-kind-rootfs,ignore-error=true,timeout=2m
+
+      - name: Warm the Fiberd build cache
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          builder: lampyr-ci-cache
+          context: .
+          file: ./fiberd/ci.Dockerfile
+          platforms: linux/amd64
+          provenance: false
+          cache-from: type=gha,scope=ci-fiberd,timeout=2m
+          cache-to: type=gha,mode=min,scope=ci-fiberd,ignore-error=true,timeout=2m
+
+      - name: Warm the fiber router build cache
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          builder: lampyr-ci-cache
+          context: .
+          file: ./activator/ci.Dockerfile
+          platforms: linux/amd64
+          provenance: false
+          cache-from: type=gha,scope=ci-router,timeout=2m
+          cache-to: type=gha,mode=min,scope=ci-router,ignore-error=true,timeout=2m
+
+      - name: Download the cluster suites' controller inputs
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: cluster-inputs-${{ github.sha }}
+          path: build/cluster-inputs
+
+      - name: Install Kind and rootfs tools
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends cpio jq
+          just install-kind
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm || true
+          sudo chmod 0666 /dev/kvm
+
+      - name: Run Kind runtime examples
+        env:
+          BUILDX_BUILDER: lampyr-ci-cache
+          LAMPYR_CI_SUITE: ${{ matrix.suite }}
+          LAMPYR_CI_EXAMPLES: ${{ matrix.examples }}
+          LAMPYR_CI_EVENTING: ${{ matrix.eventing }}
+          LAMPYR_CI_EVENTING_ONLY: ${{ matrix.eventing_only || '0' }}
+          LAMPYR_CI_RUNTIME_EXTRAS: ${{ matrix.extras }}
+          LAMPYR_CI_RELEASE_GATES: ${{ matrix.release_gates }}
+          LAMPYR_CI_MODE_CHECKS: ${{ matrix.mode_checks || 'all' }}
+          LAMPYR_CLUSTER_INPUTS: ${{ github.workspace }}/build/cluster-inputs
+        run: just test-kind-runtime-integration-prebuilt
+
+      - name: Upload release gate evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: lampyr-release-gates-${{ matrix.name }}-${{ github.sha }}
+          path: build/release-results/
+          if-no-files-found: ignore
+          retention-days: 30
+
+  kind-cluster-lifecycle:
+    name: kind-cluster-lifecycle (${{ matrix.name }})
+    needs: [cluster-inputs]
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: existing-cluster
+            suite: lifecycle
+          - name: eventing
+            suite: eventing-lifecycle
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Free unused Android SDK space on the hosted runner
+        run: |
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          df -h /
+          if [ -d /usr/local/lib/android ]; then
+            sudo du -sh /usr/local/lib/android
+            sudo rm --recursive --force -- /usr/local/lib/android
+          fi
+          df -h /
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            cli/target
+            build/hluk
+            build/kernel
+            providers/runtime/build/elfloader_hyperlight-x86_64
+          key: cargo-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('cli/Cargo.lock', 'cli/Cargo.toml', 'cli/rust-toolchain.toml') }}
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: kind-provider-artifact
+        with:
+          path: providers/kind/build/rootfs
+          key: kind-provider-artifact-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('providers/kind/Dockerfile', 'providers/kind/Justfile', 'providers/kind/artifact.json', 'providers/kind/provider.py', 'providers/kind/requirements.txt', 'providers/kind/templates/**', 'providers/common/**', 'providers/build-rootfs.sh', 'providers/package.py') }}
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: "**/go.sum"
+
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+
+      - uses: azure/setup-kubectl@bda439f5f36b99b262ebdcd3613869bddb064c8e # v5.2.0
+        with:
+          version: v1.35.0
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          name: lampyr-ci-cache
+
+      - name: Build runtime assets
+        run: just build
+
+      - name: Prepare the Kind provider artifact
+        if: steps.kind-provider-artifact.outputs.cache-hit != 'true'
+        env:
+          BUILDX_BUILDER: lampyr-ci-cache
+        run: just kind::build
+
+      - name: Warm the Fiberd build cache
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          builder: lampyr-ci-cache
+          context: .
+          file: ./fiberd/ci.Dockerfile
+          platforms: linux/amd64
+          provenance: false
+          cache-from: type=gha,scope=ci-fiberd,timeout=2m
+          cache-to: type=gha,mode=min,scope=ci-fiberd,ignore-error=true,timeout=2m
+
+      - name: Warm the fiber router build cache
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          builder: lampyr-ci-cache
+          context: .
+          file: ./activator/ci.Dockerfile
+          platforms: linux/amd64
+          provenance: false
+          cache-from: type=gha,scope=ci-router,timeout=2m
+          cache-to: type=gha,mode=min,scope=ci-router,ignore-error=true,timeout=2m
+
+      - name: Download the cluster suites' controller inputs
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: cluster-inputs-${{ github.sha }}
+          path: build/cluster-inputs
+
+      - name: Install Kind and rootfs tools
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends cpio jq
+          just install-kind
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm || true
+          sudo chmod 0666 /dev/kvm
+
+      - name: Run Kind provider and existing-cluster lifecycle
+        env:
+          BUILDX_BUILDER: lampyr-ci-cache
+          LAMPYR_CI_SUITE: ${{ matrix.suite }}
+          LAMPYR_CLUSTER_INPUTS: ${{ github.workspace }}/build/cluster-inputs
+        run: just test-kind-lifecycle-integration-prebuilt
+
+  knative-portability:
+    needs: [cluster-inputs]
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Free unused Android SDK space on the hosted runner
+        run: |
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          df -h /
+          if [ -d /usr/local/lib/android ]; then
+            sudo du -sh /usr/local/lib/android
+            sudo rm --recursive --force -- /usr/local/lib/android
+          fi
+          df -h /
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            cli/target
+            build/hluk
+            build/kernel
+            providers/runtime/build/elfloader_hyperlight-x86_64
+          key: cargo-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('cli/Cargo.lock', 'cli/Cargo.toml', 'cli/rust-toolchain.toml') }}
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: "**/go.sum"
+
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+
+      - uses: azure/setup-kubectl@bda439f5f36b99b262ebdcd3613869bddb064c8e # v5.2.0
+        with:
+          version: v1.35.0
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          name: lampyr-ci-cache
+
+      - name: Download the cluster suites' controller inputs
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: cluster-inputs-${{ github.sha }}
+          path: build/cluster-inputs
+
+      - name: Install Kind and rootfs tools
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends cpio jq
+          just install-kind
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm || true
+          sudo chmod 0666 /dev/kvm
+
+      # Two Kind clusters run here at once, Lampyr's with cert-manager,
+      # its csi-driver and fiberd-k8s-controller, and the hosted runner's
+      # default of 128 inotify instances is too few for both: the vanilla
+      # cluster's Pods never become ready.
+      - name: Raise inotify limits for two Kind clusters
+        run: |
+          sudo sysctl -w fs.inotify.max_user_instances=1024
+          sudo sysctl -w fs.inotify.max_user_watches=1048576
+
+      - name: Verify identical Knative Service on Pods and Fibers
+        env:
+          BUILDX_BUILDER: lampyr-ci-cache
+          LAMPYR_CLUSTER_INPUTS: ${{ github.workspace }}/build/cluster-inputs
+        run: just test-knative-portability
+
+  kind-existing-cluster:
+    needs: [cluster-inputs]
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Free unused Android SDK space on the hosted runner
+        run: |
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          df -h /
+          if [ -d /usr/local/lib/android ]; then
+            sudo du -sh /usr/local/lib/android
+            sudo rm --recursive --force -- /usr/local/lib/android
+          fi
+          df -h /
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            cli/target
+            build/hluk
+            build/kernel
+            providers/runtime/build/elfloader_hyperlight-x86_64
+          key: cargo-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('cli/Cargo.lock', 'cli/Cargo.toml', 'cli/rust-toolchain.toml') }}
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: "**/go.sum"
+
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+
+      - uses: azure/setup-kubectl@bda439f5f36b99b262ebdcd3613869bddb064c8e # v5.2.0
+        with:
+          version: v1.35.0
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          name: lampyr-ci-cache
+
+      - name: Build runtime assets
+        run: just build
+
+      - name: Warm the Fiberd build cache
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          builder: lampyr-ci-cache
+          context: .
+          file: ./fiberd/ci.Dockerfile
+          platforms: linux/amd64
+          provenance: false
+          cache-from: type=gha,scope=ci-fiberd,timeout=2m
+          cache-to: type=gha,mode=min,scope=ci-fiberd,ignore-error=true,timeout=2m
+
+      - name: Warm the fiber router build cache
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          builder: lampyr-ci-cache
+          context: .
+          file: ./activator/ci.Dockerfile
+          platforms: linux/amd64
+          provenance: false
+          cache-from: type=gha,scope=ci-router,timeout=2m
+          cache-to: type=gha,mode=min,scope=ci-router,ignore-error=true,timeout=2m
+
+      - name: Download the cluster suites' controller inputs
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: cluster-inputs-${{ github.sha }}
+          path: build/cluster-inputs
+
+      - name: Install Kind and rootfs tools
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends cpio jq
+          just install-kind
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm || true
+          sudo chmod 0666 /dev/kvm
+
+      - name: Install and use Lampyr on an independently created Kind cluster
+        env:
+          BUILDX_BUILDER: lampyr-ci-cache
+          LAMPYR_CLUSTER_INPUTS: ${{ github.workspace }}/build/cluster-inputs
+        run: just test-existing-kind-integration
+
+  # Follows the README on a host set up like a developer's machine instead of
+  # consuming artifacts from another job: no world-writable /dev/kvm, Docker's
+  # containerd image store, and a docker-container buildx builder selected.
+  # The exception is fiberd-k8s-controller's inputs, which have no release
+  # yet: the job takes the ones CI builds as the checkout's defaults, as a
+  # release's platform package would carry them.
+  new-developer-workflow:
+    needs: [cluster-inputs]
+    runs-on: ubuntu-latest
+    # Above the steps' own limits: a step that times out fails, and failed
+    # steps get diagnostics; a job that times out is cancelled instead.
+    timeout-minutes: 50
+    defaults:
+      run:
+        # Set up by the "Join the kvm group" step; the steps before it use bash.
+        shell: /usr/local/bin/kvm-group-shell {0}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Free unused Android SDK space on the hosted runner
+        shell: bash
+        run: |
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          df -h /
+          if [ -d /usr/local/lib/android ]; then
+            sudo du -sh /usr/local/lib/android
+            sudo rm --recursive --force -- /usr/local/lib/android
+          fi
+          df -h /
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            cli/target
+            build/hluk
+            build/kernel
+            providers/runtime/build/elfloader_hyperlight-x86_64
+          key: cargo-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('cli/Cargo.lock', 'cli/Cargo.toml', 'cli/rust-toolchain.toml') }}
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: "**/go.sum"
+
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+
+      - uses: azure/setup-kubectl@bda439f5f36b99b262ebdcd3613869bddb064c8e # v5.2.0
+        with:
+          version: v1.35.0
+
+      - name: Install the documented prerequisites
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends cpio jq
+          just install-kind
+
+      # A developer reaches /dev/kvm through the kvm group, so join it rather
+      # than open up the device. Group changes don't reach the runner's
+      # running session, so later steps run through a shell that starts them
+      # with sudo as the same user, which picks up the new group. sudo passes
+      # SIGINT and SIGTERM on, so step timeouts still stop the script.
+      - name: Join the kvm group
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+            echo "this runner already opens /dev/kvm outside the kvm group, so the job wouldn't test it" >&2
+            exit 1
+          fi
+          sudo usermod --append --groups kvm "$(id --user --name)"
+          sudo tee /usr/local/bin/kvm-group-shell > /dev/null <<'EOF'
+          #!/bin/sh
+          # sudo resets the environment, so pass the step-specific GitHub and
+          # runner paths explicitly.
+          exec sudo --user="$(id --user --name)" /usr/bin/env \
+            "PATH=$PATH" \
+            "GITHUB_ENV=$GITHUB_ENV" \
+            "GITHUB_OUTPUT=$GITHUB_OUTPUT" \
+            "GITHUB_PATH=$GITHUB_PATH" \
+            "GITHUB_STEP_SUMMARY=$GITHUB_STEP_SUMMARY" \
+            "RUNNER_TEMP=$RUNNER_TEMP" \
+            "BUILDX_BUILDER=${BUILDX_BUILDER:-}" \
+            bash --noprofile --norc -eo pipefail "$@"
+          EOF
+          sudo chmod 0755 /usr/local/bin/kvm-group-shell
+          echo '[ -r /dev/kvm ] && [ -w /dev/kvm ]' > "$RUNNER_TEMP/kvm-access.sh"
+          kvm-group-shell "$RUNNER_TEMP/kvm-access.sh"
+          stat --format '%U:%G %a' /dev/kvm | tee "$RUNNER_TEMP/kvm-before"
+
+      - name: Use the containerd image store
+        timeout-minutes: 5
+        run: |
+          config=/etc/docker/daemon.json
+          sudo test -f "$config" || echo '{}' | sudo tee "$config" > /dev/null
+          sudo jq '.features["containerd-snapshotter"] = true' "$config" \
+            | sudo tee "$config.new" > /dev/null
+          sudo mv "$config.new" "$config"
+          sudo systemctl restart docker
+          docker info --format '{{.DriverStatus}}' | grep io.containerd.snapshotter > /dev/null
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          name: lampyr-ci-cache
+
+      - name: Build the CLI and container inputs
+        timeout-minutes: 10
+        run: |
+          just build-ly setup-hluk build-fiberd build-control-plane
+          build/ly doctor
+          echo "$PWD/build" >> "$GITHUB_PATH"
+
+      - name: Download the cluster suites' controller inputs
+        timeout-minutes: 5
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: cluster-inputs-${{ github.sha }}
+          path: build/cluster-inputs
+
+      # The Kind provider shares the registry this starts on its default
+      # port, 5002, from which the nodes pull the built images.
+      # kvm-group-shell passes on only the variables it names.
+      - name: Use the cluster suites' controller inputs
+        timeout-minutes: 5
+        shell: bash
+        env:
+          LAMPYR_CLUSTER_INPUTS: ${{ github.workspace }}/build/cluster-inputs
+        run: just use-cluster-inputs 5002
+
+      - name: Warm the Kind provider rootfs build cache
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          builder: lampyr-ci-cache
+          context: ./providers/kind
+          file: ./providers/kind/Dockerfile
+          target: rootfs
+          platforms: linux/amd64
+          build-contexts: |
+            platform=./k8s
+            common=./providers/common
+          provenance: false
+          cache-from: type=gha,scope=ci-provider-kind-rootfs,timeout=2m
+          cache-to: type=gha,mode=min,scope=ci-provider-kind-rootfs,ignore-error=true,timeout=2m
+
+      - name: Warm the Fiberd build cache
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          builder: lampyr-ci-cache
+          context: .
+          file: ./fiberd/ci.Dockerfile
+          platforms: linux/amd64
+          provenance: false
+          cache-from: type=gha,scope=ci-fiberd,timeout=2m
+          cache-to: type=gha,mode=min,scope=ci-fiberd,ignore-error=true,timeout=2m
+
+      - name: Warm the fiber router build cache
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          builder: lampyr-ci-cache
+          context: .
+          file: ./activator/ci.Dockerfile
+          platforms: linux/amd64
+          provenance: false
+          cache-from: type=gha,scope=ci-router,timeout=2m
+          cache-to: type=gha,mode=min,scope=ci-router,ignore-error=true,timeout=2m
+
+      - name: Install a local Kind cluster
+        timeout-minutes: 25
+        env:
+          BUILDX_BUILDER: lampyr-ci-cache
+        run: |
+          # kind::build takes an optional snapshot mode, so run each recipe on its own.
+          just kind::build
+          just cli::runtime-images
+          docker buildx prune --builder lampyr-ci-cache --all --force
+          df -h /
+          just cluster-install
+
+      # In the README's order: ly dev keeps running while the app is built and
+      # deployed, and is stopped afterwards to free port 8080.
+      - name: Run, build and deploy the demo apps
+        timeout-minutes: 25
+        run: |
+          answers() {
+            curl --fail --silent --show-error --max-time 10 \
+              -H "Host: $app.default.localhost" http://127.0.0.1:8080/test \
+              | tee /dev/stderr | grep "hello from $app" > /dev/null
+          }
+          for app in demo-app second-app; do
+            build/ly scaffold service "$app"
+            service="services/$app"
+            source scripts/runtime-examples.sh
+            expose_workspace_services "$PWD"
+            # Each app says its own name, so a response shows which one answered.
+            sed --in-place "s/hello from Hyperlight edge/hello from $app/" "$service/handler.js"
+            grep --quiet "hello from $app" "$service/handler.js"
+            build/ly dev --port 8080 "$service" > "$RUNNER_TEMP/$app-dev.log" 2>&1 &
+            dev=$!
+            ok=
+            for _ in $(seq 120); do
+              if answers 2> /dev/null; then ok=1; break; fi
+              kill -0 "$dev" 2> /dev/null || break
+              sleep 5
+            done
+            if [ -z "$ok" ]; then cat "$RUNNER_TEMP/$app-dev.log"; exit 1; fi
+
+            build/ly build "$service"
+            build/ly deploy --image "localhost:5002/$app:v1" "$service"
+            # ly build rewrote the rootfs that ly dev is running from.
+            kill -0 "$dev" || { cat "$RUNNER_TEMP/$app-dev.log"; exit 1; }
+            answers || { cat "$RUNNER_TEMP/$app-dev.log"; exit 1; }
+
+            kill "$dev" 2> /dev/null || true
+            wait "$dev" 2> /dev/null || true
+            for _ in $(seq 30); do
+              status=0
+              curl --silent --max-time 5 --output /dev/null http://127.0.0.1:8080/ || status=$?
+              # 7: connection refused; a timeout would mean something still holds the port.
+              [ "$status" -eq 7 ] && continue 2
+              sleep 1
+            done
+            echo "port 8080 still answers after stopping ly dev for $app" >&2
+            exit 1
+          done
+
+      - name: Call the deployed apps through Kourier
+        timeout-minutes: 10
+        run: |
+          kubectl port-forward -n kourier-system svc/kourier 8080:80 &
+          forward=$!
+          trap 'kill "$forward" 2> /dev/null || true' EXIT
+          for app in demo-app second-app; do
+            curl --fail --silent --show-error --max-time 30 --retry 8 --retry-delay 2 --retry-all-errors \
+              -H "Host: $app.default.localhost" http://127.0.0.1:8080/test \
+              | tee /dev/stderr | grep "hello from $app" > /dev/null
+          done
+          # Free the smoke-test homes before the walkthrough deploys its own app.
+          build/ly delete services/demo-app
+          build/ly delete services/second-app
+          # The walkthrough owns a separate disposable installation and registry.
+          build/ly cluster uninstall --provider kind --delete-cluster
+
+      - name: Check that /dev/kvm is unchanged
+        if: always()
+        timeout-minutes: 1
+        shell: bash
+        run: |
+          # Without a snapshot the KVM step already failed and said why.
+          [ -f "$RUNNER_TEMP/kvm-before" ] || exit 0
+          stat --format '%U:%G %a' /dev/kvm | tee "$RUNNER_TEMP/kvm-after"
+          diff "$RUNNER_TEMP/kvm-before" "$RUNNER_TEMP/kvm-after"
+
+      - name: Collect diagnostics
+        if: failure()
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          kubectl get pods --all-namespaces --output wide || true
+          kubectl get events --all-namespaces --sort-by=.lastTimestamp | tail -n 100 || true
+          mkdir -p "$RUNNER_TEMP/diagnostics"
+          cp "$RUNNER_TEMP"/*-dev.log "$RUNNER_TEMP/diagnostics/" 2> /dev/null || true
+          kind export logs --name lampyr "$RUNNER_TEMP/diagnostics/kind" || true
+
+      - name: Upload diagnostics
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: new-developer-workflow-diagnostics
+          path: ${{ runner.temp }}/diagnostics
+          if-no-files-found: ignore
+          retention-days: 7
+
+  walkthrough:
+    needs: [cluster-inputs]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Free unused Android SDK space on the hosted runner
+        run: |
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          sudo rm --recursive --force -- /usr/local/lib/android
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            cli/target
+            build/hluk
+            build/kernel
+            providers/runtime/build/elfloader_hyperlight-x86_64
+          key: cargo-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('cli/Cargo.lock', 'cli/Cargo.toml', 'cli/rust-toolchain.toml') }}
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: "**/go.sum"
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+      - uses: azure/setup-kubectl@bda439f5f36b99b262ebdcd3613869bddb064c8e # v5.2.0
+        with:
+          version: v1.35.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          name: lampyr-walkthrough-cache
+      - name: Build the CLI and container inputs
+        run: just build-ly setup-hluk build-fiberd build-control-plane
+      - name: Download the cluster suites' controller inputs
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: cluster-inputs-${{ github.sha }}
+          path: build/cluster-inputs
+      # The walkthrough installs with registryPort 5500, so the Kind
+      # provider shares the registry this starts there.
+      - name: Use the cluster suites' controller inputs
+        env:
+          LAMPYR_CLUSTER_INPUTS: ${{ github.workspace }}/build/cluster-inputs
+        run: just use-cluster-inputs 5500
+      - name: Warm the Kind provider rootfs build cache
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          builder: lampyr-walkthrough-cache
+          context: ./providers/kind
+          file: ./providers/kind/Dockerfile
+          target: rootfs
+          platforms: linux/amd64
+          build-contexts: |
+            platform=./k8s
+            common=./providers/common
+          provenance: false
+          cache-from: type=gha,scope=ci-provider-kind-rootfs,timeout=2m
+          cache-to: type=gha,mode=min,scope=ci-provider-kind-rootfs,ignore-error=true,timeout=2m
+      - name: Warm the Fiberd build cache
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          builder: lampyr-walkthrough-cache
+          context: .
+          file: ./fiberd/ci.Dockerfile
+          platforms: linux/amd64
+          provenance: false
+          cache-from: type=gha,scope=ci-fiberd,timeout=2m
+          cache-to: type=gha,mode=min,scope=ci-fiberd,ignore-error=true,timeout=2m
+      - name: Warm the fiber router build cache
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          builder: lampyr-walkthrough-cache
+          context: .
+          file: ./activator/ci.Dockerfile
+          platforms: linux/amd64
+          provenance: false
+          cache-from: type=gha,scope=ci-router,timeout=2m
+          cache-to: type=gha,mode=min,scope=ci-router,ignore-error=true,timeout=2m
+      - name: Install Kind and rootfs tools
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends cpio jq
+          just install-kind
+          sudo chmod 0666 /dev/kvm
+      - name: Test the walkthrough
+        env:
+          BUILDX_BUILDER: lampyr-walkthrough-cache
+        run: just test-walkthrough
+
+  ci-passed:
+    if: always()
+    needs: [typos, runtime-assets, rust-cli, macos-cli, hluk-helper, cluster-inputs, provider-arm64-guests, macos-provider-snapshots, azure-provider, unit, local-runtime, local-contracts, kind-runtime-integration, kind-cluster-lifecycle, kind-existing-cluster, knative-portability, new-developer-workflow, walkthrough, kind-provider, kind-provider-integration, k3d-integration, k3d-provider-integration]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify all jobs passed
+        run: |
+          jq --exit-status 'all(.result == "success")' \
+            <<< '${{ toJson(needs) }}'

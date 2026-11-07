@@ -1,0 +1,2 @@
+FROM hluk-node-rootfs:latest AS rootfs
+COPY server.js /app/server.js

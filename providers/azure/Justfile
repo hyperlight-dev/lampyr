@@ -1,0 +1,78 @@
+set shell := ["bash", "-euo", "pipefail", "-c"]
+
+mod runtime '../runtime/Justfile'
+
+project-root := source_directory()
+repo-root := project-root / "../.."
+
+# Build the Azure Event Grid controller and adapter owned by this provider.
+build-eventgrid:
+    mkdir -p "{{project-root}}/build"
+    CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o "{{project-root}}/build/eventgrid-controller" "{{repo-root}}/providers/azure/eventgrid/cmd/controller"
+    CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o "{{project-root}}/build/eventgrid-adapter" "{{repo-root}}/providers/azure/eventgrid/cmd/adapter"
+
+# Prepare the Linux/amd64 Event Grid controller image context without publishing it.
+prepare-eventgrid-controller-image:
+    mkdir -p "{{project-root}}/build"
+    GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o "{{project-root}}/build/eventgrid-controller" "{{repo-root}}/providers/azure/eventgrid/cmd/controller"
+    python3 "{{repo-root}}/scripts/check_preview_images.py" --root "{{repo-root}}" --image eventgrid-controller --require-binaries
+
+# Prepare the Linux/amd64 Event Grid adapter image context without publishing it.
+prepare-eventgrid-adapter-image:
+    mkdir -p "{{project-root}}/build"
+    GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o "{{project-root}}/build/eventgrid-adapter" "{{repo-root}}/providers/azure/eventgrid/cmd/adapter"
+    python3 "{{repo-root}}/scripts/check_preview_images.py" --root "{{repo-root}}" --image eventgrid-adapter --require-binaries
+
+# Prepare both provider-owned Event Grid image contexts without publishing them.
+prepare-eventgrid-images: prepare-eventgrid-controller-image prepare-eventgrid-adapter-image
+
+# Validate the Linux/amd64 AKS node preparation image context without publishing it.
+prepare-node-setup-image:
+    python3 "{{repo-root}}/scripts/check_preview_images.py" --root "{{repo-root}}" --image azure-node-setup --require-binaries
+
+# Prepare every provider-owned preview image context without publishing it.
+prepare-preview-images: prepare-node-setup-image prepare-eventgrid-images
+
+# Build local Azure Event Grid images without coupling them to the platform package.
+eventgrid-images: build-eventgrid
+    for binary in eventgrid-controller eventgrid-adapter; do \
+        docker build --tag "ghcr.io/hyperlight-dev/lampyr/$binary:preview" --build-arg "BINARY=$binary" \
+            --file "{{project-root}}/eventgrid/ci.Dockerfile" "{{project-root}}"; \
+    done
+
+# Build the privileged AKS node preparation image locally.
+node-setup-image:
+    version=$(sed -n 's/^version = "\(.*\)"/\1/p' "{{repo-root}}/cli/Cargo.toml" | head -n 1); \
+    docker buildx build --platform linux/amd64 --load \
+        --tag "lampyr.local/azure-node-setup:$version" \
+        "{{project-root}}/node-setup"
+
+# Build this provider's guest independently of the ly binary.
+[positional-arguments]
+build target="rootfs" snapshot-mode="auto" guest-platform="linux/amd64" cold-os="linux" cold-architecture="x86_64":
+    bash "{{project-root}}/../build-rootfs.sh" "{{project-root}}/Dockerfile" "$1" "$3"
+    if [ "$1" = rootfs ]; then python3 "{{project-root}}/../package.py" "{{project-root}}" rootfs --snapshot-mode "$2" --cold-os "$4" --cold-architecture "$5"; fi
+
+# Capture a native variant from an existing canonical rootfs without rebuilding it.
+[positional-arguments]
+snapshot cold-os="linux" cold-architecture="x86_64":
+    python3 "{{project-root}}/../package.py" "{{project-root}}" rootfs --snapshot-mode variant --cold-os "$1" --cold-architecture "$2"
+
+# Check Azure provider Python and Event Grid Go code.
+lint:
+    python3 -m py_compile "{{project-root}}/provider.py" "{{project-root}}/eventgrid/lampyr_eventgrid.py"
+    go vet "{{repo-root}}/providers/azure/eventgrid/..."
+
+# Check provider state and ownership decisions without Azure credentials.
+test-unit: lint
+    python3 -m venv "{{project-root}}/build/test-venv"
+    "{{project-root}}/build/test-venv/bin/python" -m pip install --quiet --require-hashes -r "{{project-root}}/../test-requirements.txt"
+    "{{project-root}}/build/test-venv/bin/python" -m unittest discover --start-directory "{{project-root}}/tests" --pattern 'test_*.py'
+    go test "{{repo-root}}/providers/azure/eventgrid/..."
+
+# Compile Bicep offline in Hyperlight with the pinned provider runtime.
+test: test-unit runtime::build build (build "proof")
+    LAMPYR_TEST_AZURE_ROOTFS="{{project-root}}/build/proof/rootfs.cpio" \
+        LAMPYR_TEST_AZURE_ARTIFACT="{{project-root}}/build/rootfs" \
+        LAMPYR_TEST_KERNEL="{{project-root}}/../runtime/build/elfloader_hyperlight-x86_64" \
+        cargo test --locked --manifest-path "{{project-root}}/../../cli/Cargo.toml" --test azure_guest -- --test-threads=1

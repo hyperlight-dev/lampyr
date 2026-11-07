@@ -1,0 +1,10 @@
+{
+  "schemaVersion": "lampyr.dev/service-template/v1alpha1",
+  "runtime": "nodejs",
+  "templateVersion": "0.2.1",
+  "entrypoint": "/entrypoint.js",
+  "snapshotWarmup": "const server = require('fastify')({bodyLimit: 1048576, forceCloseConnections: true, exposeHeadRoutes: false}); server.register(require('@fastify/websocket'), {options: {maxPayload: 1048576, perMessageDeflate: false}}); server.get('/*', {wsHandler: () => {}}, () => ({})); server.route({method: ['HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'], url: '/*', handler: () => ({})}); server.ready().then(() => server.close())",
+  "userOwned": [".gitignore", "Dockerfile", "handler.js", "lampyr.yaml"],
+  "adapterOwned": ["Dockerfile.rootfs", "package.json", "package-lock.json", "server.js", "types.js", "types.d.ts"],
+  "machineState": [".lampyr/"]
+}

@@ -1,0 +1,80 @@
+rules:
+  - id: rust-disabled-test
+    languages: [rust]
+    severity: ERROR
+    message: Do not ignore tests. Use an explicit suite and run it in CI.
+    pattern-either:
+      - pattern: |
+          #[ignore]
+          fn $TEST(...) { ... }
+      - pattern: |
+          #[ignore = $REASON]
+          fn $TEST(...) { ... }
+      - patterns:
+          - pattern: |
+              #[cfg_attr($...ATTRIBUTES)]
+              fn $TEST(...) { ... }
+          - metavariable-regex:
+              metavariable: $...ATTRIBUTES
+              regex: '(?s).*,\s*ignore\b.*'
+  - id: python-disabled-test-api
+    languages: [python]
+    severity: ERROR
+    message: Do not disable tests. Use an explicit suite and run it in CI.
+    patterns:
+      - pattern-either:
+          - pattern: unittest.$MARKER
+          - pattern: pytest.$MARKER
+          - pattern: pytest.mark.$MARKER
+      - metavariable-regex:
+          metavariable: $MARKER
+          regex: ^(skip|skipIf|skipUnless|SkipTest|expectedFailure|skipif|xfail)$
+  - id: python-disabled-test-method
+    languages: [python]
+    severity: ERROR
+    message: Do not disable tests. Use an explicit suite and run it in CI.
+    pattern-either:
+      - pattern: $CASE.skipTest
+      - pattern: $CASE.__unittest_skip__
+      - pattern: __unittest_skip__ = $VALUE
+  - id: go-disabled-test
+    languages: [go]
+    severity: ERROR
+    message: Do not skip tests. Use an explicit suite and run it in CI.
+    patterns:
+      - pattern: $T.$METHOD(...)
+      - metavariable-regex:
+          metavariable: $METHOD
+          regex: ^Skip(f|Now)?$
+  - id: javascript-disabled-test-api
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: Do not disable tests. Use an explicit suite and run it in CI.
+    patterns:
+      - pattern-either:
+          - pattern: $OBJECT.$MARKER
+          - pattern: $OBJECT[$MARKER]
+      - metavariable-regex:
+          metavariable: $MARKER
+          regex: ^['"]?(skip|skipIf|todo|only|fixme)['"]?$
+  - id: javascript-focused-test-alias
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: Do not disable tests. Use an explicit suite and run it in CI.
+    patterns:
+      - pattern: $ALIAS(...)
+      - metavariable-regex:
+          metavariable: $ALIAS
+          regex: ^(xit|xtest|xdescribe|fit|fdescribe)$
+  - id: javascript-disabled-test-option
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: Do not disable tests. Use an explicit suite and run it in CI.
+    patterns:
+      - pattern: '$TEST(..., { $KEY: $VALUE, ... }, ...)'
+      - metavariable-regex:
+          metavariable: $TEST
+          regex: ^(.*\.)?(test|it|describe)$
+      - metavariable-regex:
+          metavariable: $KEY
+          regex: ^['"]?(skip|todo|only)['"]?$

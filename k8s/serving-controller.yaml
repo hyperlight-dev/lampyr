@@ -1,0 +1,88 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: lampyr-serving-controller
+rules:
+  # The controller reads, creates and updates each Revision's grant;
+  # garbage collection deletes it with its Revision.
+  - apiGroups: [fiberd.io]
+    resources: [capacitygrants]
+    verbs: [get, create, update]
+---
+# A grant is ready only once fiberd-k8s-controller's Deployment for it has
+# rolled out. Lampyr serves Revisions only in namespace default.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: lampyr-serving-controller-grants
+  namespace: default
+rules:
+  - apiGroups: [apps]
+    resources: [deployments]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: lampyr-serving-controller-grants
+  namespace: default
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: lampyr-serving-controller-grants
+subjects:
+  - kind: ServiceAccount
+    name: controller
+    namespace: knative-serving
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: lampyr-serving-controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: lampyr-serving-controller
+subjects:
+  - kind: ServiceAccount
+    name: controller
+    namespace: knative-serving
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lampyr-serving-controller
+  namespace: knative-serving
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: lampyr-serving-controller
+  template:
+    metadata:
+      labels:
+        app: lampyr-serving-controller
+    spec:
+      serviceAccountName: controller
+      containers:
+        - name: controller
+          image: ghcr.io/hyperlight-dev/lampyr/fiberd:preview
+          imagePullPolicy: IfNotPresent
+          command: [serving-controller]
+          env:
+            - name: SYSTEM_NAMESPACE
+              value: knative-serving
+            - name: CONFIG_LOGGING_NAME
+              value: config-logging
+            - name: CONFIG_OBSERVABILITY_NAME
+              value: config-observability
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests:
+              cpu: 20m
+              memory: 64Mi
+            limits:
+              memory: 512Mi

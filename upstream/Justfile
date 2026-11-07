@@ -1,0 +1,168 @@
+set shell := ["bash", "-euo", "pipefail", "-c"]
+
+project-root := source_directory()
+repo-root := project-root / ".."
+pins := project-root / "pins.env"
+sources := repo-root / "build/upstream"
+
+# Neither fiberd nor fiberd-k8s-controller publishes images or an install
+# manifest yet, so Lampyr builds them from the commits pins.env pins. The
+# sources are checked out under build/upstream.
+
+# Check out the pinned fiberd or fiberd-k8s-controller under build/upstream.
+[positional-arguments]
+source name:
+    . "{{pins}}"; \
+    case "$1" in \
+      fiberd) repository=$FIBERD_REPOSITORY; commit=$FIBERD_COMMIT ;; \
+      fiberd-k8s-controller) repository=$CONTROLLER_REPOSITORY; commit=$CONTROLLER_COMMIT ;; \
+      *) echo "unknown upstream source $1: fiberd or fiberd-k8s-controller" >&2; exit 1 ;; \
+    esac; \
+    checkout="{{sources}}/$1"; \
+    if [[ -d $checkout/.git && $(git -C "$checkout" rev-parse HEAD) == "$commit" && \
+      -z $(git -C "$checkout" status --porcelain --untracked-files=all) ]]; then exit 0; fi; \
+    rm -rf -- "$checkout"; \
+    mkdir -p "$checkout"; \
+    git -C "$checkout" init --quiet; \
+    git -C "$checkout" fetch --quiet --depth 1 "https://github.com/$repository" "$commit"; \
+    git -C "$checkout" -c advice.detachedHead=false checkout --quiet FETCH_HEAD; \
+    [[ $(git -C "$checkout" rev-parse HEAD) == "$commit" ]]
+
+# The upstream-fiberd image is fiberd's own docker/fiberd build, so its
+# context is the checkout. Its VERSION build arg is what fiberd -version
+# prints: go.mod's github.com/Azure/fiberd, the pseudo-version of the
+# pinned commit, which the release tests keep on FIBERD_COMMIT.
+
+# Print the version the upstream-fiberd image is built as.
+fiberd-version:
+    @awk '$1 == "github.com/Azure/fiberd" {print $2; found=1} END {exit !found}' "{{repo-root}}/go.mod"
+
+# Check out the source the upstream-fiberd image builds from.
+prepare-fiberd-image: (source "fiberd")
+
+# ly deploy runs zygotectl and grant-issuer on the user's machine, so a
+# platform package carries them built for its own target, from the pinned
+# fiberd. A checkout builds them for its host with just
+# fiberd-template-tools instead.
+
+# Build zygotectl and grant-issuer for every platform target into build/template-tools.
+template-tools: (source "fiberd")
+    for target in linux-amd64 darwin-arm64; do \
+      out="{{repo-root}}/build/template-tools/$target"; \
+      mkdir -p "$out"; \
+      for tool in zygotectl grant-issuer; do \
+        GOOS=${target%-*} GOARCH=${target#*-} CGO_ENABLED=0 go -C "{{sources}}/fiberd" build \
+          -trimpath -ldflags="-s -w -buildid=" -o "$out/$tool" "./cmd/$tool"; \
+      done; \
+    done
+
+# The controller's go.mod may ask for a newer Go than Lampyr's, which
+# GOTOOLCHAIN=auto fetches. actions/setup-go exports GOTOOLCHAIN=local, so
+# the recipe sets auto for its own go build.
+
+# Prepare the Linux/amd64 fiberd-k8s-controller image context without publishing it.
+prepare-controller-image: (source "fiberd-k8s-controller")
+    mkdir -p "{{repo-root}}/build"
+    GOTOOLCHAIN=auto GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go -C "{{sources}}/fiberd-k8s-controller" build \
+      -trimpath -ldflags="-s -w -buildid=" -o "{{repo-root}}/build/fiberd-k8s-controller" ./cmd/fiberd-k8s-controller
+    python3 "{{repo-root}}/scripts/check_preview_images.py" --root "{{repo-root}}" --image fiberd-k8s-controller --require-binaries
+
+# The controller's install manifest is its config/default: the CRDs, RBAC,
+# fiberd CA, admission policies and the Deployment, which runs `image`.
+
+# Write the controller's install manifest, running `image`, to `output`.
+[no-cd]
+[positional-arguments]
+controller-manifest image output: (source "fiberd-k8s-controller")
+    image=$1; output="$(realpath -m -- "$2")"; \
+    name=${image%@*}; field=digest; value=${image#*@}; \
+    if [[ $image != *@* ]]; then \
+      [[ ${image##*/} == *:* ]] || { echo "controller image needs a tag or digest: $image" >&2; exit 1; }; \
+      name=${image%:*}; field=newTag; value=${image##*:}; \
+    fi; \
+    overlay=$(mktemp -d "{{sources}}/fiberd-k8s-controller/.lampyr-overlay.XXXXXX"); \
+    trap 'rm -rf -- "$overlay"' EXIT; \
+    printf 'resources:\n  - ../config/default\nimages:\n  - name: controller\n    newName: %s\n    %s: %s\n' \
+      "$name" "$field" "$value" > "$overlay/kustomization.yaml"; \
+    mkdir -p "$(dirname "$output")"; \
+    kubectl kustomize "$overlay" > "$output.tmp"; \
+    grep -Eq "^ +(- )?image: ${image//./\\.}$" "$output.tmp" || { echo "the manifest does not run $image" >&2; exit 1; }; \
+    mv "$output.tmp" "$output"
+
+# build/controller-inputs.json names build/fiberd-k8s-controller.yaml, which
+# runs `controller-image`, and the digest-pinned grant and helper images.
+# Packaging adds both files when they exist, and ly cluster install takes
+# each input an install is not given from them.
+
+# Write the controller inputs a platform package installs by default.
+[positional-arguments]
+controller-inputs controller-image grant-image helper-image:
+    for image in "$1" "$2" "$3"; do \
+      [[ $image =~ ^[^@[:space:]]+@sha256:[0-9a-f]{64}$ ]] || { echo "not pinned by a sha256 digest: $image" >&2; exit 1; }; \
+    done
+    just --justfile "{{project-root}}/Justfile" controller-manifest "$1" "{{repo-root}}/build/fiberd-k8s-controller.yaml"
+    jq -n --arg grantImage "$2" --arg helperImage "$3" \
+      '{controllerManifest:"build/fiberd-k8s-controller.yaml",grantImage:$grantImage,helperImage:$helperImage}' \
+      > "{{repo-root}}/build/controller-inputs.json"
+
+# The cluster suites take this directory as LAMPYR_CLUSTER_INPUTS in place
+# of published inputs: the upstream-fiberd and helper images as OCI layouts
+# a suite pushes to its registry, the controller image as a Docker archive
+# its provider loads, the manifest running it, and the helper, zygotectl
+# and grant-issuer that ly build and ly deploy seal templates with.
+# The builder must export OCI layouts, as a docker-container one does.
+# The recipe replaces `output` only once the build has succeeded, and only
+# when it is missing, empty or earlier cluster inputs, so a mistyped
+# `build` is refused rather than deleted. Only `output`'s parent is
+# resolved, so a symbolic link is refused itself rather than accepted as
+# the directory it points to, which would then be replaced.
+
+# Build the cluster suites' controller inputs into `output`.
+[no-cd]
+[positional-arguments]
+cluster-inputs output: prepare-fiberd-image prepare-controller-image
+    just --justfile "{{repo-root}}/Justfile" fiberd-template-tools "{{sources}}/fiberd"
+    . "{{pins}}"; \
+    name=$(basename -- "$1"); \
+    [[ $name != . && $name != .. && $name != / ]] || { \
+      echo "refusing to replace $1: name the inputs directory itself" >&2; exit 1; }; \
+    output="$(realpath -m -- "$(dirname -- "$1")")/$name"; \
+    if [[ -e $output || -L $output ]]; then \
+      [[ -d $output && ! -L $output && -r $output && -x $output ]] || { \
+        echo "refusing to replace $output: it is a symbolic link or not a directory this user can read" >&2; exit 1; }; \
+      entries=$(ls -A -- "$output"); \
+      [[ -f $output/inputs.json || -z $entries ]] || { \
+        echo "refusing to replace $output: it is neither empty nor earlier cluster inputs" >&2; exit 1; }; \
+    fi; \
+    mkdir -p -- "$(dirname -- "$output")"; \
+    staging=$(mktemp -d "$(dirname -- "$output")/.cluster-inputs.XXXXXX"); \
+    trap 'rm -rf -- "$staging"' EXIT; \
+    chmod 0755 "$staging"; \
+    mkdir -p "$staging/images" "$staging/bin"; \
+    fiberd_version=$(just --justfile "{{project-root}}/Justfile" fiberd-version); \
+    [[ -n $fiberd_version ]] || { echo "fiberd-version printed nothing" >&2; exit 1; }; \
+    controller="lampyr.local/fiberd-k8s-controller:${CONTROLLER_COMMIT:0:12}"; \
+    docker buildx build --platform linux/amd64 --provenance=false --tag "$controller" \
+      --output "type=docker,dest=$staging/images/fiberd-k8s-controller.tar" \
+      --file "{{project-root}}/controller.Dockerfile" "{{repo-root}}"; \
+    docker buildx build --platform linux/amd64 --provenance=false \
+      --output "type=oci,dest=$staging/images/hluk-helper,tar=false" \
+      --file "{{repo-root}}/helper/ci.Dockerfile" "{{repo-root}}"; \
+    docker buildx build --platform linux/amd64 --provenance=false --target fiberd \
+      --build-arg "VERSION=$fiberd_version" \
+      --output "type=oci,dest=$staging/images/upstream-fiberd,tar=false" \
+      --file "{{sources}}/fiberd/docker/fiberd/Dockerfile" "{{sources}}/fiberd"; \
+    digest() { \
+      jq -er '.manifests | select(length == 1) | .[0].digest | select(test("^sha256:[0-9a-f]{64}$"))' \
+        "$staging/images/$1/index.json"; \
+    }; \
+    grant_digest=$(digest upstream-fiberd); \
+    helper_digest=$(digest hluk-helper); \
+    for tool in hluk-helper zygotectl grant-issuer; do \
+      install -m 0755 "{{repo-root}}/build/$tool" "$staging/bin/$tool"; \
+    done; \
+    just --justfile "{{project-root}}/Justfile" controller-manifest "$controller" "$staging/fiberd-k8s-controller.yaml"; \
+    jq -n --arg controllerImage "$controller" --arg grantDigest "$grant_digest" --arg helperDigest "$helper_digest" \
+      '{controllerImage:$controllerImage,grantDigest:$grantDigest,helperDigest:$helperDigest}' > "$staging/inputs.json"; \
+    rm -rf -- "$output"; \
+    mv -- "$staging" "$output"

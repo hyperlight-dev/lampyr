@@ -1,0 +1,175 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: lampyr-routes
+  namespace: lampyr-system
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: fiber-router
+  namespace: lampyr-system
+---
+# The router's identity to fiberd-k8s-controller and to grant Pods: every
+# CapacityGrant's callerThumbprint names this key. A Secret rather than a
+# csi-driver volume, which makes a key per Pod, so that renewals and router
+# replicas keep the one key and a renewal rolls no grant Pod.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: fiber-router
+  namespace: lampyr-system
+spec:
+  secretName: fiber-router-tls
+  commonName: system:serviceaccount:lampyr-system:fiber-router
+  usages:
+    - client auth
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Never
+  issuerRef:
+    group: cert-manager.io
+    kind: ClusterIssuer
+    name: fiberd-ca
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fiber-router
+  namespace: lampyr-system
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: fiber-router
+  template:
+    metadata:
+      labels:
+        app: fiber-router
+    spec:
+      serviceAccountName: fiber-router
+      # The image runs as 65532, which reads the fiberd-tls Secret through
+      # this group alone.
+      securityContext:
+        fsGroup: 65532
+      # The router drains for 20s, then releases the fibers it still
+      # holds, all within this.
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: router
+          image: ghcr.io/hyperlight-dev/lampyr/fiber-router:preview
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: metrics
+              containerPort: 9090
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          # A burst of 1,000 cold requests holds 1,000 requests, their
+          # Fibers' proxies and home streams at once, which took the router
+          # to 127 MiB; GOMEMLIMIT makes the collector work harder before
+          # the limit rather than be killed at it.
+          env:
+            - name: GOMEMLIMIT
+              value: 400MiB
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 512Mi
+          volumeMounts:
+            - name: routes
+              mountPath: /var/lib/lampyr/routes
+              readOnly: true
+            - name: fiberd-tls
+              mountPath: /var/run/fiberd/tls
+              readOnly: true
+      volumes:
+        - name: routes
+          configMap:
+            name: lampyr-routes
+        # tls.crt and tls.key are the router's client certificate, and
+        # ca.crt the fiberd CA, which signs the controller and grant Pods.
+        - name: fiberd-tls
+          secret:
+            secretName: fiber-router-tls
+            # 0440, so tls.key is readable by the router's group and by no
+            # other user.
+            defaultMode: 288
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fiber-router
+  namespace: lampyr-system
+spec:
+  selector:
+    app: fiber-router
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+---
+# The same router for routes to gRPC services. Kourier speaks HTTP/2 without
+# TLS to a Service with a port named h2c, and it decides per Service, not per
+# port, so this needs a Service of its own: an h2c port on fiber-router would
+# move every route to HTTP/2.
+apiVersion: v1
+kind: Service
+metadata:
+  name: fiber-router-h2c
+  namespace: lampyr-system
+spec:
+  selector:
+    app: fiber-router
+  ports:
+    - name: h2c
+      port: 81
+      targetPort: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: fiber-router
+  namespace: lampyr-system
+spec:
+  podSelector:
+    matchLabels:
+      app: fiber-router
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kourier-system
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: knative-eventing
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: knative-serving
+          podSelector:
+            matchLabels:
+              app: net-kourier-controller
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: knative-serving
+          podSelector:
+            matchLabels:
+              app: lampyr-serving-controller
+      ports:
+        - protocol: TCP
+          port: 8080

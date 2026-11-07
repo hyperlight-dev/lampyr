@@ -1,0 +1,16 @@
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: portability-proof
+  namespace: default
+spec:
+  template:
+    metadata:
+      annotations:
+        autoscaling.knative.dev/max-scale: "2"
+        lampyr.dev/snapshot-artifact: __SNAPSHOT_IMAGE__
+        lampyr.dev/fiberd-template: __FIBERD_TEMPLATE__
+    spec:
+      containerConcurrency: 1
+      containers:
+        - image: __NORMAL_IMAGE__

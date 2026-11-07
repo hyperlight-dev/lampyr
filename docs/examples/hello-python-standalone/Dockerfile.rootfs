@@ -1,0 +1,14 @@
+FROM python:3.12-slim-bookworm AS dependencies
+WORKDIR /app
+COPY requirements.txt ./
+RUN pip install --no-cache-dir --target=/dependencies -r requirements.txt
+
+FROM hluk-python-rootfs:latest AS rootfs
+COPY --from=dependencies /dependencies /usr/local/lib/python3.12/site-packages/
+COPY --from=dependencies /usr/lib/x86_64-linux-gnu/libssl.so.3 /usr/lib/x86_64-linux-gnu/libssl.so.3
+COPY --from=dependencies /usr/lib/x86_64-linux-gnu/libcrypto.so.3 /usr/lib/x86_64-linux-gnu/libcrypto.so.3
+COPY --from=dependencies /lib/x86_64-linux-gnu/libgcc_s.so.1 /lib/x86_64-linux-gnu/libgcc_s.so.1
+COPY --from=dependencies /lib/x86_64-linux-gnu/librt.so.1 /lib/x86_64-linux-gnu/librt.so.1
+COPY --from=dependencies /lib/x86_64-linux-gnu/libpthread.so.0 /lib/x86_64-linux-gnu/libpthread.so.0
+COPY --from=dependencies /lib/x86_64-linux-gnu/libdl.so.2 /lib/x86_64-linux-gnu/libdl.so.2
+COPY application.py server.py /

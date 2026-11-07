@@ -1,0 +1,93 @@
+# Onboards namespace default, where Lampyr's grant Pods run, as a
+# fiberd-k8s-controller tenant, as the controller's config/tenant does, and
+# lets the fiber-router read the grants there. It leaves out config/tenant's
+# fiberd-grant-author RoleBinding: no group of people writes CapacityGrants
+# in default, since Lampyr's serving controller writes every one under its
+# own ClusterRole.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: fiberd-grant
+  namespace: default
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: fiberd-grant
+  namespace: default
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: fiberd-grant
+subjects:
+  - kind: ServiceAccount
+    name: fiberd-grant
+    namespace: default
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: fiberd-k8s-controller-tenant
+  namespace: default
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: fiberd-k8s-controller-tenant
+subjects:
+  - kind: ServiceAccount
+    name: fiberd-k8s-controller
+    namespace: fiberd-system
+---
+# Revisions come and go, so the rule names no CapacityGrant. The router
+# reads a grant's fiber cap, which its caller grants do not carry; its
+# certificate, not RBAC, is what the controller grants by.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: lampyr-router-grants
+  namespace: default
+rules:
+  - apiGroups: [fiberd.io]
+    resources: [capacitygrants]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: lampyr-router-grants
+  namespace: default
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: lampyr-router-grants
+subjects:
+  - kind: ServiceAccount
+    name: fiber-router
+    namespace: lampyr-system
+---
+# Only the router reaches grant Pods: fiberd's Fibers API, and the fiber
+# endpoints fiberd relays on its own port range.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: lampyr-grant-homes
+  namespace: default
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/managed-by: fiberd-k8s-controller
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: lampyr-system
+          podSelector:
+            matchLabels:
+              app: fiber-router
+      ports:
+        - protocol: TCP
+          port: 8484
+        - protocol: TCP
+          port: 30000
+          endPort: 32767

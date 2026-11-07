@@ -1,0 +1,9 @@
+apiVersion: lampyr.dev/v1alpha1
+kind: Workspace
+# Both services get a public hostname. The runner is public too, so the
+# tour's comparison can call it directly; the playground reaches it through
+# its runner binding either way.
+ingress:
+  services:
+    - playground
+    - runner

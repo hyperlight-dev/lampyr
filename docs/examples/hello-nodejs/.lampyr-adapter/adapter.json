@@ -1,0 +1,19 @@
+{
+  "schemaVersion": "lampyr.dev/runtime-adapter/v1alpha1",
+  "runtime": "nodejs",
+  "templateVersion": "0.2.1",
+  "entrypoint": "/entrypoint.js",
+  "snapshotWarmup": "const server = require('fastify')({bodyLimit: 1048576, forceCloseConnections: true, exposeHeadRoutes: false}); server.register(require('@fastify/websocket'), {options: {maxPayload: 1048576, perMessageDeflate: false}}); server.get('/*', {wsHandler: () => {}}, () => ({})); server.route({method: ['HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'], url: '/*', handler: () => ({})}); server.ready().then(() => server.close())",
+  "files": {
+    "Dockerfile.rootfs": "sha256:b832053bde2eeeb7525156e6c3b4c269689a67f7fd199c6f64be694f78403233",
+    "package-lock.json": "sha256:112f44e9a266084a820e3794f5e6c526d98e6626ba797f192c6e09942849d50b",
+    "package.json": "sha256:5a0e093ee1d112a508afd1a41562017b798e8bb0cec047a08e6fdf821458c2b3",
+    "server.js": "sha256:72d22f0411ac6d461145d72078ee7035dcf0a5edd6e9d7746919baf129f42100",
+    "types.d.ts": "sha256:895231cd0c462fe67b57d68e6789234ce0ba4adb7fc47a6b62020c865b8759cd",
+    "types.js": "sha256:ffe075de428278223c9723df150c20474df2b50263d1a16974bb0642da2a9459"
+  },
+  "pristine": {
+    "entrypoint": "/entrypoint.js",
+    "snapshotWarmup": "const server = require('fastify')({bodyLimit: 1048576, forceCloseConnections: true, exposeHeadRoutes: false}); server.register(require('@fastify/websocket'), {options: {maxPayload: 1048576, perMessageDeflate: false}}); server.get('/*', {wsHandler: () => {}}, () => ({})); server.route({method: ['HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'], url: '/*', handler: () => ({})}); server.ready().then(() => server.close())"
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "schemaVersion": "lampyr.dev/service-template/v1alpha1",
+  "runtime": "go",
+  "templateVersion": "0.1.1",
+  "entrypoint": "/app/service",
+  "userOwned": [".gitignore", "Dockerfile", "Dockerfile.rootfs", "lampyr.yaml", "go.mod", "go.sum", "application.go", "main.go"],
+  "adapterOwned": [],
+  "machineState": [".lampyr/"]
+}

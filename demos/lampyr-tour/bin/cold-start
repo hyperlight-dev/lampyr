@@ -1,0 +1,227 @@
+#!/usr/bin/env bash
+# Start N new instances at once, from none running, and time each one to its
+# first HTTP answer.
+#
+#   bin/cold-start --containers [N]   scale the baseline Deployment 0 -> N
+#   bin/cold-start --fibers URL [N]   N concurrent requests to an idle Service
+#
+# N defaults to 50. RUNS (default 1) repeats the measurement, one line per
+# run, then the medians. Before the first run, each side starts once
+# untimed, so the container image and the Service's snapshot are already on
+# the node. A Fibers run that gets no answer, a 429 or a 5xx is discarded
+# and run again, at most 3 attempts in all; any other status fails at once.
+#
+# Both sides use one clock and one definition: the time from just before the
+# start (the scale request, or the burst) to each instance's first answer.
+# Kind nodes share the host's kernel, so the prober pod inside the cluster
+# and this machine read the same /proc/uptime. The prober reaches each
+# replica directly by pod IP; Fibers are reached through the URL given,
+# through Kourier and fiber-router. A Fiber starts from the snapshot ly build
+# took, inside the Service's home pod, which stays up while the Service is
+# idle.
+#
+# CONTEXT defaults to kind-${NAME:-lampyr}.
+set -euo pipefail
+usage() { echo "usage: cold-start --containers [N] | --fibers URL [N]" >&2; exit 2; }
+context=${CONTEXT:-kind-${NAME:-lampyr}}
+k() { kubectl --context "$context" -n baseline "$@"; }
+positive() { [[ $1 =~ ^[1-9][0-9]*$ ]]; }
+
+mode=${1:-}
+case $mode in
+  --containers) n=${2:-50} ;;
+  --fibers) url=${2:-}; [[ $url =~ ^https?:// ]] || usage; n=${3:-50} ;;
+  *) usage ;;
+esac
+runs=${RUNS:-1}
+positive "$n" || { echo "cold-start: N must be a positive integer, not '$n'" >&2; exit 2; }
+positive "$runs" || { echo "cold-start: RUNS must be a positive integer, not '$runs'" >&2; exit 2; }
+
+# Prints one run's line and appends its first and last times (ms) to $log.
+summary() { # LABEL VALUES_MS...
+  python3 - "$log" "${run_label:-}" "$@" <<'EOF'
+import statistics, sys
+log, prefix, label, *values = sys.argv[1:]
+values = sorted(float(v) for v in values)
+fmt = lambda ms: f"{ms / 1000:.1f} s" if ms >= 1000 else f"{ms:.0f} ms"
+prefix = f"run {prefix}: " if prefix else ""
+if len(values) == 1:
+    print(f"{prefix}{label}: answering after {fmt(values[0])}")
+else:
+    print(f"{prefix}{label}: {len(values)} answering; first {fmt(values[0])}, median {fmt(statistics.median(values))}, last {fmt(values[-1])}")
+with open(log, "a") as out:
+    out.write(f"{values[0]:.0f} {values[-1]:.0f}\n")
+EOF
+}
+
+# Scale the baseline to 0 and wait until no replica is left.
+scale_to_zero() {
+  k scale deploy runner --replicas=0 >/dev/null || return 1
+  local out
+  # With no replica left, older kubectl versions report "no matching
+  # resources"; that is success here, any other failure is not.
+  if ! out=$(k wait --for=delete pod -l app=runner --timeout=120s 2>&1); then
+    grep -q 'no matching resources' <<<"$out" || { echo "cold-start: $out" >&2; return 1; }
+  fi
+}
+
+containers_warmup() {
+  k rollout status deploy prober --timeout=60s >/dev/null || return 1
+  scale_to_zero || return 1
+  k scale deploy runner --replicas=1 >/dev/null || return 1
+  k rollout status deploy runner --timeout=180s >/dev/null || return 1
+  scale_to_zero
+}
+
+containers() {
+  # Not local: the EXIT trap below runs after this function returns.
+  watch='' watch_log='' probe_out='' probe=''
+  trap 'kill "$watch" "$probe" 2>/dev/null || true; rm -f "$watch_log" "$probe_out"; k scale deploy runner --replicas=0 >/dev/null 2>&1 || true' EXIT
+  # This runs in a subshell whose status is tested, where set -e is off:
+  # check each step.
+  scale_to_zero || return 1
+  # The host tells the prober each replica's pod IP as soon as it is
+  # assigned, from a watch started before the scale request.
+  watch_log=$(mktemp) || return 1
+  exec 3< <(exec kubectl --context "$context" -n baseline get pods -l app=runner --watch \
+    -o jsonpath='{.status.podIP}{"\n"}' 2>"$watch_log")
+  watch=$!
+  # The prober starts first and says "ready", so connecting to it isn't
+  # part of the time. It then prints, for each replica, the /proc/uptime at
+  # its first 200, and gives up after 120 s; the command around it gives up
+  # 10 s later.
+  probe_out=$(mktemp) || return 1
+  timeout --foreground 130 kubectl --context "$context" -n baseline exec -i deploy/prober -- sh -c "
+    # Each run gets its own directory. A background command's stdin would
+    # be /dev/null; hand it a copy.
+    dir=/tmp/cold.\$\$
+    rm -rf /tmp/cold.* && mkdir \$dir && : > \$dir/ips
+    exec 4<&0
+    cat <&4 >> \$dir/ips &
+    reader=\$!
+    pids=\$reader
+    n=$n
+    deadline=\$(( \$(cut -d. -f1 /proc/uptime) + 120 ))
+    # One probe per replica, in parallel, so a slow one doesn't hold up the
+    # rest. Each gives up at the deadline, so none outlives the run.
+    probe() {
+      until wget -q -T 1 -O /dev/null http://\$1:8080/ 2>/dev/null; do
+        [ \$(cut -d. -f1 /proc/uptime) -lt \$deadline ] || return 1
+        sleep 0.05
+      done
+      # Written under another name, then renamed, so the count never sees
+      # a half-written file.
+      cut -d' ' -f1 /proc/uptime > \$dir/.t.\$1
+      mv \$dir/.t.\$1 \$dir/t.\$1
+    }
+    echo ready
+    seen=' '
+    while [ \$(ls \$dir | grep -c '^t\\.') -lt \$n ]; do
+      # The reader ends when this machine's kubectl goes away; so do we.
+      kill -0 \$reader 2>/dev/null || { kill \$pids 2>/dev/null; wait; exit 1; }
+      if [ \$(cut -d. -f1 /proc/uptime) -ge \$deadline ]; then
+        echo \"cold-start: only \$(ls \$dir | grep -c '^t\\.') of \$n replicas answered within 120 s\" >&2
+        kill \$pids 2>/dev/null
+        wait
+        exit 1
+      fi
+      for ip in \$(grep . \$dir/ips | sort -u); do
+        case \"\$seen\" in *\" \$ip \"*) continue ;; esac
+        seen=\"\$seen\$ip \"
+        probe \$ip &
+        pids=\"\$pids \$!\"
+      done
+      sleep 0.05
+    done
+    cat \$dir/t.*
+    # Most have exited by now; stop the rest, and the reader.
+    kill \$pids 2>/dev/null
+    wait
+    true" <&3 >"$probe_out" &
+  probe=$!
+  until grep -qx ready "$probe_out"; do
+    kill -0 "$probe" 2>/dev/null || { echo "cold-start: the prober didn't start" >&2; return 1; }
+    sleep 0.02
+  done
+  local start
+  start=$(cut -d' ' -f1 /proc/uptime)
+  k scale deploy runner --replicas="$n" >/dev/null || return 1
+  if ! wait "$probe"; then
+    echo "cold-start: the containers did not all answer" >&2
+    [ -s "$watch_log" ] && { echo "cold-start: the pod watch said:" >&2; cat "$watch_log" >&2; }
+    return 1
+  fi
+  local times
+  times=$(grep -vx ready "$probe_out" | awk -v start="$start" '{printf "%.0f\n", ($1 - start) * 1000}') || return 1
+  local label="$n new containers"
+  [ "$n" = 1 ] && label="a new container"
+  # shellcheck disable=SC2086
+  summary "$label" $times
+}
+
+fibers() {
+  local attempt start results
+  for attempt in 1 2 3; do
+    start=$(cut -d' ' -f1 /proc/uptime)
+    # Each request notes when its answer arrived; all N start together.
+    # shellcheck disable=SC2016 # $1 expands in the inner sh, not here
+    results=$(seq "$n" | xargs -P "$n" -I{} sh -c '
+      code=$(curl -sk -m 30 -o /dev/null -w "%{http_code}" "$1")
+      echo "$code $(cut -d" " -f1 /proc/uptime)"' _ "$url") || return 1
+    grep -qv '^200 ' <<<"$results" || break
+    echo "cold-start: attempt $attempt had answers other than 200, discarded:" >&2
+    grep -v '^200 ' <<<"$results" | cut -d' ' -f1 | sort | uniq -c >&2
+    # Only no answer (000), 429 and 5xx are worth another try; any other
+    # status is the request's own fault.
+    if grep -v '^200 ' <<<"$results" | grep -qv -E '^(000|429|5[0-9][0-9]) '; then
+      return 1
+    fi
+    [ "$attempt" -lt 3 ] || return 1
+    sleep 5
+  done
+  local label="$n new Fibers (micro-VMs)"
+  [ "$n" = 1 ] && label="a new Fiber (micro-VM)"
+  # shellcheck disable=SC2046
+  summary "$label" $(awk -v start="$start" '{printf "%.0f\n", ($2 - start) * 1000}' <<<"$results")
+}
+
+log=$(mktemp)
+if [ "$mode" = --containers ]; then
+  # Whatever happens, leave the baseline at 0 replicas.
+  trap 'rm -f "$log"; k scale deploy runner --replicas=0 >/dev/null 2>&1 || true' EXIT
+else
+  trap 'rm -f "$log"' EXIT
+fi
+case $mode in
+  --containers) containers_warmup ;;
+  --fibers) curl -sk -m 30 -o /dev/null "$url" || true ;;
+esac
+for run in $(seq "$runs"); do
+  run_label=
+  [ "$runs" -gt 1 ] && run_label=$run
+  # Each run in its own shell, so a trap set by one run doesn't replace
+  # this one.
+  status=0
+  ( case $mode in
+      --containers) containers ;;
+      --fibers) fibers ;;
+    esac ) || status=$?
+  if [ "$status" -gt 128 ]; then
+    echo "cold-start: interrupted" >&2
+    exit "$status"
+  fi
+  [ "$status" = 0 ] || exit "$status"
+done
+if [ "$runs" -gt 1 ]; then
+  python3 - "$log" <<'EOF'
+import statistics, sys
+rows = [line.split() for line in open(sys.argv[1]) if line.strip()]
+fmt = lambda ms: f"{ms / 1000:.1f} s" if ms >= 1000 else f"{ms:.0f} ms"
+first = statistics.median(float(r[0]) for r in rows)
+last = statistics.median(float(r[1]) for r in rows)
+if first == last:
+    print(f"median of {len(rows)} runs: {fmt(last)}")
+else:
+    print(f"median of {len(rows)} runs: first {fmt(first)}, last {fmt(last)}")
+EOF
+fi

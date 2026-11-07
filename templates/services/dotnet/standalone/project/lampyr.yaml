@@ -1,0 +1,10 @@
+apiVersion: lampyr.dev/v1alpha1
+kind: Project
+name: hello-dotnet
+runtime: dotnet
+application:
+    type: standalone
+    command: /app/Service
+resources:
+    memory: 512Mi
+    cpu: 250m

@@ -1,0 +1,14 @@
+apiVersion: lampyr.dev/v1alpha1
+kind: Project
+name: hello-rust
+runtime: rust
+application:
+    type: handler
+events:
+    maxRetries: 3
+    initialBackoff: 100ms
+    attemptTimeout: 5s
+    deadLetter: .lampyr/dead-letter.jsonl
+resources:
+    memory: 64Mi
+    cpu: 250m

@@ -1,0 +1,179 @@
+set shell := ["bash", "-euo", "pipefail", "-c"]
+
+project-root := source_directory()
+repo-root := project-root / ".."
+
+# Build the developer-facing Rust CLI.
+build:
+    cargo build --locked --manifest-path "{{project-root}}/Cargo.toml" --target-dir "{{project-root}}/target" --bin ly
+
+# Build the native Apple Silicon release CLI.
+build-macos:
+    source_date_epoch=$(git -C "{{repo-root}}" show -s --format=%ct HEAD); \
+    SOURCE_DATE_EPOCH="$source_date_epoch" \
+        cargo build --release --locked --manifest-path "{{project-root}}/Cargo.toml" --target-dir "{{project-root}}/target" --bin ly
+    codesign --force --sign - --entitlements "{{project-root}}/macos-entitlements.plist" "{{project-root}}/target/release/ly"
+    codesign --verify --strict "{{project-root}}/target/release/ly"
+
+# Prepare the checksum-pinned runtime and kernel.
+setup-hluk:
+    cargo run --quiet --locked --manifest-path "{{project-root}}/Cargo.toml" --bin runtime-assets -- --root "{{repo-root}}"
+
+# Prepare a runtime's checksum-pinned published root filesystem.
+setup-rootfs runtime platform="linux/amd64":
+    cargo run --quiet --locked --manifest-path "{{project-root}}/Cargo.toml" --bin runtime-assets -- --root "{{repo-root}}" --rootfs "{{runtime}}" --platform "{{platform}}"
+
+# Build development images out of band; installation never builds or publishes them.
+runtime-images:
+    just --justfile "{{repo-root}}/Justfile" build-fiberd build-control-plane
+    docker buildx build --load --platform linux/amd64 --tag "ghcr.io/hyperlight-dev/lampyr/fiberd:preview" --file "{{repo-root}}/fiberd/ci.Dockerfile" "{{repo-root}}"; \
+    docker buildx build --load --platform linux/amd64 --tag "ghcr.io/hyperlight-dev/lampyr/fiber-router:preview" --file "{{repo-root}}/activator/ci.Dockerfile" "{{repo-root}}"
+
+# Check Rust formatting and all production and test targets.
+lint:
+    cargo fmt --manifest-path "{{project-root}}/Cargo.toml" -- --check
+    cargo clippy --locked --manifest-path "{{project-root}}/Cargo.toml" --all-targets --all-features -- -D warnings
+
+# Format the Rust CLI and its focused tests.
+fmt:
+    cargo fmt --manifest-path "{{project-root}}/Cargo.toml"
+
+# Run the permission checks under umask 002, the default on Ubuntu and Debian.
+# Needs a user whose primary group is private, as those distributions create.
+test-group-umask:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    umask 002
+    if [ "$(id -un)" != "$(id -gn)" ]; then
+        echo "primary group $(id -gn) isn't private to $(id -un); run this as a user with a private group" >&2
+        exit 1
+    fi
+    python3 "{{project-root}}/../providers/tests/test_permissions.py"
+    cargo test --locked --manifest-path "{{project-root}}/Cargo.toml" --lib
+    # The permission tests; the rest of this suite needs built artifacts.
+    cargo test --locked --manifest-path "{{project-root}}/Cargo.toml" --test artifact -- \
+        ancestor owner_controlled
+    just --justfile "{{project-root}}/../Justfile" providers::test-snapshots
+
+# Run non-virtualized tests without requiring a hypervisor.
+test: lint test-packaging
+    cargo test --locked --manifest-path "{{project-root}}/Cargo.toml" --lib --bins \
+        --test adapter --test assets --test cluster --test connection --test dev --test event \
+        --test image --test installation --test kubernetes --test platform --test project \
+        --test provider_registry --test standalone --test template_versions --test tools --test workspace
+
+# Check and run the portable CLI integration tests on native macOS.
+test-macos: lint
+    cargo test --locked --manifest-path "{{project-root}}/Cargo.toml" --bins \
+        --test assets --test connection --test dev \
+        --test image --test installation --test platform --test project \
+        --test standalone --test template_versions --test tools --test workspace \
+        -- --test-threads=1
+
+# Build and sign the macOS snapshot helper for Hypervisor.framework.
+build-provider-snapshot-macos:
+    cargo build --locked --manifest-path "{{project-root}}/Cargo.toml" --target-dir "{{project-root}}/target" --bin provider-snapshot
+    codesign --force --sign - --entitlements "{{project-root}}/macos-entitlements.plist" "{{project-root}}/target/debug/provider-snapshot"
+    codesign --verify --strict "{{project-root}}/target/debug/provider-snapshot"
+
+# Exercise VM deadlines, provider boundaries, and snapshot layouts with rootfs/kernel fixtures.
+test-runtime:
+    cargo test --locked --manifest-path "{{project-root}}/Cargo.toml" --test runtime --test provider -- --test-threads=1
+    cargo test --locked --manifest-path "{{project-root}}/Cargo.toml" --test artifact -- --test-threads=1
+
+# Test publishing and cache reuse against a disposable local registry.
+[positional-arguments]
+test-registry project image:
+    LAMPYR_TEST_PROJECT="$1" LAMPYR_TEST_REGISTRY_IMAGE="$2" \
+        cargo test --locked --manifest-path "{{project-root}}/Cargo.toml" --test registry
+
+# Exercise actual generated Node/Python adapters against shared wire fixtures.
+test-handler-contracts: build
+    python3 "{{repo-root}}/tests/contracts/test_contract.py" --ly "{{project-root}}/target/debug/ly"
+
+# Check standalone archive integrity and filesystem boundaries.
+test-packaging:
+    python3 "{{repo-root}}/scripts/tests/test_package_platform.py"
+    just --justfile "{{repo-root}}/providers/Justfile" test-snapshots
+
+# Use the same executable intent documents as the Go baseline.
+test-intent: build
+    just --justfile "{{repo-root}}/Justfile" install-mm
+    PATH="{{project-root}}/target/debug:$PATH" "{{repo-root}}/build/tools/mm" "{{repo-root}}/tests/cli" --cwd "{{repo-root}}"
+
+# Package the tested Linux/amd64 CLI, standalone platform, and separate providers.
+# A nonempty image-tag replaces the default `:preview` platform image tags.
+[no-cd]
+[positional-arguments]
+package image-tag="" provider-artifacts="":
+    image_tag="$1"; \
+    if [[ -n "$image_tag" ]]; then export LAMPYR_IMAGE_TAG="$image_tag"; fi; \
+    cargo build --release --locked --manifest-path "{{project-root}}/Cargo.toml" --target-dir "{{project-root}}/target" --bin ly
+    just --justfile "{{repo-root}}/Justfile" setup-hluk platform-template-tools
+    GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o "{{repo-root}}/build/ly-dev" "{{repo-root}}/cmd/ly-dev"
+    if [[ -z "$2" ]]; then \
+        just --justfile "{{repo-root}}/providers/kind/Justfile" build; \
+        just --justfile "{{repo-root}}/providers/k3d/Justfile" build; \
+        just --justfile "{{repo-root}}/providers/azure/Justfile" build; \
+    fi
+    source_commit=$(git -C "{{repo-root}}" rev-parse HEAD); \
+    image_args=(); \
+    if [[ -n "$1" ]]; then image_args=(--image-tag "$1"); fi; \
+    if [[ -n "$2" ]]; then image_args+=(--provider-artifacts "$2"); fi; \
+    python3 "{{repo-root}}/scripts/package-platform.py" --root "{{repo-root}}" --binary "{{project-root}}/target/release/ly" --output "{{repo-root}}/build/dist" --source-commit "$source_commit" "${image_args[@]}"
+
+# Add stable rolling-preview aliases for the versioned package outputs.
+[no-cd]
+[positional-arguments]
+package-preview provider-artifacts="": (package "" provider-artifacts)
+    python3 "{{repo-root}}/scripts/package-platform.py" --root "{{repo-root}}" --output "{{repo-root}}/build/dist" --aliases preview
+
+# Package the native Apple Silicon CLI using Rust target-triple naming.
+[no-cd]
+[positional-arguments]
+package-macos suffix="": build-macos
+    python3 "{{repo-root}}/scripts/package-platform.py" \
+        --root "{{repo-root}}" \
+        --binary "{{project-root}}/target/release/ly" \
+        --output "{{repo-root}}/build/dist" \
+        --cli-only \
+        --cli-platform aarch64-apple-darwin
+    suffix="$1"; \
+    if [[ -n "$suffix" ]]; then \
+        python3 "{{repo-root}}/scripts/package-platform.py" \
+            --root "{{repo-root}}" \
+            --output "{{repo-root}}/build/dist" \
+            --aliases "$suffix" \
+            --cli-only \
+            --cli-platform aarch64-apple-darwin; \
+    fi
+
+# Package the Darwin/ARM platform payload from prepared ARM provider artifacts.
+[no-cd]
+[positional-arguments]
+package-darwin-platform suffix provider-artifacts: setup-hluk
+    GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o "{{repo-root}}/build/ly-dev-darwin-arm64" "{{repo-root}}/cmd/ly-dev"
+    just --justfile "{{repo-root}}/Justfile" platform-template-tools
+    source_commit=$(git -C "{{repo-root}}" rev-parse HEAD); \
+    image_args=(); \
+    if [[ "$1" != preview ]]; then image_args=(--image-tag "$1"); fi; \
+    python3 "{{repo-root}}/scripts/package-platform.py" \
+        --root "{{repo-root}}" \
+        --output "{{repo-root}}/build/dist" \
+        --source-commit "$source_commit" \
+        --provider-artifacts "$2" \
+        --platform-only \
+        --platform-target darwin-arm64 \
+        "${image_args[@]}"
+    python3 "{{repo-root}}/scripts/package-platform.py" \
+        --root "{{repo-root}}" \
+        --output "{{repo-root}}/build/dist" \
+        --aliases "$1" \
+        --platform-only \
+        --platform-target darwin-arm64
+
+# Package an immutable release whose CLI and manifests default to `:version` images.
+[no-cd]
+[positional-arguments]
+package-release version provider-artifacts="": (package version provider-artifacts)
+    python3 "{{repo-root}}/scripts/package-platform.py" --root "{{repo-root}}" --output "{{repo-root}}/build/dist" --aliases "$1"

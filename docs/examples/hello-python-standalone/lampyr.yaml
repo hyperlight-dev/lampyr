@@ -1,0 +1,10 @@
+apiVersion: lampyr.dev/v1alpha1
+kind: Project
+name: hello-python-standalone
+runtime: python
+application:
+    type: standalone
+    command: /server.py
+resources:
+    memory: 768Mi
+    cpu: 250m

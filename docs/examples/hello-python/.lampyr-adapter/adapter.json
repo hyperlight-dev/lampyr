@@ -1,0 +1,16 @@
+{
+  "schemaVersion": "lampyr.dev/runtime-adapter/v1alpha1",
+  "runtime": "python",
+  "templateVersion": "0.2.1",
+  "entrypoint": "/entrypoint.py",
+  "files": {
+    "Dockerfile.rootfs": "sha256:45109168cc116495f86cc498d96823cc07b753a2a490114eeb4adec568197c99",
+    "lampyr_types.py": "sha256:2b012f35b9c837b4dd9002d4c81ac6799396610feecba40b89aecee8ed1b1ff0",
+    "requirements.in": "sha256:9ff2177e763edd4e9724ffbd5a78794aa24e8492245e2f9e2b3f521fdf956b74",
+    "requirements.txt": "sha256:8f1ae7c124601a47b87be2457cb11e7ee658ba9c49f480928a1318622be2b246",
+    "server.py": "sha256:9f70157444981eeaf8c437d61591edd7169eb8f17ac9f2e6e863c576ea84e8ac"
+  },
+  "pristine": {
+    "entrypoint": "/entrypoint.py"
+  }
+}

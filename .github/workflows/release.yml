@@ -1,0 +1,846 @@
+name: Release
+
+# Pushes to main publish the rolling preview; v0.0.0 tags publish an immutable
+# version through the same gates after every committed version is checked.
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ startsWith(github.ref, 'refs/tags/') && github.ref || 'preview-release' }}
+  cancel-in-progress: false
+
+env:
+  IMAGE_PREFIX: ghcr.io/hyperlight-dev/lampyr
+  PREVIEW_TAG: preview-release
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      suffix: ${{ steps.channel.outputs.suffix }}
+      image-tag: ${{ steps.channel.outputs.image-tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check release versions
+        id: channel
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            python3 scripts/release-version.py check --tag "$GITHUB_REF_NAME"
+            git merge-base --is-ancestor "$GITHUB_SHA" origin/main || {
+              echo "::error::$GITHUB_REF_NAME must point at a commit on main"
+              exit 1
+            }
+            scripts/require-new-release.sh "$GITHUB_REF_NAME"
+            version="${GITHUB_REF_NAME#v}"
+            printf 'suffix=%s\nimage-tag=%s\n' "$version" "$version" >>"$GITHUB_OUTPUT"
+          else
+            python3 scripts/release-version.py check
+            printf 'suffix=preview\nimage-tag=preview-%s\n' "$GITHUB_SHA" >>"$GITHUB_OUTPUT"
+          fi
+
+  provider-linux-guests:
+    needs:
+      - version
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+
+      - name: Install provider packaging tools
+        run: sudo apt-get update -q && sudo apt-get install -y --no-install-recommends cpio
+
+      - name: Build Linux provider guests
+        run: |
+          just providers::build-platform-artifacts \
+            "$RUNNER_TEMP/providers-linux-amd64" \
+            linux/amd64 linux x86_64
+
+      - name: Upload Linux provider guests
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: provider-guests-linux-amd64-${{ github.sha }}
+          path: ${{ runner.temp }}/providers-linux-amd64
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+  provider-darwin-guests:
+    needs:
+      - version
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        with:
+          platforms: arm64
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+
+      - name: Install provider packaging tools
+        run: sudo apt-get update -q && sudo apt-get install -y --no-install-recommends cpio
+
+      - name: Build macOS ARM64 provider guests
+        run: |
+          just providers::build-platform-artifacts \
+            "$RUNNER_TEMP/providers-darwin-arm64" \
+            linux/arm64 macos aarch64
+
+      - name: Upload macOS ARM64 provider guests
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: provider-guests-darwin-arm64-${{ github.sha }}
+          path: ${{ runner.temp }}/providers-darwin-arm64
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+  provider-kvm-snapshots:
+    needs:
+      - provider-linux-guests
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+
+      - name: Enable KVM
+        run: |
+          test -c /dev/kvm
+          sudo chmod 0666 /dev/kvm
+
+      - name: Download Linux provider guests
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: provider-guests-linux-amd64-${{ github.sha }}
+          path: ${{ runner.temp }}/providers-linux-amd64
+
+      - name: Capture Linux KVM provider snapshots
+        run: |
+          just providers::capture-platform-variants \
+            "$RUNNER_TEMP/providers-linux-amd64" \
+            "$RUNNER_TEMP/provider-variants-kvm" \
+            linux x86_64
+
+      - name: Upload Linux KVM provider snapshots
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: provider-variants-kvm-${{ github.sha }}
+          path: ${{ runner.temp }}/provider-variants-kvm
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+  provider-hvf-snapshots:
+    needs:
+      - provider-darwin-guests
+    runs-on: [self-hosted, macos, arm64, hvf]
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: hyperlight-dev/ci-setup-workflow@59673866360458f8dd035f4a9fa766aeebad2038 # v2.3.1
+        with:
+          additional-toolchain-directory: cli
+          just-version: "1.43"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download macOS ARM64 provider guests
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: provider-guests-darwin-arm64-${{ github.sha }}
+          path: ${{ runner.temp }}/providers-darwin-arm64
+
+      - name: Capture macOS HVF provider snapshots
+        run: |
+          just providers::capture-platform-variants \
+            "$RUNNER_TEMP/providers-darwin-arm64" \
+            "$RUNNER_TEMP/provider-variants-hvf" \
+            macos aarch64
+
+      - name: Upload macOS HVF provider snapshots
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: provider-variants-hvf-${{ github.sha }}
+          path: ${{ runner.temp }}/provider-variants-hvf
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+  publish-provider-snapshots:
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - version
+      - verify-ci
+      - provider-linux-guests
+      - provider-darwin-guests
+      - provider-kvm-snapshots
+      - provider-hvf-snapshots
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    outputs:
+      kind_digest: ${{ steps.publish.outputs.kind_digest }}
+      k3d_digest: ${{ steps.publish.outputs.k3d_digest }}
+      azure_digest: ${{ steps.publish.outputs.azure_digest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Three providers' snapshots, their inputs and their published layouts
+      # fill the hosted runner's disk.
+      - name: Free unused Android SDK space on the hosted runner
+        run: |
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          df -h /
+          if [ -d /usr/local/lib/android ]; then
+            sudo rm --recursive --force -- /usr/local/lib/android
+          fi
+          df -h /
+
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+
+      - name: Install ORAS
+        run: |
+          just providers::install-oras
+          echo "$PWD/build/tools" >>"$GITHUB_PATH"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download provider inputs
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: provider-*-${{ github.sha }}
+          path: build/provider-inputs
+
+      - name: Assemble and publish provider snapshots
+        id: publish
+        env:
+          TAG: ${{ needs.version.outputs.image-tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p build/provider-layouts build/providers-linux build/providers-darwin
+          linux=build/provider-inputs/provider-guests-linux-amd64-${GITHUB_SHA}
+          darwin=build/provider-inputs/provider-guests-darwin-arm64-${GITHUB_SHA}
+          kvm=build/provider-inputs/provider-variants-kvm-${GITHUB_SHA}
+          hvf=build/provider-inputs/provider-variants-hvf-${GITHUB_SHA}
+          for provider in kind k3d azure; do
+            repository="ghcr.io/hyperlight-dev/lampyr/provider-${provider}-snapshots"
+            layout="build/provider-layouts/$provider"
+            just providers::snapshot-assemble \
+              "$linux/$provider" "$layout" "$kvm/$provider" "$hvf/$provider"
+            reference=$(just providers::snapshot-publish \
+              "$layout" "$repository" "$TAG" "build/providers-linux/$provider")
+            just providers::snapshot-bind \
+              "$darwin/$provider" "$layout" "$repository" \
+              "build/providers-darwin/$provider"
+            printf '%s_digest=%s\n' "$provider" "${reference#*@}" >>"$GITHUB_OUTPUT"
+            # The published and bound artifacts hold everything later steps
+            # need, the bound one sharing the layout's blobs, so the layout
+            # and this provider's inputs go before the next provider's.
+            rm -rf -- "$layout" "$linux/$provider" "$darwin/$provider" \
+              "$kvm/$provider" "$hvf/$provider"
+            df -h /
+          done
+
+      - name: Attest Kind snapshot index
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/hyperlight-dev/lampyr/provider-kind-snapshots
+          subject-digest: ${{ steps.publish.outputs.kind_digest }}
+          push-to-registry: true
+
+      - name: Attest k3d snapshot index
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/hyperlight-dev/lampyr/provider-k3d-snapshots
+          subject-digest: ${{ steps.publish.outputs.k3d_digest }}
+          push-to-registry: true
+
+      - name: Attest Azure snapshot index
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/hyperlight-dev/lampyr/provider-azure-snapshots
+          subject-digest: ${{ steps.publish.outputs.azure_digest }}
+          push-to-registry: true
+
+      # Every provider's KVM and HVF snapshots are 7.5 GiB across the two
+      # platforms, and Azure's memory layer alone is over the installer's
+      # 1 GiB file limit, so no platform archive can carry them. Each
+      # artifact keeps its pinned snapshotIndex and snapshotRepository, and
+      # ly pulls only the host's variant by that digest when the provider
+      # starts, cold-booting if the registry can't be reached.
+      - name: Drop local snapshot layouts from the provider artifacts
+        run: |
+          set -euo pipefail
+          artifacts=(build/providers-{linux,darwin}/{kind,k3d,azure})
+          # Every artifact is checked before any layout goes, so a failed
+          # check leaves them all as published.
+          for artifact in "${artifacts[@]}"; do
+            jq --exit-status \
+              '(.snapshotRepository | type == "string")
+                and .snapshotIndex.path == "index.json"' \
+              "$artifact/manifest.json" >/dev/null || {
+              echo "$artifact does not pin a published snapshot index" >&2
+              exit 1
+            }
+          done
+          for artifact in "${artifacts[@]}"; do
+            rm -rf -- "$artifact/blobs" "$artifact/index.json" \
+              "$artifact/oci-layout"
+          done
+          du -sh build/providers-linux build/providers-darwin
+
+      - name: Upload pinned provider artifacts
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: published-provider-artifacts-${{ github.sha }}
+          path: |
+            build/providers-linux
+            build/providers-darwin
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+  packages:
+    needs:
+      - version
+      - publish-provider-snapshots
+      - publish-images
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+
+      - name: Install package tool
+        run: sudo apt-get update -q && sudo apt-get install -y --no-install-recommends cpio
+
+      - name: Download pinned provider artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: published-provider-artifacts-${{ github.sha }}
+          path: build
+
+      - uses: azure/setup-kubectl@bda439f5f36b99b262ebdcd3613869bddb064c8e # v5.2.0
+        with:
+          version: v1.35.0
+
+      - name: Download published image digests
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: image-digest-*-${{ github.sha }}
+          path: build/image-digests
+          merge-multiple: true
+
+      # The platform installs these when an install is not given them, so
+      # ly cluster install from a release needs none of them, and
+      # zygoteRegistries defaults to the Kind or k3d local registry.
+      - name: Write the default controller inputs
+        run: |
+          image() {
+            local digest
+            digest=$(<"build/image-digests/$1")
+            [[ $digest =~ ^sha256:[0-9a-f]{64}$ ]] || {
+              echo "bad digest for $1" >&2
+              return 1
+            }
+            printf '%s/%s@%s\n' "$IMAGE_PREFIX" "$1" "$digest"
+          }
+          # A failure inside $(...) as an argument would not stop the step.
+          controller=$(image fiberd-k8s-controller)
+          grant=$(image upstream-fiberd)
+          helper=$(image hluk-helper)
+          just upstream::controller-inputs "$controller" "$grant" "$helper"
+
+      - name: Package release archives
+        env:
+          SUFFIX: ${{ needs.version.outputs.suffix }}
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            just package-release "$GITHUB_REF_NAME" "$PWD/build/providers-linux"
+          else
+            just package-preview "$PWD/build/providers-linux"
+          fi
+          just cli::package-darwin-platform "$SUFFIX" "$PWD/build/providers-darwin"
+
+      - name: Upload packages for publication
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: lampyr-packages-${{ github.sha }}
+          path: |
+            build/dist/lampyr-cli-linux-amd64-${{ needs.version.outputs.suffix }}.tar.gz
+            build/dist/lampyr-cli-linux-amd64-${{ needs.version.outputs.suffix }}.tar.gz.sha256
+            build/dist/lampyr-platform-linux-amd64-${{ needs.version.outputs.suffix }}.tar.gz
+            build/dist/lampyr-platform-linux-amd64-${{ needs.version.outputs.suffix }}.tar.gz.sha256
+            build/dist/lampyr-platform-darwin-arm64-${{ needs.version.outputs.suffix }}.tar.gz
+            build/dist/lampyr-platform-darwin-arm64-${{ needs.version.outputs.suffix }}.tar.gz.sha256
+            build/dist/lampyr-provider-kind-${{ needs.version.outputs.suffix }}.tar.gz
+            build/dist/lampyr-provider-kind-${{ needs.version.outputs.suffix }}.tar.gz.sha256
+            build/dist/lampyr-provider-k3d-${{ needs.version.outputs.suffix }}.tar.gz
+            build/dist/lampyr-provider-k3d-${{ needs.version.outputs.suffix }}.tar.gz.sha256
+            build/dist/lampyr-provider-azure-${{ needs.version.outputs.suffix }}.tar.gz
+            build/dist/lampyr-provider-azure-${{ needs.version.outputs.suffix }}.tar.gz.sha256
+            build/dist/install-ly.sh
+            build/dist/install-ly.sh.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+  macos-cli-package:
+    needs:
+      - version
+    runs-on: [self-hosted, macos, arm64, hvf]
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: hyperlight-dev/ci-setup-workflow@59673866360458f8dd035f4a9fa766aeebad2038 # v2.3.1
+        with:
+          additional-toolchain-directory: cli
+          just-version: "1.43"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check and test the macOS CLI
+        run: just cli::test-macos
+
+      - name: Package the macOS CLI
+        env:
+          LAMPYR_IMAGE_TAG: ${{ needs.version.outputs.suffix }}
+        run: just cli::package-macos "${{ needs.version.outputs.suffix }}"
+
+      - name: Attest macOS CLI archive
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: build/dist/lampyr-cli-aarch64-apple-darwin-${{ needs.version.outputs.suffix }}.tar.gz
+
+      - name: Upload macOS CLI for publication
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: lampyr-macos-cli-${{ github.sha }}
+          path: |
+            build/dist/lampyr-cli-aarch64-apple-darwin-${{ needs.version.outputs.suffix }}.tar.gz
+            build/dist/lampyr-cli-aarch64-apple-darwin-${{ needs.version.outputs.suffix }}.tar.gz.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+  verify-ci:
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 65
+    permissions:
+      actions: read
+    steps:
+      - name: Wait for CI on this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for attempt in $(seq 1 120); do
+            run=$(gh api \
+              "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${GITHUB_SHA}&event=push&per_page=100" \
+              --jq '.workflow_runs | sort_by(.created_at) | last // empty')
+            if [[ -n "$run" ]]; then
+              status=$(jq -r '.status' <<<"$run")
+              if [[ "$status" == "completed" ]]; then
+                conclusion=$(jq -r '.conclusion' <<<"$run")
+                if [[ "$conclusion" != "success" ]]; then
+                  echo "CI for $GITHUB_SHA completed with conclusion: $conclusion" >&2
+                  exit 1
+                fi
+                exit 0
+              fi
+            fi
+            sleep 30
+          done
+          echo "Timed out waiting for CI on $GITHUB_SHA" >&2
+          exit 1
+
+  publish-images:
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - version
+      - verify-ci
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    strategy:
+      matrix:
+        include:
+          - image: fiberd
+            prepare: prepare-fiberd-image
+            context: .
+            dockerfile: fiberd/ci.Dockerfile
+            target: ""
+            build_args: ""
+            title: Lampyr fiberd
+            description: Lampyr serving controller
+          - image: fiber-router
+            prepare: prepare-fiber-router-image
+            context: .
+            dockerfile: activator/ci.Dockerfile
+            target: ""
+            build_args: ""
+            title: Lampyr fiber-router
+            description: Lampyr fiber router
+          - image: hluk-helper
+            prepare: helper::prepare-image
+            context: .
+            dockerfile: helper/ci.Dockerfile
+            target: ""
+            build_args: ""
+            title: Lampyr hluk helper
+            description: fiberd helper for Lampyr snapshots on hyperlight-unikraft
+          - image: azure-node-setup
+            prepare: azure::prepare-node-setup-image
+            context: providers/azure/node-setup
+            dockerfile: providers/azure/node-setup/Dockerfile
+            target: ""
+            build_args: ""
+            title: Lampyr Azure node setup
+            description: Lampyr AKS node preparation
+          - image: eventgrid-controller
+            prepare: azure::prepare-eventgrid-controller-image
+            context: providers/azure
+            dockerfile: providers/azure/eventgrid/ci.Dockerfile
+            target: ""
+            build_args: BINARY=eventgrid-controller
+            title: Lampyr Event Grid controller
+            description: Lampyr Event Grid controller
+          - image: eventgrid-adapter
+            prepare: azure::prepare-eventgrid-adapter-image
+            context: providers/azure
+            dockerfile: providers/azure/eventgrid/ci.Dockerfile
+            target: ""
+            build_args: BINARY=eventgrid-adapter
+            title: Lampyr Event Grid adapter
+            description: Lampyr Event Grid adapter
+          # Built from the upstream commits upstream/pins.env pins until
+          # fiberd and fiberd-k8s-controller publish images of their own.
+          - image: upstream-fiberd
+            prepare: upstream::prepare-fiberd-image
+            context: build/upstream/fiberd
+            dockerfile: build/upstream/fiberd/docker/fiberd/Dockerfile
+            target: fiberd
+            build_args: ""
+            title: fiberd
+            description: Stock fiberd, which grant Pods run, from the commit upstream/pins.env pins
+          - image: fiberd-k8s-controller
+            prepare: upstream::prepare-controller-image
+            context: .
+            dockerfile: upstream/controller.Dockerfile
+            target: ""
+            build_args: ""
+            title: fiberd-k8s-controller
+            description: fiberd-k8s-controller from the commit upstream/pins.env pins
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+
+      # Re-runs reuse the version job's outputs, so recheck before pushing version tags.
+      - name: Require an unpublished version
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/require-new-release.sh "$GITHUB_REF_NAME"
+
+      - name: Prepare ${{ matrix.image }} image context
+        run: just ${{ matrix.prepare }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # The upstream images' descriptions name the repository and commit
+      # pins.env gives, so an image says which source it was built from.
+      - name: Read the upstream source
+        id: upstream
+        if: matrix.image == 'upstream-fiberd' || matrix.image == 'fiberd-k8s-controller'
+        env:
+          IMAGE: ${{ matrix.image }}
+        run: |
+          . upstream/pins.env
+          if [[ $IMAGE == upstream-fiberd ]]; then
+            description="Stock fiberd, which grant Pods run, from $FIBERD_REPOSITORY@$FIBERD_COMMIT"
+          else
+            description="fiberd-k8s-controller from $CONTROLLER_REPOSITORY@$CONTROLLER_COMMIT"
+          fi
+          printf 'description=%s\n' "$description" >>"$GITHUB_OUTPUT"
+
+      - name: Extract image metadata
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.IMAGE_PREFIX }}/${{ matrix.image }}
+          tags: type=raw,value=${{ needs.version.outputs.image-tag }}
+          labels: |
+            org.opencontainers.image.title=${{ matrix.title }}
+            org.opencontainers.image.description=${{ steps.upstream.outputs.description || matrix.description }}
+            org.opencontainers.image.source=https://github.com/hyperlight-dev/lampyr
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ needs.version.outputs.image-tag }}
+
+      # fiberd -version prints the version the image is built as.
+      - name: Read the fiberd version
+        id: fiberd-version
+        if: matrix.image == 'upstream-fiberd'
+        # A failure inside $(...) as an argument would not stop the step.
+        run: |
+          version=$(just upstream::fiberd-version)
+          [[ -n $version ]] || { echo "just upstream::fiberd-version printed nothing" >&2; exit 1; }
+          printf 'build-args=VERSION=%s\n' "$version" >>"$GITHUB_OUTPUT"
+
+      - name: Build and push image
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          target: ${{ matrix.target }}
+          build-args: ${{ steps.fiberd-version.outputs.build-args || matrix.build_args }}
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: mode=max
+          sbom: true
+
+      - name: Attest image
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE_PREFIX }}/${{ matrix.image }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      - name: Verify image
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE: ${{ env.IMAGE_PREFIX }}/${{ matrix.image }}:${{ needs.version.outputs.image-tag }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          gh attestation verify "oci://${IMAGE}@${IMAGE_DIGEST}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/release.yml" \
+            --source-ref "$GITHUB_REF" \
+            --source-digest "$GITHUB_SHA" \
+            --deny-self-hosted-runners
+
+      # Packaging pins the platform's default controller inputs to these.
+      - name: Record image digest
+        env:
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p build/image-digests
+          printf '%s\n' "$IMAGE_DIGEST" >"build/image-digests/${{ matrix.image }}"
+
+      - name: Upload image digest
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: image-digest-${{ matrix.image }}-${{ github.sha }}
+          path: build/image-digests/${{ matrix.image }}
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - version
+      - packages
+      - macos-cli-package
+      - publish-images
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download tested packages
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: lampyr-packages-${{ github.sha }}
+          path: build/dist
+
+      - name: Download tested macOS CLI
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: lampyr-macos-cli-${{ github.sha }}
+          path: build/dist
+
+      - name: Verify package checksums
+        working-directory: build/dist
+        env:
+          SUFFIX: ${{ needs.version.outputs.suffix }}
+        run: sha256sum --check ./*-"$SUFFIX".tar.gz.sha256 ./install-ly.sh.sha256
+
+      - name: Attest CLI archive
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: build/dist/lampyr-cli-linux-amd64-${{ needs.version.outputs.suffix }}.tar.gz
+
+      - name: Attest platform archive
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: build/dist/lampyr-platform-linux-amd64-${{ needs.version.outputs.suffix }}.tar.gz
+
+      - name: Attest Darwin platform archive
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: build/dist/lampyr-platform-darwin-arm64-${{ needs.version.outputs.suffix }}.tar.gz
+
+      - name: Attest Kind provider archive
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: build/dist/lampyr-provider-kind-${{ needs.version.outputs.suffix }}.tar.gz
+
+      - name: Attest k3d provider archive
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: build/dist/lampyr-provider-k3d-${{ needs.version.outputs.suffix }}.tar.gz
+
+      - name: Attest Azure provider archive
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: build/dist/lampyr-provider-azure-${{ needs.version.outputs.suffix }}.tar.gz
+
+      - name: Attest installer
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: build/dist/install-ly.sh
+
+      - name: Verify artifact provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUFFIX: ${{ needs.version.outputs.suffix }}
+        run: |
+          for artifact in \
+            build/dist/lampyr-cli-linux-amd64-"$SUFFIX".tar.gz \
+            build/dist/lampyr-platform-linux-amd64-"$SUFFIX".tar.gz \
+            build/dist/lampyr-platform-darwin-arm64-"$SUFFIX".tar.gz \
+            build/dist/lampyr-provider-kind-"$SUFFIX".tar.gz \
+            build/dist/lampyr-provider-k3d-"$SUFFIX".tar.gz \
+            build/dist/lampyr-provider-azure-"$SUFFIX".tar.gz \
+            build/dist/install-ly.sh; do
+            gh attestation verify "$artifact" \
+              --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/release.yml" \
+              --source-ref "$GITHUB_REF" \
+              --source-digest "$GITHUB_SHA" \
+              --deny-self-hosted-runners
+          done
+
+      - name: Verify macOS artifact provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUFFIX: ${{ needs.version.outputs.suffix }}
+        run: |
+          gh attestation verify \
+            build/dist/lampyr-cli-aarch64-apple-darwin-"$SUFFIX".tar.gz \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/release.yml" \
+            --source-ref "$GITHUB_REF" \
+            --source-digest "$GITHUB_SHA"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish preview
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/publish-preview-release.sh
+
+      - name: Publish version
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/publish-version-release.sh

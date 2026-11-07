@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Delete the tour's Revisions that serve no traffic. Each Revision keeps its
+# own home pod until it is deleted. A Revision that was just replaced may
+# still be finishing requests, and deleting it cuts them off: run this once
+# the new Revision is ready (ly deploy waits for that) and the old one's
+# requests are done.
+#
+#   bin/prune-revisions
+#
+# CONTEXT defaults to kind-${NAME:-lampyr}.
+set -euo pipefail
+context=${CONTEXT:-kind-${NAME:-lampyr}}
+k() { kubectl --context "$context" -n default "$@"; }
+for service in runner playground; do
+  # Keep the latest created and latest ready Revisions and every Revision
+  # the route sends traffic to: a redeploy of older code can bring an older
+  # Revision back, and a new one may not be ready yet.
+  keep=$(k get ksvc "$service" --ignore-not-found -o jsonpath='{.status.latestCreatedRevisionName} {.status.latestReadyRevisionName} {.status.traffic[*].revisionName}')
+  [ -n "${keep// /}" ] || continue
+  # On its own line, so set -e stops on an API failure.
+  revisions=$(k get revisions -l "serving.knative.dev/service=$service" -o name)
+  for revision in $revisions; do
+    case " $keep " in
+      *" ${revision#*/} "*) ;;
+      *) k delete "$revision" --wait=false >/dev/null ;;
+    esac
+  done
+done

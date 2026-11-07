@@ -1,0 +1,16 @@
+{
+  "schemaVersion": "lampyr.dev/runtime-adapter/v1alpha1",
+  "runtime": "rust",
+  "templateVersion": "0.2.1",
+  "entrypoint": "/entrypoint",
+  "files": {
+    "Cargo.lock": "sha256:5e996b4f39afc35329ebd927c024e63bb5806b464fd226aa6b5f24cb29ed9c52",
+    "Cargo.toml": "sha256:26cc92f3acac041beb63e018fe7a0cdb471149cdb88b3aa7ea17b1d921980e54",
+    "Dockerfile.rootfs": "sha256:0c5dca08329a91e1a97e9671352c384c286b7c9252065a2e9a3fb1642a9b792d",
+    "server.rs": "sha256:686dc4d081163a724677d406fa45f8642df9f1c06a17cbc5b7d19aa6c6ca6820",
+    "types.rs": "sha256:1975943cd1a06834f3ac0e992af4929fae9df942ac2d883eed79c714679a3d96"
+  },
+  "pristine": {
+    "entrypoint": "/entrypoint"
+  }
+}

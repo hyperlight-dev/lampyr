@@ -1,0 +1,13 @@
+/build/
+/cli/target/
+/helper/target/
+/providers/*/build/
+__pycache__/
+/walkthrough/
+/demo-app/
+
+.scratch/
+.lampyr-walkthrough/
+.lampyr-walkthrough.*/
+.lampyr-aks-walkthrough/
+.lampyr-aks-walkthrough.*/

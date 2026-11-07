@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 630" role="img" aria-labelledby="title desc">
+  <title id="title">Lampyr: Small services. Bright starts.</title>
+  <desc id="desc">A geometric firefly glows over a technical request path on a deep forest background.</desc>
+  <defs>
+    <radialGradient id="glow">
+      <stop offset="0" stop-color="#d5ff5f" stop-opacity=".5"/>
+      <stop offset="1" stop-color="#d5ff5f" stop-opacity="0"/>
+    </radialGradient>
+    <pattern id="grid" width="48" height="48" patternUnits="userSpaceOnUse">
+      <path d="M48 0H0v48" fill="none" stroke="#a8b6a4" stroke-opacity=".08"/>
+    </pattern>
+  </defs>
+  <rect width="1200" height="630" fill="#08150f"/>
+  <rect width="1200" height="630" fill="url(#grid)"/>
+  <circle cx="916" cy="305" r="250" fill="url(#glow)"/>
+  <g transform="translate(825 165) scale(2.2)" fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M48 23 37 34l11 11 11-11Z" fill="#12251b" stroke="#a8b6a4" stroke-width="3"/>
+    <path d="M48 45 36 57l12 22 12-22Z" fill="#d5ff5f" stroke="#08150f" stroke-width="3"/>
+    <path d="M36 43 16 32l7 24 13 1M60 43l20-11-7 24-13 1" stroke="#ffbe55" stroke-width="4"/>
+    <path d="m42 24-7-9m19 9 7-9" stroke="#a8b6a4" stroke-width="3"/>
+  </g>
+  <text x="92" y="170" fill="#ffbe55" font-family="ui-monospace, monospace" font-size="26" letter-spacing="5">LAMPYR / HARDWARE ISOLATION</text>
+  <text x="92" y="270" fill="#f1f5df" font-family="ui-serif, Georgia, serif" font-size="70" font-weight="700">Small services.</text>
+  <text x="92" y="350" fill="#d5ff5f" font-family="ui-serif, Georgia, serif" font-size="70" font-weight="700">Bright starts.</text>
+  <text x="96" y="430" fill="#a8b6a4" font-family="ui-sans-serif, sans-serif" font-size="30">Hardware-isolated activation for familiar applications.</text>
+  <path d="M96 505H690" stroke="#a8b6a4" stroke-opacity=".35" stroke-width="2"/>
+  <circle cx="96" cy="505" r="7" fill="#d5ff5f"/>
+  <circle cx="350" cy="505" r="7" fill="#ffbe55"/>
+  <circle cx="690" cy="505" r="7" fill="#d5ff5f"/>
+  <text x="96" y="548" fill="#a8b6a4" font-family="ui-monospace, monospace" font-size="22">INGRESS</text>
+  <text x="320" y="548" fill="#a8b6a4" font-family="ui-monospace, monospace" font-size="22">ACTIVATE</text>
+  <text x="630" y="548" fill="#a8b6a4" font-family="ui-monospace, monospace" font-size="22">RESTORE</text>
+</svg>

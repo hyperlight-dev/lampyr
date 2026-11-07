@@ -1,0 +1,25 @@
+{
+  "schemaVersion": "lampyr.dev/artifact/v1alpha2",
+  "revisionId": "3def56a12477a03019331f294a5d066865cd15a25f2b72421198bb56bee1caa3",
+  "project": {
+    "apiVersion": "lampyr.dev/v1alpha1",
+    "kind": "Project",
+    "name": "standalone",
+    "runtime": "go",
+    "application": {"type": "standalone", "command": "/app/service"},
+    "command": "/app/service",
+    "protocols": {"http": true, "streaming": true, "websocket": true, "events": false},
+    "events": {"maxRetries": 0, "initialBackoff": "", "attemptTimeout": "", "deadLetter": ""},
+    "resources": {"memory": "256Mi", "cpu": "250m"}
+  },
+  "target": {
+    "os": "linux",
+    "arch": "amd64",
+    "hypervisor": "kvm",
+    "compatibilityClass": "linux-amd64-kvm"
+  },
+  "source": {"digest": "sha256:source"},
+  "runtime": {"hyperlightUnikraft": "fixture"},
+  "artifacts": {"kernel": "sha256:0000000000000000000000000000000000000000000000000000000000000000", "rootfs": "sha256:1111111111111111111111111111111111111111111111111111111111111111"},
+  "provenance": {"buildType": "https://lampyr.dev/build/snapshot/v1", "builder": "ly"}
+}

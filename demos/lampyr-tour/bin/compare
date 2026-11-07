@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# One line about each model, from Prometheus: what the node holds now.
+#
+#   bin/compare containers   the baseline replicas
+#   bin/compare fibers       the runner's Fibers and home pod
+#   bin/compare              both
+#
+# PROMETHEUS defaults to http://127.0.0.1:19090 (bin/setup.sh forwards it).
+# Memory is RSS from the kubelet's last cAdvisor sample, so it lags a few
+# seconds. Container replicas are idle; busy Fibers are mid-request.
+set -euo pipefail
+
+prometheus=${PROMETHEUS:-http://127.0.0.1:19090}
+
+query() {
+  local out status=0
+  out=$(curl -fsS -m 5 --get --data-urlencode "query=($1) or vector(0)" "$prometheus/api/v1/query" 2>/dev/null) ||
+    status=$?
+  if [ "$status" = 22 ]; then
+    echo "compare: Prometheus at $prometheus answered with an HTTP error; check the query or the server" >&2
+    exit 1
+  elif [ "$status" != 0 ]; then
+    echo "compare: Prometheus at $prometheus doesn't answer; see bin/setup.sh" >&2
+    exit 1
+  fi
+  python3 -c 'import json, sys
+r = json.load(sys.stdin)["data"]["result"]
+print(r[0]["value"][1] if r else "0")' <<<"$out"
+}
+
+phase() { # NAMESPACE POD_REGEX PHASE
+  query "count(kube_pod_status_phase{namespace=\"$1\",pod=~\"$2\",phase=\"$3\"} == 1)"
+}
+
+# The runner's home pods, by label: their names depend on how the platform
+# creates them. kube-state-metrics exports these labels (observability/values.yaml).
+home='kube_pod_labels{label_lampyr_dev_home="true",label_serving_knative_dev_service="runner"}'
+
+containers() {
+  local running pending rss
+  running=$(phase baseline 'runner-.*' Running)
+  pending=$(phase baseline 'runner-.*' Pending)
+  rss=$(query 'sum(container_memory_rss{namespace="baseline",container="runner"})')
+  python3 - "$running" "$pending" "$rss" <<'EOF'
+import sys
+running, pending, rss = (float(v) for v in sys.argv[1:])
+each = f" (~{rss / running / 2**20:.0f} MiB each)" if running else ""
+print(f"containers: {running:.0f} running, {pending:.0f} Pending, {rss / 2**20:.0f} MiB{each}")
+EOF
+}
+
+fibers() {
+  local up busy homes pending rss
+  up=$(query 'max(up{job="monitoring/fiber-router"})') || exit 1
+  [ "$up" = 1 ] || { echo "compare: Prometheus is not scraping fiber-router; see bin/setup.sh" >&2; exit 1; }
+  busy=$(query 'sum(lampyr_router_fibers_busy{exported_namespace="default",revision=~"runner-[0-9a-f]{12}"})')
+  homes=$(query "count(kube_pod_status_phase{phase=\"Running\"} == 1 and on(namespace, pod) $home)")
+  pending=$(query "count(kube_pod_status_phase{phase=\"Pending\"} == 1 and on(namespace, pod) $home)")
+  rss=$(query "sum(container_memory_rss{container!=\"\",container!=\"POD\"} * on(namespace, pod) group_left() max by (namespace, pod) ($home))")
+  python3 - "$busy" "$homes" "$pending" "$rss" <<'EOF'
+import sys
+busy, homes, pending, rss = (float(v) for v in sys.argv[1:])
+each = f" (~{rss / busy / 2**20:.0f} MiB per VM)" if busy else ""
+pods = "home pod" if homes == 1 else "home pods"
+print(f"Lampyr: {busy:.0f} micro-VMs running in {homes:.0f} {pods}, {pending:.0f} Pending, {rss / 2**20:.0f} MiB{each}")
+EOF
+}
+
+case ${1:-both} in
+  containers) containers ;;
+  fibers) fibers ;;
+  both) containers; fibers ;;
+  *) echo "usage: compare [containers | fibers]" >&2; exit 2 ;;
+esac

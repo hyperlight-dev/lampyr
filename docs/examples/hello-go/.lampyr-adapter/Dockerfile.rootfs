@@ -1,0 +1,11 @@
+FROM golang:1.26-alpine AS build
+
+WORKDIR /src
+COPY .lampyr-adapter/go.mod .lampyr-adapter/go.sum ./
+RUN go mod download
+COPY .lampyr-adapter/server.go .lampyr-adapter/types.go handler.go ./
+RUN CGO_ENABLED=0 go build -buildmode=pie -trimpath -ldflags="-s -w" -o /entrypoint . \
+    && /entrypoint --check
+
+FROM hluk-go-rootfs:latest AS rootfs
+COPY --from=build /entrypoint /entrypoint

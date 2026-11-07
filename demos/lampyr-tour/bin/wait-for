@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# Wait until URL answers without an HTTP error, and print how long that took since
+# your newest `ly dev` started (or since this command started, without one).
+#
+#   bin/wait-for URL [TIMEOUT_SECONDS]   (default timeout: 180)
+set -euo pipefail
+[ $# -ge 1 ] || { echo "usage: wait-for URL [TIMEOUT_SECONDS]" >&2; exit 2; }
+url=$1
+timeout=${2:-180}
+[[ $timeout =~ ^[1-9][0-9]*$ ]] || { echo "wait-for: TIMEOUT_SECONDS must be a positive integer, not '$timeout'" >&2; exit 2; }
+deadline=$((SECONDS + timeout))
+# A process's start time is field 22 of /proc/PID/stat, in clock ticks
+# since boot; /proc/uptime is seconds since boot.
+start=$(cut -d' ' -f1 /proc/uptime)
+since="this command started"
+# The newest of your `ly dev` processes; with several, it may not be the
+# one serving URL.
+if pid=$(pgrep -n -u "$(id -u)" -f '(^|/)ly dev( |$)' 2>/dev/null); then
+  # The process may have exited since; then time from this command.
+  if ticks=$(awk '{print $22}' "/proc/$pid/stat" 2>/dev/null) && [ -n "$ticks" ]; then
+    start=$(python3 -c "import os; print($ticks / os.sysconf('SC_CLK_TCK'))")
+    since="ly dev started"
+  fi
+fi
+if curl -fsk -m 2 -o /dev/null "$url"; then
+  echo "already answering"
+  exit 0
+fi
+until curl -fsk -m 2 -o /dev/null "$url"; do
+  [ "$SECONDS" -lt "$deadline" ] || { echo "wait-for: $url did not answer" >&2; exit 1; }
+  sleep 0.2
+done
+awk -v start="$start" -v since="$since" '{printf "answering %.1f s after %s\n", $1 - start, since}' /proc/uptime

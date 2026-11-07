@@ -1,0 +1,40 @@
+apiVersion: k3d.io/v1alpha5
+kind: Simple
+metadata:
+  name: __NAME__
+servers: 1
+agents: 0
+image: rancher/k3s:v1.35.5-k3s1@sha256:2074403abe1bded11ef3dde09d457e13be8e0b64c218b1c4f8269b4565cfbc65
+network: __NETWORK__
+kubeAPI:
+  host: 127.0.0.1
+  hostIP: 127.0.0.1
+  hostPort: "0"
+volumes:
+  - volume: /dev/kvm:/dev/kvm:ro
+    nodeFilters: ["server:*", "agent:*"]
+ports:
+  - port: "127.0.0.1:__HTTP_PORT__:30080"
+    nodeFilters: ["server:0:direct"]
+  - port: "127.0.0.1:__HTTPS_PORT__:30443"
+    nodeFilters: ["server:0:direct"]
+options:
+  k3d:
+    wait: true
+    timeout: 180s
+    disableLoadbalancer: true
+    disableImageVolume: false
+    disableRollback: true
+  k3s:
+    extraArgs:
+      - arg: --disable=traefik
+        nodeFilters: ["server:*"]
+      - arg: --disable=servicelb
+        nodeFilters: ["server:*"]
+  kubeconfig:
+    updateDefaultKubeconfig: false
+    switchCurrentContext: false
+  runtime:
+    labels:
+      - label: lampyr.dev/installation-id=__INSTALLATION_ID__
+        nodeFilters: ["server:*", "agent:*"]

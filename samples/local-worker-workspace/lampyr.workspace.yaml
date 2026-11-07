@@ -1,0 +1,5 @@
+apiVersion: lampyr.dev/v1alpha1
+kind: Workspace
+ingress:
+  services:
+    - worker-api

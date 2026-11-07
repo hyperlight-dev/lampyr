@@ -1,0 +1,20 @@
+---
+import SiteShell from '../layouts/SiteShell.astro';
+
+const base = import.meta.env.BASE_URL;
+---
+
+<SiteShell
+	title="Page not found: Lampyr"
+	description="The requested Lampyr documentation page could not be found."
+	noindex
+>
+	<section class="not-found section">
+		<h1>This light moved on.</h1>
+		<p><strong>404.</strong> The requested page is not in the generated field guide.</p>
+		<div class="actions">
+			<a class="button primary" href={base}>Return home</a>
+			<a class="button" href={`${base}docs/`}>Browse documentation</a>
+		</div>
+	</section>
+</SiteShell>

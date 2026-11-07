@@ -1,0 +1,13 @@
+apiVersion: lampyr.dev/v1alpha1
+kind: Project
+name: worker-reused
+runtime: nodejs
+application:
+  type: standalone
+  command: /app/server.js
+resources:
+  memory: 512Mi
+  cpu: 250m
+execution:
+  mode: reuse
+  idleTimeout: 2s

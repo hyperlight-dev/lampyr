@@ -1,0 +1,16 @@
+{
+  "schemaVersion": "lampyr.dev/runtime-adapter/v1alpha1",
+  "runtime": "go",
+  "templateVersion": "0.2.1",
+  "entrypoint": "/entrypoint",
+  "files": {
+    "Dockerfile.rootfs": "sha256:6c78e09ca0f1b46c6202341d777042a79b5251981a79e9c48842c90b22a1fc11",
+    "go.mod": "sha256:0350b7e50ed52495f3d27006c81dd29196abfb8898ca494a1aa1a92cbf4cd792",
+    "go.sum": "sha256:1737d5523b7264df09b253e86e29f96af295a7bd18e0aaa4373c6099317e065f",
+    "server.go": "sha256:70094987278bfefd2a69c35b7e22d3c5a68c734374dfe73d0ea1f31c835cb8a8",
+    "types.go": "sha256:d1194008329ba24485a07ab5cd2d56954ac764fa66bab1727eaa7f793af3904f"
+  },
+  "pristine": {
+    "entrypoint": "/entrypoint"
+  }
+}

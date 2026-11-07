@@ -1,0 +1,27 @@
+set shell := ["bash", "-euo", "pipefail", "-c"]
+
+project-root := source_directory()
+revision := "34c0d647a9f8679c0ce53b76e174894b2c5bfa7a"
+kernel-sha256 := "fb05f5f9150b9c48de9c035b94eee0fa4c580bd5332586b48f0cee2e860cf861"
+
+# Download the provider kernel from the same pinned Hyperlight-Unikraft revision as the CLI.
+build arch="x86_64":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ "{{ arch }}" != "x86_64" ]]; then
+        echo "provider kernels are currently published for x86_64 only" >&2
+        exit 1
+    fi
+    mkdir -p "{{ project-root }}/build"
+    destination="{{ project-root }}/build/elfloader_hyperlight-{{ arch }}"
+    if echo "{{ kernel-sha256 }}  $destination" | sha256sum --check --status 2>/dev/null; then
+        exit 0
+    fi
+    exec 9>"{{ project-root }}/build/.kernel-download.lock"
+    flock 9
+    temporary=$(mktemp "{{ project-root }}/build/.kernel.XXXXXX")
+    trap 'rm -f "$temporary"' EXIT
+    curl --fail --silent --show-error --location --output "$temporary" \
+        "https://raw.githubusercontent.com/hyperlight-dev/hyperlight-unikraft/{{ revision }}/kernel/elfloader_hyperlight-{{ arch }}"
+    echo "{{ kernel-sha256 }}  $temporary" | sha256sum --check
+    install -m 0644 "$temporary" "$destination"

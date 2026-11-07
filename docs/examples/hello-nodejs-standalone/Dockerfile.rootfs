@@ -1,0 +1,8 @@
+FROM node:24-alpine AS dependencies
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev
+
+FROM hluk-node-rootfs:latest AS rootfs
+COPY --from=dependencies /app/node_modules /app/node_modules
+COPY application.js server.js /app/

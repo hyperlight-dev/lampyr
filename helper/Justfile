@@ -1,0 +1,68 @@
+set shell := ["bash", "-euo", "pipefail", "-c"]
+
+project-root := source_directory()
+repo-root := project-root / ".."
+
+# The newest glibc the helper may need: fiberd's proc base, which grant
+# Pods run it on, is Debian bookworm.
+max-glibc := "2.36"
+
+# Build the helper.
+build:
+    cargo build --locked --manifest-path "{{project-root}}/Cargo.toml"
+
+# Check formatting and every target.
+lint:
+    cargo fmt --manifest-path "{{project-root}}/Cargo.toml" -- --check
+    cargo clippy --locked --manifest-path "{{project-root}}/Cargo.toml" --all-targets -- -D warnings
+
+# Format the helper.
+fmt:
+    cargo fmt --manifest-path "{{project-root}}/Cargo.toml"
+
+# Run the tests that need no hypervisor.
+test: lint
+    cargo test --locked --manifest-path "{{project-root}}/Cargo.toml" --bins --test version
+
+# Build the incarnation fixture into `output` with the CLI at `ly`: a Python
+# service as `ly scaffold` makes it, with tests/fixtures/incarnation's
+# handler, so the fixture holds only what the tests need and its adapter is
+# always the CLI's own.
+[no-cd]
+incarnation-template ly output:
+    ly="$(realpath "{{ly}}")"; output="$(realpath -m "{{output}}")"; \
+    work="$(mktemp -d)"; trap 'rm -rf "$work"' EXIT; \
+    "$ly" scaffold workspace "$work/workspace" >/dev/null; \
+    (cd "$work/workspace" && "$ly" scaffold service helper-incarnation --runtime python) >/dev/null; \
+    cp "{{project-root}}/tests/fixtures/incarnation/handler.py" "$work/workspace/services/helper-incarnation/handler.py"; \
+    "$ly" build "$work/workspace/services/helper-incarnation" --output "$output"
+
+# Drive the helper over fiberd's protocol against a template `ly build` wrote
+# from docs/examples, and one incarnation-template wrote (the second argument,
+# or LAMPYR_HELPER_INCARNATION_TEMPLATE). Needs KVM, and both templates.
+# Relative templates are relative to where just runs, not to helper/; cargo
+# then runs from helper/, so it takes the toolchain rust-toolchain.toml pins.
+[no-cd]
+test-kvm template incarnation-template=env("LAMPYR_HELPER_INCARNATION_TEMPLATE", ""):
+    template="$(realpath "{{template}}")"; \
+    if [ -z "{{incarnation-template}}" ]; then echo "test-kvm needs the incarnation template: just helper::incarnation-template" >&2; exit 1; fi; \
+    incarnation="$(realpath "{{incarnation-template}}")"; \
+    export LAMPYR_HELPER_INCARNATION_TEMPLATE="$incarnation"; \
+    cd "{{project-root}}"; \
+    LAMPYR_HELPER_TEMPLATE="$template" cargo test --locked --manifest-path "{{project-root}}/Cargo.toml" --test protocol -- --test-threads=1
+
+# Prepare the Linux/amd64 helper image context without publishing it.
+prepare-image:
+    mkdir -p "{{repo-root}}/build"
+    cargo build --locked --release --manifest-path "{{project-root}}/Cargo.toml" --target x86_64-unknown-linux-gnu
+    cp "{{project-root}}/target/x86_64-unknown-linux-gnu/release/lampyr-hluk-helper" "{{repo-root}}/build/hluk-helper"
+    newest="$(objdump -T "{{repo-root}}/build/hluk-helper" | { grep -o 'GLIBC_[0-9.]*' || true; } | sed 's/GLIBC_//' | sort -uV | tail -1)"; \
+    if [ -z "$newest" ]; then echo "build/hluk-helper names no glibc version: is it a glibc build?" >&2; exit 1; fi; \
+    if [ "$(printf '%s\n%s\n' "$newest" "{{max-glibc}}" | sort -V | tail -1)" != "{{max-glibc}}" ]; then \
+      echo "build/hluk-helper needs glibc $newest, newer than bookworm's {{max-glibc}}" >&2; exit 1; \
+    fi
+    python3 "{{repo-root}}/scripts/check_preview_images.py" --root "{{repo-root}}" --image hluk-helper --require-binaries
+
+# Build the helper image locally.
+image tag="ghcr.io/hyperlight-dev/lampyr/hluk-helper:preview": prepare-image
+    docker buildx build --load --platform linux/amd64 --tag "{{tag}}" --file "{{project-root}}/ci.Dockerfile" "{{repo-root}}"

@@ -1,0 +1,9 @@
+{
+  "schemaVersion": "lampyr.dev/service-template/v1alpha1",
+  "runtime": "rust",
+  "templateVersion": "0.1.1",
+  "entrypoint": "/app/service",
+  "userOwned": [".gitignore", "Dockerfile", "Dockerfile.rootfs", "lampyr.yaml", "Cargo.toml", "Cargo.lock", "src/application.rs", "src/main.rs"],
+  "adapterOwned": [],
+  "machineState": [".lampyr/"]
+}

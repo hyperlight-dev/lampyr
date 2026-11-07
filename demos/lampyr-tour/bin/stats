@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# Print what the node and fiber-router report right now, from Prometheus.
+#
+#   bin/stats            one snapshot
+#   bin/stats --watch    refresh every 2 s
+#
+# PROMETHEUS defaults to http://127.0.0.1:19090 (bin/setup.sh forwards it).
+# Memory comes from the kubelet's last cAdvisor sample, so it can lag the
+# Fiber count by a few seconds. RSS is resident memory; the working set
+# also counts page cache the pod has touched, such as snapshot pages.
+set -euo pipefail
+
+prometheus=${PROMETHEUS:-http://127.0.0.1:19090}
+
+# Prints NaN when there is no data or the query fails.
+query() {
+  { curl -fsS -m 5 --get --data-urlencode "query=$1" "$prometheus/api/v1/query" 2>/dev/null || true; } |
+    python3 -c 'import json, sys
+try:
+    r = json.load(sys.stdin)["data"]["result"]
+    print(r[0]["value"][1] if r else "NaN")
+except Exception:
+    print("NaN")'
+}
+
+# Format and divide in one place; values may be NaN when there is no data.
+fmt() { python3 - "$@" <<'EOF'
+import sys
+kind, *values = sys.argv[1:]
+def number(x):
+    try:
+        return float(x)
+    except ValueError:
+        return float("nan")
+v = [number(x) for x in values]
+if kind == "mib":
+    print("-" if v[0] != v[0] else f"{v[0] / 2**20:.0f} MiB")
+elif kind == "per":
+    print("-" if not v[1] >= 1 or v[0] != v[0] else f"{v[0] / v[1] / 2**20:.1f} MiB")
+elif kind == "ms":
+    print("-" if v[0] != v[0] else f"{v[0] * 1000:.0f} ms")
+EOF
+}
+
+snapshot() {
+  [ "$(query 'max(up{job="monitoring/fiber-router"}) or vector(0)')" = 1 ] ||
+    { echo "stats: Prometheus at $prometheus is unreachable or not scraping fiber-router; see bin/setup.sh" >&2; return 1; }
+  local running pending busy peak
+  running=$(query 'sum(kube_pod_status_phase{phase="Running"}) or vector(0)')
+  pending=$(query 'sum(kube_pod_status_phase{phase="Pending"}) or vector(0)')
+  busy=$(query 'sum(lampyr_router_fibers_busy) or vector(0)')
+  peak=$(query 'max_over_time(sum(lampyr_router_fibers_busy)[2m:1s]) or vector(0)')
+  printf 'pods                 %s running, %s pending (one node; the kubelet default maxPods is 110)\n' "${running%.*}" "${pending%.*}"
+  printf 'busy Fibers          %s now, %s peak in the last 2 min\n' "${busy%.*}" "${peak%.*}"
+  # The histograms' largest finite bucket is 30 s, so longer times show as 30 s.
+  printf 'time to get a Fiber  p50 %s, p99 %s (last minute; at most 30 s shown)\n' \
+    "$(fmt ms "$(query 'histogram_quantile(0.5, sum by (le) (rate(lampyr_router_fiber_acquire_seconds_bucket{kind!~"error|canceled"}[1m])))')")" \
+    "$(fmt ms "$(query 'histogram_quantile(0.99, sum by (le) (rate(lampyr_router_fiber_acquire_seconds_bucket{kind!~"error|canceled"}[1m])))')")"
+  printf 'request duration     p50 %s, p99 %s (last minute; at most 30 s shown)\n' \
+    "$(fmt ms "$(query 'histogram_quantile(0.5, sum by (le) (rate(lampyr_router_request_duration_seconds_bucket[1m])))')")" \
+    "$(fmt ms "$(query 'histogram_quantile(0.99, sum by (le) (rate(lampyr_router_request_duration_seconds_bucket[1m])))')")"
+  # Lampyr's home pods, by label (kube-state-metrics exports it, see
+  # observability/values.yaml); their names depend on how the platform creates them.
+  local homes='* on(namespace, pod) group_left() max by (namespace, pod) (kube_pod_labels{label_lampyr_dev_home="true"})'
+  local containers='container!="",container!="POD"'
+  local replicas='namespace="baseline",container="runner"'
+  # fiberd-k8s-controller runs in fiberd-system, and cert-manager, with its
+  # csi-driver, issues the home pods' certificates. Home pods are left out
+  # wherever they run: they are the line above.
+  local platform='namespace=~"lampyr-system|knative-serving|kourier-system|hyperlight-system|fiberd-system|cert-manager",container!="",container!="POD"'
+  local not_homes='unless on(namespace, pod) kube_pod_labels{label_lampyr_dev_home="true"}'
+  local home_rss replica_rss replica_count
+  home_rss=$(query "sum(container_memory_rss{$containers} $homes) or vector(0)")
+  replica_rss=$(query "sum(container_memory_rss{$replicas}) or vector(0)")
+  replica_count=$(query "count(container_memory_rss{$replicas}) or vector(0)")
+  echo 'memory, last sample  RSS        working set  per instance (RSS)'
+  printf '  Lampyr home pods   %-10s %-12s %s (home RSS / busy Fibers)\n' "$(fmt mib "$home_rss")" \
+    "$(fmt mib "$(query "sum(container_memory_working_set_bytes{$containers} $homes) or vector(0)")")" "$(fmt per "$home_rss" "$busy")"
+  printf '  container replicas %-10s %-12s %s per replica (%s)\n' "$(fmt mib "$replica_rss")" \
+    "$(fmt mib "$(query "sum(container_memory_working_set_bytes{$replicas}) or vector(0)")")" "$(fmt per "$replica_rss" "$replica_count")" "${replica_count%.*}"
+  printf '  Lampyr platform    %-10s %-12s fiber-router and controllers, fiberd-k8s-controller, cert-manager, Knative Serving, Kourier, KVM plugin\n' \
+    "$(fmt mib "$(query "sum(container_memory_rss{$platform} $not_homes) or vector(0)")")" \
+    "$(fmt mib "$(query "sum(container_memory_working_set_bytes{$platform} $not_homes) or vector(0)")")"
+}
+
+if [ "${1:-}" = --watch ]; then
+  while true; do
+    out=$(snapshot 2>&1) || true
+    clear || true
+    echo "$out"
+    sleep 2
+  done
+else
+  snapshot
+fi

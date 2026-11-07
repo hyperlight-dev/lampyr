@@ -1,0 +1,9 @@
+{
+  "schemaVersion": "lampyr.dev/service-template/v1alpha1",
+  "runtime": "dotnet",
+  "templateVersion": "0.1.1",
+  "entrypoint": "/app/Service",
+  "userOwned": [".gitignore", "Dockerfile", "Dockerfile.rootfs", "lampyr.yaml", "Service.csproj", "Application.cs", "Program.cs"],
+  "adapterOwned": [],
+  "machineState": [".lampyr/"]
+}

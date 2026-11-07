@@ -1,0 +1,15 @@
+FROM rust:1.91-alpine AS build
+
+WORKDIR /src
+COPY handler.rs ./handler.rs
+COPY .lampyr-adapter/Cargo.toml .lampyr-adapter/Cargo.lock ./.lampyr-adapter/
+COPY .lampyr-adapter/server.rs .lampyr-adapter/types.rs ./.lampyr-adapter/
+ENV RUSTFLAGS="-C target-feature=+crt-static -C relocation-model=pie -C link-arg=-static-pie"
+RUN target="$(rustc -vV | sed -n 's/^host: //p')" \
+    && cargo build --locked --release --target "$target" --target-dir /build \
+        --manifest-path .lampyr-adapter/Cargo.toml \
+    && "/build/$target/release/lampyr-service" --check \
+    && cp "/build/$target/release/lampyr-service" /entrypoint
+
+FROM hluk-rust-rootfs:latest AS rootfs
+COPY --from=build /entrypoint /entrypoint
