@@ -44,8 +44,8 @@ macOS/arm64. The installer checks every archive's checksum and GitHub
 attestation; see [`ly setup`](docs/cli/setup.md) for the verified install.
 
 ```bash
-gh release download v0.1.0 --repo hyperlight-dev/lampyr --pattern install-ly.sh
-bash install-ly.sh v0.1.0
+gh release download v0.1.1 --repo hyperlight-dev/lampyr --pattern install-ly.sh
+bash install-ly.sh v0.1.1
 export PATH="$HOME/.local/bin:$PATH"
 ly doctor
 ```

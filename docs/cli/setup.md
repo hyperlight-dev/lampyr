@@ -5,7 +5,7 @@ description: Install and validate the Lampyr platform packages.
 
 # Setting up Lampyr
 
-Download `install-ly.sh` from a release. These steps install `v0.1.0`.
+Download `install-ly.sh` from a release. These steps install `v0.1.1`.
 
 ```bash
 set -euo pipefail
@@ -13,7 +13,7 @@ set -euo pipefail
 gh auth status --hostname github.com
 
 install -d -m 0700 "$HOME/.cache/lampyr"
-gh release download v0.1.0 \
+gh release download v0.1.1 \
   --repo hyperlight-dev/lampyr \
   --dir "$HOME/.cache/lampyr" \
   --clobber \
@@ -26,19 +26,19 @@ gh release download v0.1.0 \
 )
 
 RELEASE_COMMIT=$(
-  gh api "repos/hyperlight-dev/lampyr/commits/v0.1.0" --jq .sha
+  gh api "repos/hyperlight-dev/lampyr/commits/v0.1.1" --jq .sha
 )
 gh attestation verify "$HOME/.cache/lampyr/install-ly.sh" \
   --repo hyperlight-dev/lampyr \
   --signer-workflow hyperlight-dev/lampyr/.github/workflows/release.yml \
-  --source-ref refs/tags/v0.1.0 \
+  --source-ref refs/tags/v0.1.1 \
   --source-digest "$RELEASE_COMMIT" \
   --deny-self-hosted-runners
 
 chmod 0700 "$HOME/.cache/lampyr/install-ly.sh"
 
 # Install the release whose installer you verified.
-"$HOME/.cache/lampyr/install-ly.sh" v0.1.0
+"$HOME/.cache/lampyr/install-ly.sh" v0.1.1
 
 # Without an argument, the installer takes the rolling preview-release from main.
 # "$HOME/.cache/lampyr/install-ly.sh"
