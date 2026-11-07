@@ -12,7 +12,7 @@ Create a Lampyr Service, run it locally, and deploy it to Kind.
 ## Before you start
 
 The `ly` CLI must be on your `PATH`. Install it from a release as the
-[README](../README.md#install-the-cli) shows, or follow
+[README](https://github.com/hyperlight-dev/lampyr#install-the-cli) shows, or follow
 [Build from source](contributing.md#build-from-source). The
 [local requirements](requirements.md) include Docker with Buildx and read/write
 access to KVM; `ly doctor` checks those and the remaining build requirements.

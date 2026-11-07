@@ -21,7 +21,7 @@ silently delete or replace it.
 ## Install
 
 With `ly` installed from a release (see the
-[README](../README.md#install-the-cli)), the platform already carries the
+[README](https://github.com/hyperlight-dev/lampyr#install-the-cli)), the platform already carries the
 provider, runtime images and fiberd-k8s-controller inputs:
 
 ```bash
