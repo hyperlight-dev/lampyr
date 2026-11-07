@@ -460,7 +460,12 @@ fn buildx_version(docker: &Path) -> std::result::Result<String, String> {
         return Err(HINT.to_owned());
     }
     let version = String::from_utf8_lossy(&output.stdout);
-    Ok(version.lines().next().unwrap_or("available").trim().to_owned())
+    Ok(version
+        .lines()
+        .next()
+        .unwrap_or("available")
+        .trim()
+        .to_owned())
 }
 
 pub fn doctor(root: Option<&Path>) -> Result<()> {

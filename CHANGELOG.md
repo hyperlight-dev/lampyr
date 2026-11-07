@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - `ly doctor` checks for Docker Buildx, which `ly build` and `ly dev` need and Ubuntu's `docker.io` package leaves out, instead of reporting Ready and leaving them to fail with `unknown flag: --builder`.
 - `ly --version` (and `-V`) prints the version and build commit, as `ly doctor` does, instead of failing with `unexpected argument`.
+- A provider whose published snapshot index has no variant for this host, such as an Intel host when the release published only AMD KVM snapshots, warns once that it is cold-booting (and so slower), naming the host's architecture, hypervisor and CPU vendor, instead of cold-booting silently.
 
 ## [0.1.0] - 2026-11-07
 

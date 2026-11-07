@@ -402,9 +402,16 @@ impl Artifact {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => match registry {
                     // No variant can match a host without a detected hypervisor or CPU vendor, so
                     // don't authenticate to the registry or fetch the index just to cold-boot.
-                    Some(_) if host.hypervisor.is_none() || host.cpu_vendor.is_none() => None,
+                    Some(_) if host.hypervisor.is_none() || host.cpu_vendor.is_none() => {
+                        warn_no_snapshot_variant(&manifest.id, host);
+                        None
+                    }
                     Some(registry) => {
                         match registry.pull_selected(&format!("sha256:{}", index.sha256), host) {
+                            Ok(Some(layout)) if layout.digest.is_none() => {
+                                warn_no_snapshot_variant(&manifest.id, host);
+                                None
+                            }
                             Ok(layout) => layout
                                 .and_then(|layout| layout.digest.map(|digest| (layout.path, digest))),
                             Err(error)
@@ -435,7 +442,14 @@ impl Artifact {
                         None
                     }
                 },
-                _ => variants::select_layout(&directory, index, host, &artifact_path)?,
+                _ => {
+                    let selected =
+                        variants::select_layout(&directory, index, host, &artifact_path)?;
+                    if selected.is_none() {
+                        warn_no_snapshot_variant(&manifest.id, host);
+                    }
+                    selected
+                }
             };
             match selected {
                 Some((layout, digest)) => (Some(layout), Some(digest)),
@@ -835,8 +849,52 @@ pub(crate) fn validate_rootfs(path: &Path) -> Result<()> {
     }
 }
 
+/// Says why a provider is about to cold-boot when its published snapshot index has no variant
+/// for this host, for example an Intel host when only AMD KVM snapshots were published; the
+/// provider still works, only slower, so this is a warning rather than an error.
+fn no_snapshot_variant_message(provider: &str, host: &HostCompatibility) -> String {
+    format!(
+        "provider {provider}: no published snapshot matches this host ({}/{}/{}); cold-booting, which is slower",
+        host.architecture,
+        host.hypervisor.as_deref().unwrap_or("no hypervisor"),
+        host.cpu_vendor.as_deref().unwrap_or("unknown CPU vendor"),
+    )
+}
+
+fn warn_no_snapshot_variant(provider: &str, host: &HostCompatibility) {
+    static WARNED: std::sync::Mutex<BTreeSet<String>> = std::sync::Mutex::new(BTreeSet::new());
+    let mut warned = WARNED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if warned.insert(provider.to_owned()) {
+        eprintln!("{}", no_snapshot_variant_message(provider, host));
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn no_snapshot_variant_message_names_the_host() {
+        let host = super::HostCompatibility {
+            architecture: "x86_64".into(),
+            hypervisor: Some("kvm".into()),
+            cpu_vendor: Some("GenuineIntel".into()),
+        };
+        assert_eq!(
+            super::no_snapshot_variant_message("kind", &host),
+            "provider kind: no published snapshot matches this host (x86_64/kvm/GenuineIntel); cold-booting, which is slower"
+        );
+        let unknown = super::HostCompatibility {
+            architecture: "x86_64".into(),
+            hypervisor: None,
+            cpu_vendor: None,
+        };
+        assert!(
+            super::no_snapshot_variant_message("k3d", &unknown)
+                .contains("x86_64/no hypervisor/unknown CPU vendor")
+        );
+    }
+
     use super::*;
     use std::io::Write;
 
