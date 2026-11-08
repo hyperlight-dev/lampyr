@@ -37,10 +37,20 @@ short-lived, hardware-isolated microVMs when work arrives.
 
 ## Getting started
 
+### Prerequisites
+
+Install [Docker with Buildx](https://docs.docker.com/get-started/get-docker/)
+and [kubectl](https://kubernetes.io/docs/tasks/tools/) on your `PATH`.
+For the release installer below, also install the GitHub CLI (`gh`) and
+authenticate with `gh auth login`.
+
+On Linux, also enable [KVM](https://documentation.ubuntu.com/server/how-to/virtualisation/libvirt/)
+(Ubuntu setup guide). Your user must have read/write access to `/dev/kvm`.
+
 ### Install the CLI
 
 Install `ly` and its platform bundle from the latest release on Linux/amd64 or
-macOS/arm64. The installer checks every archive's checksum and GitHub
+macOS/arm64. Use WSL on Windows. The installer checks every archive's checksum and GitHub
 attestation; see [`ly setup`](docs/cli/setup.md) for the verified install.
 
 ```bash
@@ -50,7 +60,8 @@ export PATH="$HOME/.local/bin:$PATH"
 ly doctor
 ```
 
-To build `ly` from a checkout instead, run `just build-ly`.
+To build `ly` from a checkout instead, run `just build-ly` and add it to your
+`PATH` with `export PATH="$PWD/build:$PATH"`.
 
 ### Walkthrough
 
