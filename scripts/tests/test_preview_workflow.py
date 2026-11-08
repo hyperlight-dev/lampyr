@@ -604,6 +604,31 @@ class PreviewWorkflowPolicyTests(unittest.TestCase):
             self.assertIn("FROM --platform=$BUILDPLATFORM golang:", dockerfile)
             self.assertIn('GOOS="$TARGETOS" GOARCH="$TARGETARCH"', dockerfile)
 
+    def test_checkout_cluster_workflow_uses_a_separate_workspace(self):
+        self.assertFalse((ROOT / "lampyr.workspace.yaml").exists())
+        justfile = (ROOT / "Justfile").read_text(encoding="utf-8")
+        self.assertIn('env_var_or_default("LAMPYR_WORKSPACE", repo-root / "build/workspace")', justfile)
+        self.assertIn('build/ly scaffold workspace "{{workspace}}"', justfile)
+        for recipe in ["cluster-install", "cluster-install-k3d", "cluster-install-azure"]:
+            with self.subTest(recipe=recipe):
+                dry_run = subprocess.run(
+                    ["just", "--dry-run", recipe, *(["provider.yaml"] if recipe.endswith("azure") else [])],
+                    cwd=ROOT,
+                    check=True,
+                    text=True,
+                    capture_output=True,
+                )
+                self.assertIn("scaffold workspace", dry_run.stderr)
+                self.assertIn(f'--workspace "{ROOT / "build/workspace"}"', dry_run.stderr)
+        job = self.ci["jobs"]["new-developer-workflow"]
+        self.assertEqual(job["env"]["LAMPYR_WORKSPACE"], "${{ github.workspace }}/build/workspace")
+        apps = named(job, "Run, build and deploy the demo apps")["run"]
+        self.assertIn('cd "$LAMPYR_WORKSPACE"', apps)
+        self.assertIn('"$repo/build/ly" scaffold service "$app"', apps)
+        cleanup = named(job, "Call the deployed apps through Kourier")["run"]
+        self.assertIn('build/ly delete "$LAMPYR_WORKSPACE/services/demo-app"', cleanup)
+        self.assertIn('--workspace "$LAMPYR_WORKSPACE"', cleanup)
+
     def test_new_developer_timeout_leaves_diagnostic_headroom(self):
         job = self.ci["jobs"]["new-developer-workflow"]
         diagnostics = named(job, "Collect diagnostics")["timeout-minutes"]
