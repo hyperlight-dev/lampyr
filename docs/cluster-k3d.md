@@ -30,16 +30,19 @@ from (see [Preview images](contributing.md#preview-images)):
 `just preview-mirror-images` writes their `controllerManifest`, `grantImage`
 and `helperImage` to `build/preview-kind.yaml`, whose keys the k3d provider
 takes too. `just template-tools` builds the fiberd template tools that
-`ly build` and `ly deploy` run. Then, from the checkout, create a separate
-customer Workspace and select it for cluster commands:
+`ly build` and `ly deploy` run. Then, from the checkout, create a Workspace
+and enter it before running cluster commands:
 
 ```bash
+repo_root="$PWD"
 just preview-mirror-images destination=REGISTRY/lampyr
 just build-ly k3d::build cli::runtime-images template-tools
-build/ly scaffold workspace k3d-demo
-build/ly cluster install --provider k3d --name lampyr-k3d \
-  --provider-config build/preview-kind.yaml --allow-docker --workspace k3d-demo
-build/ly cluster health --context k3d-lampyr-k3d --workspace k3d-demo
+export PATH="$repo_root/build:$PATH"
+ly scaffold workspace k3d-demo
+cd k3d-demo
+ly cluster install --provider k3d --name lampyr-k3d \
+  --provider-config "$repo_root/build/preview-kind.yaml" --allow-docker
+ly cluster health --context k3d-lampyr-k3d
 ```
 
 `just use-cluster-inputs` does not work for k3d: it serves built images from
@@ -60,7 +63,7 @@ takes one `--provider-config` file, so start it from a copy of
 `build/preview-kind.yaml` to keep the controller inputs:
 
 ```bash
-cp build/preview-kind.yaml k3d.yaml
+cp "$repo_root/build/preview-kind.yaml" k3d.yaml
 ```
 
 ```yaml
@@ -71,8 +74,8 @@ httpsPort: 18443
 ```
 
 ```bash
-build/ly cluster install --provider k3d --name lampyr-k3d \
-  --provider-config k3d.yaml --allow-docker --workspace k3d-demo
+ly cluster install --provider k3d --name lampyr-k3d \
+  --provider-config k3d.yaml --allow-docker
 ```
 
 Omit `httpPort` and `httpsPort` (or use zero) for dynamically assigned ports.
@@ -90,10 +93,10 @@ There are no k3d-specific forks to keep synchronized.
 Copy the example into the Workspace created above:
 
 ```bash
-cp -R docs/examples/hello-nodejs k3d-demo/services/hello-nodejs
+cp -R "$repo_root/docs/examples/hello-nodejs" services/hello-nodejs
 ```
 
-In `k3d-demo/lampyr.workspace.yaml`, explicitly expose the example:
+In `lampyr.workspace.yaml`, explicitly expose the example:
 
 ```yaml
 apiVersion: lampyr.dev/v1alpha1
@@ -105,9 +108,9 @@ ingress:
 Build and deploy using the default registry port:
 
 ```bash
-build/ly build k3d-demo/services/hello-nodejs
-build/ly deploy --context k3d-lampyr-k3d \
-  --image localhost:5002/hello-nodejs:v1 k3d-demo/services/hello-nodejs
+ly build services/hello-nodejs
+ly deploy --context k3d-lampyr-k3d \
+  --image localhost:5002/hello-nodejs:v1 services/hello-nodejs
 ```
 
 Substitute any example directory and image name from the runtime table. If
@@ -142,14 +145,13 @@ customer source.
 Remove only the platform, retaining K3s and the local registry:
 
 ```bash
-build/ly cluster uninstall --context k3d-lampyr-k3d --workspace k3d-demo
+ly cluster uninstall --context k3d-lampyr-k3d
 ```
 
 Remove the owned cluster, tools container, image volume, registry, and network:
 
 ```bash
-build/ly cluster uninstall --provider k3d --name lampyr-k3d --delete-cluster \
-  --workspace k3d-demo
+ly cluster uninstall --provider k3d --name lampyr-k3d --delete-cluster
 ```
 
 The provider refuses to adopt unrelated clusters or delete replaced

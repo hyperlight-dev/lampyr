@@ -9,18 +9,20 @@ is optional: its guest only provisions infrastructure and returns a standard kub
 `ly` owns Kubernetes, platform installation, Eventing, source lifecycle, and
 health; it contains no Kind, k3d, or Azure provisioning implementation.
 
-From a checkout, create a customer Workspace before installing. The examples
-below use `build/workspace`; use an existing Workspace instead if you have one:
+From a checkout, put `ly` on your `PATH`, then create and enter a Workspace.
+If you already have a Workspace, enter it instead of scaffolding another:
 
 ```bash
-build/ly scaffold workspace build/workspace
+repo_root="$PWD"
+export PATH="$repo_root/build:$PATH"
+ly scaffold workspace cluster-demo
+cd cluster-demo
 ```
 
 ```bash
-build/ly cluster install --provider kind --name lampyr \
-  --allow-docker --workspace build/workspace
-build/ly cluster health --workspace build/workspace
-build/ly cluster uninstall --delete-cluster --workspace build/workspace
+ly cluster install --provider kind --name lampyr --allow-docker
+ly cluster health
+ly cluster uninstall --delete-cluster
 ```
 
 Without `--provider`, commands use the existing kubeconfig/context directly:
@@ -36,9 +38,9 @@ domain: services.example.com
 ```
 
 ```bash
-build/ly cluster install --context customer --workspace build/workspace
-build/ly cluster health --context customer --workspace build/workspace
-build/ly cluster uninstall --context customer --workspace build/workspace
+ly cluster install --context customer
+ly cluster health --context customer
+ly cluster uninstall --context customer
 ```
 
 The defaults are `ghcr.io/hyperlight-dev/lampyr/fiberd:preview` and
@@ -69,9 +71,9 @@ customer-editable; Lampyr Home retains the immutable runtime and provider
 artifacts.
 
 The checkout's `just cluster-install` recipes create `build/workspace` if it
-does not exist. `just cluster-health` and `just cluster-uninstall` select the
-same Workspace. Set `LAMPYR_WORKSPACE` to use another Workspace for these
-recipes. The checkout root does not need a `lampyr.workspace.yaml` file.
+does not exist, then enter it before running `ly`. `just cluster-health` and
+`just cluster-uninstall` run from the same Workspace. The checkout root does
+not need a `lampyr.workspace.yaml` file.
 
 Existing installations remain bound to their original Workspace and are not
 moved automatically. If an installation used the checkout root, manage it
@@ -111,8 +113,7 @@ registryPort: 5002
 ```
 
 ```bash
-build/ly cluster install --provider kind --provider-config kind.yaml \
-  --allow-docker --workspace build/workspace
+ly cluster install --provider kind --provider-config kind.yaml --allow-docker
 ```
 
 The provider scaffolds complete infrastructure into `infra/<provider>/<name>`
@@ -123,7 +124,7 @@ k3d accepts the same port and prebuilt-image settings, with a k3d v1alpha5
 `source` rather than Kind YAML:
 
 ```bash
-build/ly cluster install --provider k3d --allow-docker --workspace build/workspace
+ly cluster install --provider k3d --allow-docker
 ```
 
 It owns a dedicated registry rather than reusing a shared one. Select an
@@ -158,9 +159,9 @@ zygoteRegistries:
 ```
 
 ```bash
-build/ly cluster install --provider azure --eventing \
+ly cluster install --provider azure --eventing \
   --provider-config azure.yaml \
-  --approve-provider-manifests --workspace build/workspace
+  --approve-provider-manifests
 ```
 
 The Azure guest signs in using its dedicated per-installation cache. Host

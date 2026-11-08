@@ -1234,8 +1234,6 @@ jobs:
   new-developer-workflow:
     needs: [cluster-inputs]
     runs-on: ubuntu-latest
-    env:
-      LAMPYR_WORKSPACE: ${{ github.workspace }}/build/workspace
     # Above the steps' own limits: a step that times out fails, and failed
     # steps get diagnostics; a job that times out is cancelled instead.
     timeout-minutes: 50
@@ -1308,7 +1306,6 @@ jobs:
           # runner paths explicitly.
           exec sudo --user="$(id --user --name)" /usr/bin/env \
             "PATH=$PATH" \
-            "LAMPYR_WORKSPACE=$LAMPYR_WORKSPACE" \
             "GITHUB_ENV=$GITHUB_ENV" \
             "GITHUB_OUTPUT=$GITHUB_OUTPUT" \
             "GITHUB_PATH=$GITHUB_PATH" \
@@ -1416,7 +1413,7 @@ jobs:
         timeout-minutes: 25
         run: |
           repo="$PWD"
-          cd "$LAMPYR_WORKSPACE"
+          cd build/workspace
           answers() {
             curl --fail --silent --show-error --max-time 10 \
               -H "Host: $app.default.localhost" http://127.0.0.1:8080/test \
@@ -1462,6 +1459,8 @@ jobs:
       - name: Call the deployed apps through Kourier
         timeout-minutes: 10
         run: |
+          repo="$PWD"
+          cd build/workspace
           kubectl port-forward -n kourier-system svc/kourier 8080:80 &
           forward=$!
           trap 'kill "$forward" 2> /dev/null || true' EXIT
@@ -1471,10 +1470,10 @@ jobs:
               | tee /dev/stderr | grep "hello from $app" > /dev/null
           done
           # Free the smoke-test homes before the walkthrough deploys its own app.
-          build/ly delete "$LAMPYR_WORKSPACE/services/demo-app"
-          build/ly delete "$LAMPYR_WORKSPACE/services/second-app"
+          "$repo/build/ly" delete services/demo-app
+          "$repo/build/ly" delete services/second-app
           # The walkthrough owns a separate disposable installation and registry.
-          build/ly cluster uninstall --provider kind --delete-cluster --workspace "$LAMPYR_WORKSPACE"
+          "$repo/build/ly" cluster uninstall --provider kind --delete-cluster
 
       - name: Check that /dev/kvm is unchanged
         if: always()

@@ -607,50 +607,36 @@ class PreviewWorkflowPolicyTests(unittest.TestCase):
     def test_checkout_cluster_workflow_uses_a_separate_workspace(self):
         self.assertFalse((ROOT / "lampyr.workspace.yaml").exists())
         justfile = (ROOT / "Justfile").read_text(encoding="utf-8")
-        self.assertIn('env_var_or_default("LAMPYR_WORKSPACE", repo-root / "build/workspace")', justfile)
-        self.assertIn('build/ly scaffold workspace "{{workspace}}"', justfile)
-        for recipe in ["cluster-install", "cluster-install-k3d", "cluster-install-azure"]:
+        self.assertIn("build/ly scaffold workspace build/workspace", justfile)
+        for recipe, arguments in [
+            ("cluster-install", []),
+            ("cluster-install-k3d", []),
+            ("cluster-install-azure", ["provider.yaml"]),
+            ("cluster-health", []),
+            ("cluster-uninstall", []),
+            ("cluster-health-azure", []),
+            ("cluster-uninstall-azure", []),
+        ]:
             with self.subTest(recipe=recipe):
                 dry_run = subprocess.run(
-                    ["just", "--dry-run", recipe, *(["provider.yaml"] if recipe.endswith("azure") else [])],
+                    ["just", "--dry-run", recipe, *arguments],
                     cwd=ROOT,
-                    env=dict(os.environ, LAMPYR_WORKSPACE=str(ROOT / "build/workspace")),
                     check=True,
                     text=True,
                     capture_output=True,
                 )
-                self.assertIn("scaffold workspace", dry_run.stderr)
-                self.assertIn(f'--workspace "{ROOT / "build/workspace"}"', dry_run.stderr)
-        with tempfile.TemporaryDirectory() as directory:
-            workspace = str(Path(directory) / "customer workspace")
-            for recipe, arguments in [
-                ("cluster-install", []),
-                ("cluster-install-k3d", []),
-                ("cluster-install-azure", ["provider.yaml"]),
-                ("cluster-health", []),
-                ("cluster-uninstall", []),
-                ("cluster-health-azure", []),
-                ("cluster-uninstall-azure", []),
-            ]:
-                with self.subTest(recipe=recipe, workspace=workspace):
-                    dry_run = subprocess.run(
-                        ["just", "--dry-run", recipe, *arguments],
-                        cwd=ROOT,
-                        env=dict(os.environ, LAMPYR_WORKSPACE=workspace),
-                        check=True,
-                        text=True,
-                        capture_output=True,
-                    )
-                    self.assertIn(f'--workspace "{workspace}"', dry_run.stderr)
+                self.assertIn("cd build/workspace", dry_run.stderr)
+                self.assertNotIn("--workspace", dry_run.stderr)
+                if recipe.startswith("cluster-install"):
+                    self.assertIn("scaffold workspace", dry_run.stderr)
         job = self.ci["jobs"]["new-developer-workflow"]
-        self.assertEqual(job["env"]["LAMPYR_WORKSPACE"], "${{ github.workspace }}/build/workspace")
-        self.assertIn('"LAMPYR_WORKSPACE=$LAMPYR_WORKSPACE"', named(job, "Join the kvm group")["run"])
         apps = named(job, "Run, build and deploy the demo apps")["run"]
-        self.assertIn('cd "$LAMPYR_WORKSPACE"', apps)
+        self.assertIn("cd build/workspace", apps)
         self.assertIn('"$repo/build/ly" scaffold service "$app"', apps)
         cleanup = named(job, "Call the deployed apps through Kourier")["run"]
-        self.assertIn('build/ly delete "$LAMPYR_WORKSPACE/services/demo-app"', cleanup)
-        self.assertIn('--workspace "$LAMPYR_WORKSPACE"', cleanup)
+        self.assertIn("cd build/workspace", cleanup)
+        self.assertIn('"$repo/build/ly" delete services/demo-app', cleanup)
+        self.assertNotIn("--workspace", cleanup)
 
     def test_new_developer_timeout_leaves_diagnostic_headroom(self):
         job = self.ci["jobs"]["new-developer-workflow"]
