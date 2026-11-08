@@ -30,14 +30,16 @@ from (see [Preview images](contributing.md#preview-images)):
 `just preview-mirror-images` writes their `controllerManifest`, `grantImage`
 and `helperImage` to `build/preview-kind.yaml`, whose keys the k3d provider
 takes too. `just template-tools` builds the fiberd template tools that
-`ly build` and `ly deploy` run. Then, from the repository Workspace:
+`ly build` and `ly deploy` run. Then, from the checkout, create a separate
+customer Workspace and select it for cluster commands:
 
 ```bash
 just preview-mirror-images destination=REGISTRY/lampyr
 just build-ly k3d::build cli::runtime-images template-tools
+build/ly scaffold workspace k3d-demo
 build/ly cluster install --provider k3d --name lampyr-k3d \
-  --provider-config build/preview-kind.yaml --allow-docker
-build/ly cluster health --context k3d-lampyr-k3d
+  --provider-config build/preview-kind.yaml --allow-docker --workspace k3d-demo
+build/ly cluster health --context k3d-lampyr-k3d --workspace k3d-demo
 ```
 
 `just use-cluster-inputs` does not work for k3d: it serves built images from
@@ -70,7 +72,7 @@ httpsPort: 18443
 
 ```bash
 build/ly cluster install --provider k3d --name lampyr-k3d \
-  --provider-config k3d.yaml --allow-docker
+  --provider-config k3d.yaml --allow-docker --workspace k3d-demo
 ```
 
 Omit `httpPort` and `httpsPort` (or use zero) for dynamically assigned ports.
@@ -85,10 +87,9 @@ All six [runtime examples](examples.md) are provider-neutral: Node.js, Python,
 Go, Rust, and .NET use the same source and manifests on Kind and k3d.
 There are no k3d-specific forks to keep synchronized.
 
-Create a workspace and copy the example into its services directory:
+Copy the example into the Workspace created above:
 
 ```bash
-build/ly scaffold workspace k3d-demo
 cp -R docs/examples/hello-nodejs k3d-demo/services/hello-nodejs
 ```
 
@@ -141,13 +142,14 @@ customer source.
 Remove only the platform, retaining K3s and the local registry:
 
 ```bash
-build/ly cluster uninstall --context k3d-lampyr-k3d
+build/ly cluster uninstall --context k3d-lampyr-k3d --workspace k3d-demo
 ```
 
 Remove the owned cluster, tools container, image volume, registry, and network:
 
 ```bash
-build/ly cluster uninstall --provider k3d --name lampyr-k3d --delete-cluster
+build/ly cluster uninstall --provider k3d --name lampyr-k3d --delete-cluster \
+  --workspace k3d-demo
 ```
 
 The provider refuses to adopt unrelated clusters or delete replaced

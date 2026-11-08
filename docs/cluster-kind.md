@@ -25,7 +25,8 @@ With `ly` installed from a release (see the
 provider, runtime images and fiberd-k8s-controller inputs:
 
 ```bash
-ly cluster install --provider kind --allow-docker
+ly scaffold workspace kind-demo
+ly cluster install --provider kind --allow-docker --workspace kind-demo
 ```
 
 From a repository checkout:
@@ -36,9 +37,13 @@ just kind::build
 just cli::runtime-images
 just upstream::cluster-inputs build/cluster-inputs
 LAMPYR_CLUSTER_INPUTS=$PWD/build/cluster-inputs just use-cluster-inputs 5002
+build/ly scaffold workspace kind-demo
 build/ly cluster install --provider kind \
-  --allow-docker
+  --allow-docker --workspace kind-demo
 ```
+
+The release and checkout commands above are alternatives. Both create a
+customer Workspace before installation; the source checkout is not a Workspace.
 
 A release's platform installs fiberd-k8s-controller and the images its grant
 Pods run by default, but a checkout has none to install.
@@ -85,11 +90,10 @@ Deployment creates one grant Pod per CapacityGrant, running stock fiberd with
 Lampyr's helper. fiberd-k8s-controller issues each Pod's grant and renews it
 automatically.
 
-Create a workspace, then build and deploy its default app to the local registry.
-The scaffold exposes `app` through `ingress.services`:
+Build and deploy the default app in the Workspace created above to the local
+registry. The scaffold exposes `app` through `ingress.services`:
 
 ```bash
-build/ly scaffold workspace kind-demo
 build/ly build kind-demo/services/app
 build/ly deploy --image localhost:5002/app:v1 kind-demo/services/app
 ```
@@ -114,7 +118,7 @@ Broker, install explicitly with:
 
 ```bash
 build/ly cluster install --provider kind --eventing \
-  --allow-docker
+  --allow-docker --workspace kind-demo
 ```
 
 This installs the pinned Eventing 1.23.0 manifests. The InMemoryChannel-backed
@@ -124,13 +128,13 @@ available only on Azure-provider installations.
 ## Check health
 
 ```bash
-build/ly cluster health
+build/ly cluster health --workspace kind-demo
 ```
 
 ## Remove Lampyr
 
 ```bash
-build/ly cluster uninstall
+build/ly cluster uninstall --workspace kind-demo
 ```
 
 Add `--delete-cluster` to remove the Kind cluster as well. See

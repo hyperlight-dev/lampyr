@@ -614,14 +614,37 @@ class PreviewWorkflowPolicyTests(unittest.TestCase):
                 dry_run = subprocess.run(
                     ["just", "--dry-run", recipe, *(["provider.yaml"] if recipe.endswith("azure") else [])],
                     cwd=ROOT,
+                    env=dict(os.environ, LAMPYR_WORKSPACE=str(ROOT / "build/workspace")),
                     check=True,
                     text=True,
                     capture_output=True,
                 )
                 self.assertIn("scaffold workspace", dry_run.stderr)
                 self.assertIn(f'--workspace "{ROOT / "build/workspace"}"', dry_run.stderr)
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = str(Path(directory) / "customer workspace")
+            for recipe, arguments in [
+                ("cluster-install", []),
+                ("cluster-install-k3d", []),
+                ("cluster-install-azure", ["provider.yaml"]),
+                ("cluster-health", []),
+                ("cluster-uninstall", []),
+                ("cluster-health-azure", []),
+                ("cluster-uninstall-azure", []),
+            ]:
+                with self.subTest(recipe=recipe, workspace=workspace):
+                    dry_run = subprocess.run(
+                        ["just", "--dry-run", recipe, *arguments],
+                        cwd=ROOT,
+                        env=dict(os.environ, LAMPYR_WORKSPACE=workspace),
+                        check=True,
+                        text=True,
+                        capture_output=True,
+                    )
+                    self.assertIn(f'--workspace "{workspace}"', dry_run.stderr)
         job = self.ci["jobs"]["new-developer-workflow"]
         self.assertEqual(job["env"]["LAMPYR_WORKSPACE"], "${{ github.workspace }}/build/workspace")
+        self.assertIn('"LAMPYR_WORKSPACE=$LAMPYR_WORKSPACE"', named(job, "Join the kvm group")["run"])
         apps = named(job, "Run, build and deploy the demo apps")["run"]
         self.assertIn('cd "$LAMPYR_WORKSPACE"', apps)
         self.assertIn('"$repo/build/ly" scaffold service "$app"', apps)
@@ -1061,7 +1084,7 @@ class PreviewWorkflowPolicyTests(unittest.TestCase):
         self.assertIn("registry_port=5500", walkthrough)
         self.assertIn("ly build services/app", walkthrough)
         self.assertIn(
-            'build/ly build "$service"',
+            '"$repo/build/ly" build "$service"',
             named(jobs["new-developer-workflow"], "Run, build and deploy the demo apps")["run"],
         )
 
