@@ -640,9 +640,14 @@ class PreviewWorkflowPolicyTests(unittest.TestCase):
 
     def test_kind_lifecycle_enters_its_scaffolded_workspace(self):
         script = KIND_INTEGRATION.read_text(encoding="utf-8")
-        self.assertIn(
-            '"$repo_root/build/ly" scaffold workspace "$project" >/dev/null\ncd "$project"',
-            script,
+        self.assertIn('\ncd "$project"\n', script)
+        self.assertLess(
+            script.index('prepare_fiberd_template_tools "$repo_root"'),
+            script.index('\ncd "$project"\n'),
+        )
+        self.assertLess(
+            script.index('\ncd "$project"\n'),
+            script.index('PATH="$project/docker-only-bin" "$repo_root/build/ly" cluster install'),
         )
 
     def test_new_developer_timeout_leaves_diagnostic_headroom(self):
