@@ -638,6 +638,13 @@ class PreviewWorkflowPolicyTests(unittest.TestCase):
         self.assertIn('"$repo/build/ly" delete services/demo-app', cleanup)
         self.assertNotIn("--workspace", cleanup)
 
+    def test_kind_lifecycle_enters_its_scaffolded_workspace(self):
+        script = KIND_INTEGRATION.read_text(encoding="utf-8")
+        self.assertIn(
+            '"$repo_root/build/ly" scaffold workspace "$project" >/dev/null\ncd "$project"',
+            script,
+        )
+
     def test_new_developer_timeout_leaves_diagnostic_headroom(self):
         job = self.ci["jobs"]["new-developer-workflow"]
         diagnostics = named(job, "Collect diagnostics")["timeout-minutes"]
