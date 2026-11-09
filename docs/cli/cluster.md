@@ -70,11 +70,6 @@ All cluster lifecycle commands read bootstrap manifests from the Workspace's
 customer-editable; Lampyr Home retains the immutable runtime and provider
 artifacts.
 
-The checkout's `just cluster-install` recipes create `build/workspace` if it
-does not exist, then enter it before running `ly`. `just cluster-health` and
-`just cluster-uninstall` run from the same Workspace. The checkout root does
-not need a `lampyr.workspace.yaml` file.
-
 Existing installations remain bound to their original Workspace and are not
 moved automatically. If an installation used the checkout root, manage it
 from the previous checkout revision that still has its manifest. Use a new
