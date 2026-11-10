@@ -1412,20 +1412,22 @@ jobs:
       - name: Run, build and deploy the demo apps
         timeout-minutes: 25
         run: |
+          repo="$PWD"
+          cd build/workspace
           answers() {
             curl --fail --silent --show-error --max-time 10 \
               -H "Host: $app.default.localhost" http://127.0.0.1:8080/test \
               | tee /dev/stderr | grep "hello from $app" > /dev/null
           }
           for app in demo-app second-app; do
-            build/ly scaffold service "$app"
+            "$repo/build/ly" scaffold service "$app"
             service="services/$app"
-            source scripts/runtime-examples.sh
+            source "$repo/scripts/runtime-examples.sh"
             expose_workspace_services "$PWD"
             # Each app says its own name, so a response shows which one answered.
             sed --in-place "s/hello from Hyperlight edge/hello from $app/" "$service/handler.js"
             grep --quiet "hello from $app" "$service/handler.js"
-            build/ly dev --port 8080 "$service" > "$RUNNER_TEMP/$app-dev.log" 2>&1 &
+            "$repo/build/ly" dev --port 8080 "$service" > "$RUNNER_TEMP/$app-dev.log" 2>&1 &
             dev=$!
             ok=
             for _ in $(seq 120); do
@@ -1435,8 +1437,8 @@ jobs:
             done
             if [ -z "$ok" ]; then cat "$RUNNER_TEMP/$app-dev.log"; exit 1; fi
 
-            build/ly build "$service"
-            build/ly deploy --image "localhost:5002/$app:v1" "$service"
+            "$repo/build/ly" build "$service"
+            "$repo/build/ly" deploy --image "localhost:5002/$app:v1" "$service"
             # ly build rewrote the rootfs that ly dev is running from.
             kill -0 "$dev" || { cat "$RUNNER_TEMP/$app-dev.log"; exit 1; }
             answers || { cat "$RUNNER_TEMP/$app-dev.log"; exit 1; }
@@ -1457,6 +1459,8 @@ jobs:
       - name: Call the deployed apps through Kourier
         timeout-minutes: 10
         run: |
+          repo="$PWD"
+          cd build/workspace
           kubectl port-forward -n kourier-system svc/kourier 8080:80 &
           forward=$!
           trap 'kill "$forward" 2> /dev/null || true' EXIT
@@ -1466,10 +1470,10 @@ jobs:
               | tee /dev/stderr | grep "hello from $app" > /dev/null
           done
           # Free the smoke-test homes before the walkthrough deploys its own app.
-          build/ly delete services/demo-app
-          build/ly delete services/second-app
+          "$repo/build/ly" delete services/demo-app
+          "$repo/build/ly" delete services/second-app
           # The walkthrough owns a separate disposable installation and registry.
-          build/ly cluster uninstall --provider kind --delete-cluster
+          "$repo/build/ly" cluster uninstall --provider kind --delete-cluster
 
       - name: Check that /dev/kvm is unchanged
         if: always()

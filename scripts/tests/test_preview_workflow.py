@@ -604,6 +604,52 @@ class PreviewWorkflowPolicyTests(unittest.TestCase):
             self.assertIn("FROM --platform=$BUILDPLATFORM golang:", dockerfile)
             self.assertIn('GOOS="$TARGETOS" GOARCH="$TARGETARCH"', dockerfile)
 
+    def test_checkout_cluster_workflow_uses_a_separate_workspace(self):
+        self.assertFalse((ROOT / "lampyr.workspace.yaml").exists())
+        justfile = (ROOT / "Justfile").read_text(encoding="utf-8")
+        self.assertIn("build/ly scaffold workspace build/workspace", justfile)
+        for recipe, arguments in [
+            ("cluster-install", []),
+            ("cluster-install-k3d", []),
+            ("cluster-install-azure", ["provider.yaml"]),
+            ("cluster-health", []),
+            ("cluster-uninstall", []),
+            ("cluster-health-azure", []),
+            ("cluster-uninstall-azure", []),
+        ]:
+            with self.subTest(recipe=recipe):
+                dry_run = subprocess.run(
+                    ["just", "--dry-run", recipe, *arguments],
+                    cwd=ROOT,
+                    check=True,
+                    text=True,
+                    capture_output=True,
+                )
+                self.assertIn("cd build/workspace", dry_run.stderr)
+                self.assertNotIn("--workspace", dry_run.stderr)
+                if recipe.startswith("cluster-install"):
+                    self.assertIn("scaffold workspace", dry_run.stderr)
+        job = self.ci["jobs"]["new-developer-workflow"]
+        apps = named(job, "Run, build and deploy the demo apps")["run"]
+        self.assertIn("cd build/workspace", apps)
+        self.assertIn('"$repo/build/ly" scaffold service "$app"', apps)
+        cleanup = named(job, "Call the deployed apps through Kourier")["run"]
+        self.assertIn("cd build/workspace", cleanup)
+        self.assertIn('"$repo/build/ly" delete services/demo-app', cleanup)
+        self.assertNotIn("--workspace", cleanup)
+
+    def test_kind_lifecycle_enters_its_scaffolded_workspace(self):
+        script = KIND_INTEGRATION.read_text(encoding="utf-8")
+        self.assertIn('\ncd "$project"\n', script)
+        self.assertLess(
+            script.index('prepare_fiberd_template_tools "$repo_root"'),
+            script.index('\ncd "$project"\n'),
+        )
+        self.assertLess(
+            script.index('\ncd "$project"\n'),
+            script.index('PATH="$project/docker-only-bin" "$repo_root/build/ly" cluster install'),
+        )
+
     def test_new_developer_timeout_leaves_diagnostic_headroom(self):
         job = self.ci["jobs"]["new-developer-workflow"]
         diagnostics = named(job, "Collect diagnostics")["timeout-minutes"]
@@ -1036,7 +1082,7 @@ class PreviewWorkflowPolicyTests(unittest.TestCase):
         self.assertIn("registry_port=5500", walkthrough)
         self.assertIn("ly build services/app", walkthrough)
         self.assertIn(
-            'build/ly build "$service"',
+            '"$repo/build/ly" build "$service"',
             named(jobs["new-developer-workflow"], "Run, build and deploy the demo apps")["run"],
         )
 

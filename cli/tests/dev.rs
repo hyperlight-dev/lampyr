@@ -6,7 +6,7 @@ use std::process::Command;
 use lampyr_cli::project::Project;
 
 fn fixture() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../samples/local-worker-workspace")
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../demos/local-worker-workspace")
 }
 
 #[test]

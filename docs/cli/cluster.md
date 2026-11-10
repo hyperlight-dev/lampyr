@@ -9,11 +9,20 @@ is optional: its guest only provisions infrastructure and returns a standard kub
 `ly` owns Kubernetes, platform installation, Eventing, source lifecycle, and
 health; it contains no Kind, k3d, or Azure provisioning implementation.
 
+From a checkout, put `ly` on your `PATH`, then create and enter a Workspace.
+If you already have a Workspace, enter it instead of scaffolding another:
+
 ```bash
-build/ly cluster install --provider kind --name lampyr \
-  --allow-docker
-build/ly cluster health
-build/ly cluster uninstall --delete-cluster
+repo_root="$PWD"
+export PATH="$repo_root/build:$PATH"
+ly scaffold workspace cluster-demo
+cd cluster-demo
+```
+
+```bash
+ly cluster install --provider kind --name lampyr --allow-docker
+ly cluster health
+ly cluster uninstall --delete-cluster
 ```
 
 Without `--provider`, commands use the existing kubeconfig/context directly:
@@ -29,9 +38,9 @@ domain: services.example.com
 ```
 
 ```bash
-build/ly cluster install --context customer
-build/ly cluster health --context customer
-build/ly cluster uninstall --context customer
+ly cluster install --context customer
+ly cluster health --context customer
+ly cluster uninstall --context customer
 ```
 
 The defaults are `ghcr.io/hyperlight-dev/lampyr/fiberd:preview` and
@@ -60,6 +69,13 @@ All cluster lifecycle commands read bootstrap manifests from the Workspace's
 `k8s/` directory. These files are copied during `ly scaffold workspace` and are
 customer-editable; Lampyr Home retains the immutable runtime and provider
 artifacts.
+
+Existing installations remain bound to their original Workspace and are not
+moved automatically. If an installation used the checkout root, manage it
+from the previous checkout revision that still has its manifest. Use a new
+installation name for a separate Workspace; `--workspace` does not reassign
+an existing installation. Keep the old installation state until its resources
+have been accounted for and cleaned up.
 
 | Option | Purpose |
 |---|---|
@@ -92,8 +108,7 @@ registryPort: 5002
 ```
 
 ```bash
-build/ly cluster install --provider kind --provider-config kind.yaml \
-  --allow-docker
+ly cluster install --provider kind --provider-config kind.yaml --allow-docker
 ```
 
 The provider scaffolds complete infrastructure into `infra/<provider>/<name>`
@@ -104,7 +119,7 @@ k3d accepts the same port and prebuilt-image settings, with a k3d v1alpha5
 `source` rather than Kind YAML:
 
 ```bash
-build/ly cluster install --provider k3d --allow-docker
+ly cluster install --provider k3d --allow-docker
 ```
 
 It owns a dedicated registry rather than reusing a shared one. Select an
@@ -139,7 +154,7 @@ zygoteRegistries:
 ```
 
 ```bash
-build/ly cluster install --provider azure --eventing \
+ly cluster install --provider azure --eventing \
   --provider-config azure.yaml \
   --approve-provider-manifests
 ```

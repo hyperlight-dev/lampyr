@@ -24,20 +24,25 @@ With `ly` installed from a release (see the
 [README](https://github.com/hyperlight-dev/lampyr#install-the-cli)), the platform already carries the
 provider, runtime images and fiberd-k8s-controller inputs:
 
-```bash
-ly cluster install --provider kind --allow-docker
-```
-
-From a repository checkout:
+From a repository checkout, prepare the CLI and runtime inputs instead:
 
 ```bash
+repo_root="$PWD"
 just build-ly
 just kind::build
 just cli::runtime-images
 just upstream::cluster-inputs build/cluster-inputs
 LAMPYR_CLUSTER_INPUTS=$PWD/build/cluster-inputs just use-cluster-inputs 5002
-build/ly cluster install --provider kind \
-  --allow-docker
+export PATH="$repo_root/build:$PATH"
+```
+
+With either installation, create a Workspace and run the remaining commands
+from inside it:
+
+```bash
+ly scaffold workspace kind-demo
+cd kind-demo
+ly cluster install --provider kind --allow-docker
 ```
 
 A release's platform installs fiberd-k8s-controller and the images its grant
@@ -85,13 +90,12 @@ Deployment creates one grant Pod per CapacityGrant, running stock fiberd with
 Lampyr's helper. fiberd-k8s-controller issues each Pod's grant and renews it
 automatically.
 
-Create a workspace, then build and deploy its default app to the local registry.
-The scaffold exposes `app` through `ingress.services`:
+Build and deploy the default app in the Workspace created above to the local
+registry. The scaffold exposes `app` through `ingress.services`:
 
 ```bash
-build/ly scaffold workspace kind-demo
-build/ly build kind-demo/services/app
-build/ly deploy --image localhost:5002/app:v1 kind-demo/services/app
+ly build services/app
+ly deploy --image localhost:5002/app:v1 services/app
 ```
 
 `ly deploy` tags and pushes the locally built image automatically. Do not pass
@@ -113,8 +117,7 @@ To add Knative Eventing and an InMemoryChannel-backed
 Broker, install explicitly with:
 
 ```bash
-build/ly cluster install --provider kind --eventing \
-  --allow-docker
+ly cluster install --provider kind --eventing --allow-docker
 ```
 
 This installs the pinned Eventing 1.23.0 manifests. The InMemoryChannel-backed
@@ -124,13 +127,13 @@ available only on Azure-provider installations.
 ## Check health
 
 ```bash
-build/ly cluster health
+ly cluster health
 ```
 
 ## Remove Lampyr
 
 ```bash
-build/ly cluster uninstall
+ly cluster uninstall
 ```
 
 Add `--delete-cluster` to remove the Kind cluster as well. See

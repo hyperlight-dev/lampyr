@@ -198,13 +198,16 @@ install-mm:
     mkdir -p "{{repo-root}}/build/tools"; \
     tar --extract --gzip --file "$dir/mm.tar.gz" --directory "{{repo-root}}/build/tools" mm
 
+prepare-workspace: build-ly
+    if [[ ! -f build/workspace/lampyr.workspace.yaml ]]; then build/ly scaffold workspace build/workspace; fi
+
 # Install the complete preview platform into a Kind cluster.
-cluster-install: build-ly
-    build/ly cluster install --provider kind --allow-docker
+cluster-install: prepare-workspace
+    cd build/workspace && ../ly cluster install --provider kind --allow-docker
 
 # Install Lampyr using the independently packaged k3d provider.
-cluster-install-k3d: build-ly
-    build/ly cluster install --provider k3d --allow-docker
+cluster-install-k3d: prepare-workspace
+    cd build/workspace && ../ly cluster install --provider k3d --allow-docker
 
 # Test the provider lifecycle and every committed runtime example on k3d.
 test-k3d-integration: build-ly k3d::build cli::runtime-images
@@ -212,26 +215,28 @@ test-k3d-integration: build-ly k3d::build cli::runtime-images
 
 # Report the health of every required preview platform component.
 cluster-health: build-ly
-    build/ly cluster health
+    cd build/workspace && ../ly cluster health
 
 # Remove preview platform resources.
 cluster-uninstall: build-ly
-    build/ly cluster uninstall
+    cd build/workspace && ../ly cluster uninstall
 
 # Create or configure an AKS cluster with the latest regional Kubernetes version.
-cluster-install-azure config name="lampyr": build-ly
-    build/ly cluster install --provider azure --name "{{name}}" --provider-config "{{config}}" --approve-provider-manifests
+cluster-install-azure config name="lampyr": prepare-workspace
+    config="{{config}}"; \
+    if [[ "$config" != /* ]]; then config="$PWD/$config"; fi; \
+    cd build/workspace && ../ly cluster install --provider azure --name "{{name}}" --provider-config "$config" --approve-provider-manifests
 
 # Report AKS and Lampyr platform health.
 cluster-health-azure name="lampyr": build-ly
-    build/ly cluster health --context "aks-{{name}}"
+    cd build/workspace && ../ly cluster health --context "aks-{{name}}"
 
 
 # Remove Lampyr from AKS while retaining the cluster by default.
 cluster-uninstall-azure name="lampyr" delete-cluster="false": build-ly
     args=(--provider azure --name "{{name}}" --context "aks-{{name}}" --approve-provider-manifests); \
     if [[ "{{delete-cluster}}" == "true" ]]; then args+=(--delete-cluster); fi; \
-    build/ly cluster uninstall "${args[@]}"
+    cd build/workspace && ../ly cluster uninstall "${args[@]}"
 
 # Build every locally produced binary.
 build: setup-hluk build-fiberd build-control-plane build-ly build-eventgrid

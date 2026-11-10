@@ -92,6 +92,7 @@ fi
 if [[ "$suite" == "full" || "$suite" == "runtime" || "$runtime_extras" == 1 ]]; then
   prepare_fiberd_template_tools "$repo_root"
 fi
+cd "$project"
 
 cleanup() {
   status=$?

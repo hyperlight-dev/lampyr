@@ -166,13 +166,13 @@ never be copied to a different architecture or hypervisor for deployment.
 
 ### Executable multi-service example
 
-`samples/local-worker-workspace/` contains dependency-free Node.js
+`demos/local-worker-workspace/` contains dependency-free Node.js
 Standalone Applications. Its API has several
 HTTP handlers, calls a fresh processor, emits a CloudEvent to that processor,
 and calls a service explicitly configured for reuse:
 
 ```bash
-ly dev samples/local-worker-workspace
+ly dev demos/local-worker-workspace
 curl http://worker-api.default.localhost:8080/invoke
 curl http://worker-api.default.localhost:8080/emit
 curl http://worker-api.default.localhost:8080/reuse
@@ -269,7 +269,7 @@ No Hyperlight source checkout, Cargo overrides or runtime descriptor is needed:
 
 ```bash
 just build-ly
-build/ly dev samples/local-worker-workspace --port 8080
+build/ly dev demos/local-worker-workspace --port 8080
 ```
 
 Lampyr downloads and verifies the released v0.21.0 executable and matching
