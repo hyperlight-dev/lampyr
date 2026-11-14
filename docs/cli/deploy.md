@@ -73,10 +73,18 @@ rebuild and redeploy each service.
 ## External exposure
 
 Deployment reads `ingress.services` from the enclosing `lampyr.workspace.yaml`.
-Listed services use Knative's generated external hostname and the installed
-cluster domain. Other services get Knative's `cluster-local` visibility and an
+Listed services use Knative's external address. Other services get Knative's
+`cluster-local` visibility and an
 internal address such as `http://worker-processor.default.svc.cluster.local`.
 Deployment outside a workspace also defaults to cluster-local.
+
+`ly deploy` and `ly status` report the observed Service address. They keep custom
+public hosts and use HTTPS with the installation's port mapping. Cluster-local
+addresses stay internal HTTP addresses, without a public port mapping.
+
+The reported URL identifies a Knative route. It does not prove that your
+workstation can reach it. Public routes need DNS, TLS, and network access.
+For an internal route, use a client in the cluster or a port-forward endpoint.
 
 Bindings can call both public and internal services through cluster DNS.
 Exposure does not change binding URLs or snapshot identity. After editing the

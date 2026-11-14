@@ -21,6 +21,10 @@ build/ly status services/hello-edge
 The output also identifies the application model configured in the local
 manifest: `handler` or `standalone`.
 
+Status requires the Service controller to have observed the current Service
+generation. Its URL follows the same [address policy as deploy](deploy.md#external-exposure).
+An internal route URL does not imply access from your workstation.
+
 For each Revision that takes traffic, a `capacity` line reports its
 CapacityGrant as fiberd-k8s-controller does, with the grant's Fiber limit:
 

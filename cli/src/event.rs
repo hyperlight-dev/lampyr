@@ -66,7 +66,12 @@ pub fn publish(options: Options<'_>, host: &Host) -> Result<Delivered> {
             !crate::kube::cluster_local(&service),
             "service is cluster-local; pass --url with a reachable endpoint, such as a port-forward URL"
         );
-        let url = crate::lifecycle::service_status_url(&service, &kube.installation()?)?;
+        let url = crate::lifecycle::service_status_url(
+            &service,
+            &project.name,
+            "default",
+            &kube.installation()?,
+        )?;
         ensure!(
             !url.is_empty(),
             "cluster has no public service domain; pass --url or configure the provider's domain"
