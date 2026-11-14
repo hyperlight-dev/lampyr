@@ -363,7 +363,7 @@ func TestReusePreservesLiveStateAndReleasesOnIdle(t *testing.T) {
 	if client.next != 1 || len(client.released) != 0 {
 		t.Fatalf("reused fiber was not retained: created=%d released=%d", client.next, len(client.released))
 	}
-	pool := router.pools["default--demo-1234"]
+	pool := router.pools["default/demo-1234"]
 	router.endPool(pool, false, time.Now().Add(time.Minute))
 	router.releases.Wait()
 	if len(client.released) != 1 || len(pool.slots) != 0 {
@@ -386,7 +386,7 @@ func TestBusyReusableFiberIsNotReleasedByIdleSweep(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	pool := router.pools["default--demo-1234"]
+	pool := router.pools["default/demo-1234"]
 	router.endPool(pool, false, time.Now().Add(time.Hour))
 	router.releases.Wait()
 	if len(client.released) != 0 {
@@ -479,7 +479,7 @@ func TestRevisionReloadUpdatesReuseIdleTimeout(t *testing.T) {
 		t.Fatal(err)
 	}
 	router.releases.Wait()
-	pool := router.pools["default--demo-1234"]
+	pool := router.pools["default/demo-1234"]
 	router.endPool(pool, false, time.Now().Add(2*time.Second))
 	router.releases.Wait()
 	if len(client.released) != 1 {

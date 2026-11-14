@@ -862,7 +862,24 @@ func ensureGrantIdentity(
 }
 
 func revisionMetadataKey(revision *servingv1.Revision) string {
-	return "revision-" + revision.Namespace + "--" + revision.Name + ".json"
+	return "revision-" + revision.Namespace + "_" + revision.Name + ".json"
+}
+
+func removeLegacyRevisionMetadata(data map[string]string, revision *servingv1.Revision) bool {
+	key := "revision-" + revision.Namespace + "--" + revision.Name + ".json"
+	var identity struct {
+		Kind      string `json:"kind"`
+		Namespace string `json:"namespace"`
+		Revision  string `json:"revision"`
+	}
+	if err := json.Unmarshal([]byte(data[key]), &identity); err != nil ||
+		identity.Kind != "revision" ||
+		identity.Namespace != revision.Namespace ||
+		identity.Revision != revision.Name {
+		return false
+	}
+	delete(data, key)
+	return true
 }
 
 func (r *Reconciler) publishRevision(
@@ -899,7 +916,10 @@ func (r *Reconciler) publishRevision(
 			config.Data = make(map[string]string)
 		}
 		key := revisionMetadataKey(revision)
-		if config.Data[key] == string(document) {
+		// Remove the owned legacy file in the same update, so the router
+		// never projects two files for this Revision during migration.
+		removedLegacy := removeLegacyRevisionMetadata(config.Data, revision)
+		if config.Data[key] == string(document) && !removedLegacy {
 			return nil
 		}
 		config.Data[key] = string(document)
@@ -960,10 +980,13 @@ func (r *Reconciler) FinalizeKind(ctx context.Context, revision *servingv1.Revis
 		if err != nil {
 			return err
 		}
-		if _, exists := config.Data[revisionMetadataKey(revision)]; !exists {
+		key := revisionMetadataKey(revision)
+		_, exists := config.Data[key]
+		removedLegacy := removeLegacyRevisionMetadata(config.Data, revision)
+		if !exists && !removedLegacy {
 			return nil
 		}
-		delete(config.Data, revisionMetadataKey(revision))
+		delete(config.Data, key)
 		_, err = configMaps.Update(ctx, config, metav1.UpdateOptions{})
 		return err
 	})

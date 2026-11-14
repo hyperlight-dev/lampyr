@@ -307,12 +307,11 @@ func (router *Router) Reload() error {
 	routed := map[string]bool{}
 	idle := map[string]time.Duration{}
 	for key, revision := range revisions {
-		poolKey := revision.Namespace + "--" + revision.Revision
 		if revision.Routed {
-			retain[poolKey] = true
+			retain[key] = true
 			routed[key] = true
 			execution, _ := (project.Manifest{Execution: &revision.Execution}).EffectiveExecution()
-			idle[poolKey], _ = time.ParseDuration(execution.IdleTimeout)
+			idle[key], _ = time.ParseDuration(execution.IdleTimeout)
 		}
 	}
 	router.mu.Lock()
@@ -621,7 +620,7 @@ func pause(request context.Context, deadline time.Time, d time.Duration) bool {
 // measures what is left of that from when the Clone arrives, so a slow
 // connect does not give the helper more time than the request has.
 func (router *Router) clone(request context.Context, deadline time.Time, whole bool, namespace, revision string, execution project.ExecutionPolicy, grant HomeGrant) (consumer.Fiber, func(bool), error) {
-	uid := namespace + "--" + revision
+	poolKey := namespace + "/" + revision
 	if execution.Mode == project.ExecutionFresh {
 		cloneCtx, cancel := context.WithDeadline(request, deadline)
 		fiber, err := grant.Client.Clone(cloneCtx, grant.Token, "", time.Until(deadline), nil)
@@ -642,10 +641,10 @@ func (router *Router) clone(request context.Context, deadline time.Time, whole b
 		return consumer.Fiber{}, nil, err
 	}
 	router.mu.Lock()
-	pool := router.pools[uid]
+	pool := router.pools[poolKey]
 	if pool == nil {
 		pool = &routerPool{idle: idle}
-		router.pools[uid] = pool
+		router.pools[poolKey] = pool
 	}
 	router.mu.Unlock()
 	pool.mu.Lock()
