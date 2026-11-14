@@ -553,7 +553,7 @@ mod tests {
 
     #[test]
     fn status_url_preserves_observed_host_and_cluster_visibility() {
-        let installation = Installation {
+        let mut installation = Installation {
             data: BTreeMap::new(),
             domain: "localhost".to_owned(),
             https_port: Some("8443".to_owned()),
@@ -617,5 +617,32 @@ mod tests {
             "status":{"url":"https://demo.default.svc.cluster.local"}
         });
         assert!(service_status_url(&secure_internal, &installation).is_err());
+        for (observed, port, expected) in [
+            (
+                "http://api.customer.example",
+                Some("8443"),
+                "https://api.customer.example:8443",
+            ),
+            (
+                "https://checkout.example.org",
+                Some("8443"),
+                "https://checkout.example.org:8443",
+            ),
+            (
+                "http://api.customer.example",
+                None,
+                "https://api.customer.example",
+            ),
+        ] {
+            installation.https_port = port.map(str::to_owned);
+            let custom = json!({
+                "metadata":{"name":"custom","namespace":"default"},
+                "status":{"url":observed}
+            });
+            assert_eq!(
+                service_status_url(&custom, &installation).unwrap(),
+                expected
+            );
+        }
     }
 }

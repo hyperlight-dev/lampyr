@@ -409,6 +409,19 @@ mod tests {
         let mut secure_internal = internal.clone();
         secure_internal["status"]["url"] = json!("https://demo.default.svc.cluster.local");
         assert!(visibility_ready(&secure_internal, &secure_internal, false).is_err());
+        for (field, observed) in [("name", "other"), ("namespace", "other")] {
+            let mut unrelated = public.clone();
+            unrelated["metadata"][field] = json!(observed);
+            unrelated["status"]["url"] = json!(format!(
+                "http://{}.{}.example.com",
+                unrelated["metadata"]["name"].as_str().unwrap(),
+                unrelated["metadata"]["namespace"].as_str().unwrap()
+            ));
+            assert!(visibility_ready(&public, &unrelated, true).is_err());
+        }
+        let mut custom = public.clone();
+        custom["status"]["url"] = json!("https://api.customer.example");
+        assert!(visibility_ready(&custom, &custom, true).unwrap());
     }
 
     #[test]
@@ -442,6 +455,20 @@ mod tests {
             &revision,
             "demo-00002"
         ));
+        let mut weighted = service(2, "demo-00002");
+        weighted["spec"]["traffic"] = json!([
+            {"revisionName":"demo-00001","percent":25},
+            {"revisionName":"demo-00002","percent":75}
+        ]);
+        weighted["status"]["traffic"] = weighted["spec"]["traffic"].clone();
+        for _ in 0..2 {
+            assert!(deployment_ready(&weighted, &revision, "demo-00002"));
+        }
+        weighted["status"]["traffic"] = json!([
+            {"revisionName":"demo-00001","percent":100},
+            {"revisionName":"demo-00002","percent":0}
+        ]);
+        assert!(deployment_ready(&weighted, &revision, "demo-00002"));
     }
 
     #[test]
