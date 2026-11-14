@@ -36,6 +36,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/apimachinery/pkg/util/validation"
 	utilyaml "k8s.io/apimachinery/pkg/util/yaml"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
 	"k8s.io/client-go/kubernetes/fake"
@@ -803,6 +804,88 @@ func TestValidateRevisionRequiresFiberdTemplate(t *testing.T) {
 	}
 	if _, err := validateRevision(revision); err == nil {
 		t.Fatal("Revision without a fiberd template was accepted")
+	}
+}
+
+func TestRevisionRouterMetadataKeepsCompoundIdentitiesDistinct(t *testing.T) {
+	ctx := context.Background()
+	client := fake.NewSimpleClientset(&corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "lampyr-routes", Namespace: systemNamespace},
+	})
+	reconciler := &Reconciler{kube: client}
+	revisions := []*servingv1.Revision{
+		{ObjectMeta: metav1.ObjectMeta{Namespace: "a--b", Name: "c"}},
+		{ObjectMeta: metav1.ObjectMeta{Namespace: "a", Name: "b--c"}},
+	}
+	spec := revisionSpec{execution: project.ExecutionPolicy{Mode: project.ExecutionFresh}, timeout: time.Second}
+	for _, revision := range revisions {
+		if _, err := reconciler.publishRevision(ctx, revision, spec); err != nil {
+			t.Fatal(err)
+		}
+		key := revisionMetadataKey(revision)
+		if errors := validation.IsConfigMapKey(key); len(errors) != 0 {
+			t.Errorf("route filename %q is not a valid ConfigMap key: %v", key, errors)
+		}
+	}
+	config, err := client.CoreV1().ConfigMaps(systemNamespace).Get(ctx, "lampyr-routes", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(config.Data) != 2 {
+		t.Fatalf("published %d route files, want 2 independent Revisions: %v", len(config.Data), config.Data)
+	}
+	if err := reconciler.FinalizeKind(ctx, revisions[0]); err != nil {
+		t.Fatal(err)
+	}
+	config, err = client.CoreV1().ConfigMaps(systemNamespace).Get(ctx, "lampyr-routes", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := config.Data[revisionMetadataKey(revisions[1])]; !exists {
+		t.Fatal("finalizing one Revision removed the other Revision's metadata")
+	}
+}
+
+func TestRevisionRouterMetadataMigratesLegacyFilename(t *testing.T) {
+	const legacyKey = "revision-a--b--c.json"
+	for _, operation := range []string{"publish", "finalize"} {
+		for _, legacy := range []struct {
+			name, document string
+			owned          bool
+		}{
+			{"matching", `{"kind":"revision","namespace":"a--b","revision":"c"}`, true},
+			{"colliding", `{"kind":"revision","namespace":"a","revision":"b--c"}`, false},
+			{"invalid", `not-json`, false},
+		} {
+			t.Run(operation+"/"+legacy.name, func(t *testing.T) {
+				ctx := context.Background()
+				client := fake.NewSimpleClientset(&corev1.ConfigMap{
+					ObjectMeta: metav1.ObjectMeta{Name: "lampyr-routes", Namespace: systemNamespace},
+					Data:       map[string]string{legacyKey: legacy.document},
+				})
+				reconciler := &Reconciler{kube: client}
+				revision := &servingv1.Revision{ObjectMeta: metav1.ObjectMeta{Namespace: "a--b", Name: "c"}}
+				if operation == "publish" {
+					spec := revisionSpec{execution: project.ExecutionPolicy{Mode: project.ExecutionFresh}, timeout: time.Second}
+					if _, err := reconciler.publishRevision(ctx, revision, spec); err != nil {
+						t.Fatal(err)
+					}
+				} else if err := reconciler.FinalizeKind(ctx, revision); err != nil {
+					t.Fatal(err)
+				}
+				config, err := client.CoreV1().ConfigMaps(systemNamespace).Get(ctx, "lampyr-routes", metav1.GetOptions{})
+				if err != nil {
+					t.Fatal(err)
+				}
+				document, exists := config.Data[legacyKey]
+				if legacy.owned && exists {
+					t.Error("owned legacy filename survived migration")
+				}
+				if !legacy.owned && (!exists || document != legacy.document) {
+					t.Error("legacy metadata without a matching identity was changed")
+				}
+			})
+		}
 	}
 }
 

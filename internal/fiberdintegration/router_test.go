@@ -165,6 +165,76 @@ func revisionRequest(method, path string, revision RevisionRoute) *http.Request 
 	return request
 }
 
+func TestRevisionPoolsKeepCompoundIdentitiesDistinct(t *testing.T) {
+	routes := t.TempDir()
+	revisions := []RevisionRoute{
+		{
+			Kind: "revision", Namespace: "a--b", Revision: "c",
+			Execution: project.ExecutionPolicy{Mode: project.ExecutionReuse, IdleTimeout: "30s"},
+			Timeout:   "30s", Routed: true,
+		},
+		{
+			Kind: "revision", Namespace: "a", Revision: "b--c",
+			Execution: project.ExecutionPolicy{Mode: project.ExecutionReuse, IdleTimeout: "30s"},
+			Timeout:   "30s", Routed: true,
+		},
+	}
+	for index, revision := range revisions {
+		data, err := json.Marshal(revision)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(routes, fmt.Sprintf("route-%d.json", index)), data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	client := &testFiberClient{sessions: map[string]consumer.Fiber{}, servers: map[string]*httptest.Server{}}
+	router, err := NewRouter(testHomeResolver{client: client}, routes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		router.Close()
+		for _, server := range client.servers {
+			server.Close()
+		}
+		for _, revision := range revisions {
+			forgetRevision(revision.Namespace, revision.Revision)
+		}
+	})
+	request := func(revision RevisionRoute, count int) {
+		t.Helper()
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, revisionRequest(http.MethodGet, "/test", revision))
+		if response.Code != http.StatusOK || response.Body.String() != fmt.Sprint(count) {
+			t.Errorf("%s/%s request = %d %q, want independent fiber count %d",
+				revision.Namespace, revision.Revision, response.Code, response.Body.String(), count)
+		}
+	}
+	for count := 1; count <= 2; count++ {
+		for _, revision := range revisions {
+			request(revision, count)
+		}
+	}
+	if len(router.pools) != 2 {
+		t.Errorf("pool count = %d, want 2", len(router.pools))
+	}
+	if err := os.Remove(filepath.Join(routes, "route-0.json")); err != nil {
+		t.Fatal(err)
+	}
+	if err := router.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	request(revisions[1], 3)
+	router.releases.Wait()
+	if len(client.released) != 1 {
+		t.Errorf("removed Revision released %d fibers, want 1", len(client.released))
+	}
+	if len(router.pools) != 1 || client.next != 2 {
+		t.Errorf("remaining pools = %d, created fibers = %d, want 1 and 2", len(router.pools), client.next)
+	}
+}
+
 func TestFreshPolicyCreatesAndReleasesEveryRequest(t *testing.T) {
 	router, client, revision := routerFixture(t, project.ExecutionFresh)
 	for range 2 {
