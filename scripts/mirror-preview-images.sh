@@ -6,23 +6,20 @@ readonly REPOSITORY="hyperlight-dev/lampyr"
 readonly SIGNER_WORKFLOW="${REPOSITORY}/.github/workflows/release.yml"
 readonly SOURCE_REF="refs/heads/main"
 readonly PREVIEW_RELEASE="preview-release"
-# The last three are the platform's default controller inputs: the fiberd
-# image grant Pods run, the controller the manifest below runs, and the
-# helper image.
-readonly -a IMAGES=(
+# The upstream grant and controller images are read from the signed platform.
+declare -a IMAGES=(
     fiberd
     fiber-router
     azure-node-setup
     eventgrid-controller
     eventgrid-adapter
-    upstream-fiberd
-    fiberd-k8s-controller
     hluk-helper
 )
 # The preview platform carries fiberd-k8s-controller's manifest, which
 # pulls the controller image by digest.
 readonly PLATFORM_ARCHIVE="lampyr-platform-linux-amd64-preview.tar.gz"
 readonly CONTROLLER_MANIFEST="build/fiberd-k8s-controller.yaml"
+readonly CONTROLLER_INPUTS="build/controller-inputs.json"
 
 die() {
     echo "preview mirror: $*" >&2
@@ -64,6 +61,8 @@ gh auth status --hostname github.com >/dev/null 2>&1 ||
     die "gh must be authenticated to github.com"
 command -v docker >/dev/null 2>&1 ||
     die "docker is required"
+command -v jq >/dev/null 2>&1 ||
+    die "jq is required"
 docker buildx version >/dev/null 2>&1 ||
     die "Docker Buildx is required"
 
@@ -92,6 +91,7 @@ cleanup() {
 trap cleanup EXIT
 
 declare -a source_references=()
+declare -a source_names=()
 declare -a source_digests=()
 declare -a destination_references=()
 
@@ -99,6 +99,7 @@ for image in "${IMAGES[@]}"; do
     source="${SOURCE_PREFIX}/${image}:${source_tag}"
     digest=$(inspect_digest "$source")
     source_references+=("$source")
+    source_names+=("${SOURCE_PREFIX}/${image}")
     source_digests+=("$digest")
 
     if ! gh attestation verify "oci://${source}@${digest}" \
@@ -125,8 +126,8 @@ if ! gh attestation verify "${work}/${PLATFORM_ARCHIVE}" \
     die "attestation verification failed for ${PLATFORM_ARCHIVE}"
 fi
 tar --extract --gzip --file "${work}/${PLATFORM_ARCHIVE}" \
-    --directory "$work" "$CONTROLLER_MANIFEST" ||
-    die "${PLATFORM_ARCHIVE} has no ${CONTROLLER_MANIFEST}"
+    --directory "$work" "$CONTROLLER_MANIFEST" "$CONTROLLER_INPUTS" ||
+    die "${PLATFORM_ARCHIVE} has no controller manifest or inputs"
 manifest=$(<"${work}/${CONTROLLER_MANIFEST}")
 
 # Every image the manifest pulls must be one mirrored here, by the digest
@@ -138,11 +139,45 @@ mapfile -t manifest_images < <(
 )
 (( ${#manifest_images[@]} > 0 )) ||
     die "${CONTROLLER_MANIFEST} pulls no image"
+
+grant=$(jq -er '.grantImage' "${work}/${CONTROLLER_INPUTS}") ||
+    die "${CONTROLLER_INPUTS} has no grantImage"
+[[ "$grant" =~ ^ghcr.io/azure/fiberd@sha256:[0-9a-f]{64}$ ]] ||
+    die "grantImage is not a digest-pinned upstream fiberd image"
+controller=
+for reference in "${manifest_images[@]}"; do
+    if [[ "$reference" =~ ^ghcr.io/azure/fiberd-k8s-controller@sha256:[0-9a-f]{64}$ ]]; then
+        [[ -z "$controller" ]] || die "controller manifest pulls several controller images"
+        controller=$reference
+    fi
+done
+[[ -n "$controller" ]] ||
+    die "${CONTROLLER_MANIFEST} does not pull a verified upstream controller image"
+
+for image in upstream-fiberd fiberd-k8s-controller; do
+    if [[ "$image" == upstream-fiberd ]]; then
+        reference=$grant
+        repository=Azure/fiberd
+    else
+        reference=$controller
+        repository=Azure/fiberd-k8s-controller
+    fi
+    gh attestation verify "oci://$reference" \
+        --repo "$repository" \
+        --signer-workflow "$repository/.github/workflows/release.yml" \
+        --deny-self-hosted-runners >/dev/null ||
+        die "attestation verification failed for $reference"
+    IMAGES+=("$image")
+    source_names+=("${reference%@*}")
+    source_references+=("${reference%@*}")
+    source_digests+=("${reference#*@}")
+done
+
 declare -a manifest_indexes=()
 for reference in "${manifest_images[@]}"; do
     found=
     for index in "${!IMAGES[@]}"; do
-        if [[ "$reference" == "${SOURCE_PREFIX}/${IMAGES[$index]}@${source_digests[$index]}" ]]; then
+        if [[ "$reference" == "${source_names[$index]}@${source_digests[$index]}" ]]; then
             found=$index
         fi
     done
@@ -173,7 +208,7 @@ azure_tmp="${build_dir}/.preview-azure.yaml.$$"
 manifest_tmp="${build_dir}/.preview-fiberd-k8s-controller.yaml.$$"
 
 for index in "${manifest_indexes[@]}"; do
-    source="${SOURCE_PREFIX}/${IMAGES[$index]}@${source_digests[$index]}"
+    source="${source_names[$index]}@${source_digests[$index]}"
     manifest=${manifest//"$source"/"${destination_references[$index]}"}
 done
 printf '%s\n' "$manifest" > "$manifest_tmp"

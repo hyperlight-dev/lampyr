@@ -389,6 +389,8 @@ jobs:
       # ly cluster install from a release needs none of them, and
       # zygoteRegistries defaults to the Kind or k3d local registry.
       - name: Write the default controller inputs
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           image() {
             local digest
@@ -400,8 +402,9 @@ jobs:
             printf '%s/%s@%s\n' "$IMAGE_PREFIX" "$1" "$digest"
           }
           # A failure inside $(...) as an argument would not stop the step.
-          controller=$(image fiberd-k8s-controller)
-          grant=$(image upstream-fiberd)
+          . upstream/pins.env
+          controller=$CONTROLLER_IMAGE
+          grant=$FIBERD_IMAGE
           helper=$(image hluk-helper)
           just upstream::controller-inputs "$controller" "$grant" "$helper"
 
@@ -579,24 +582,6 @@ jobs:
             build_args: BINARY=eventgrid-adapter
             title: Lampyr Event Grid adapter
             description: Lampyr Event Grid adapter
-          # Built from the upstream commits upstream/pins.env pins until
-          # fiberd and fiberd-k8s-controller publish images of their own.
-          - image: upstream-fiberd
-            prepare: upstream::prepare-fiberd-image
-            context: build/upstream/fiberd
-            dockerfile: build/upstream/fiberd/docker/fiberd/Dockerfile
-            target: fiberd
-            build_args: ""
-            title: fiberd
-            description: Stock fiberd, which grant Pods run, from the commit upstream/pins.env pins
-          - image: fiberd-k8s-controller
-            prepare: upstream::prepare-controller-image
-            context: .
-            dockerfile: upstream/controller.Dockerfile
-            target: ""
-            build_args: ""
-            title: fiberd-k8s-controller
-            description: fiberd-k8s-controller from the commit upstream/pins.env pins
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -628,22 +613,6 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # The upstream images' descriptions name the repository and commit
-      # pins.env gives, so an image says which source it was built from.
-      - name: Read the upstream source
-        id: upstream
-        if: matrix.image == 'upstream-fiberd' || matrix.image == 'fiberd-k8s-controller'
-        env:
-          IMAGE: ${{ matrix.image }}
-        run: |
-          . upstream/pins.env
-          if [[ $IMAGE == upstream-fiberd ]]; then
-            description="Stock fiberd, which grant Pods run, from $FIBERD_REPOSITORY@$FIBERD_COMMIT"
-          else
-            description="fiberd-k8s-controller from $CONTROLLER_REPOSITORY@$CONTROLLER_COMMIT"
-          fi
-          printf 'description=%s\n' "$description" >>"$GITHUB_OUTPUT"
-
       - name: Extract image metadata
         id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
@@ -652,20 +621,10 @@ jobs:
           tags: type=raw,value=${{ needs.version.outputs.image-tag }}
           labels: |
             org.opencontainers.image.title=${{ matrix.title }}
-            org.opencontainers.image.description=${{ steps.upstream.outputs.description || matrix.description }}
+            org.opencontainers.image.description=${{ matrix.description }}
             org.opencontainers.image.source=https://github.com/hyperlight-dev/lampyr
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.version=${{ needs.version.outputs.image-tag }}
-
-      # fiberd -version prints the version the image is built as.
-      - name: Read the fiberd version
-        id: fiberd-version
-        if: matrix.image == 'upstream-fiberd'
-        # A failure inside $(...) as an argument would not stop the step.
-        run: |
-          version=$(just upstream::fiberd-version)
-          [[ -n $version ]] || { echo "just upstream::fiberd-version printed nothing" >&2; exit 1; }
-          printf 'build-args=VERSION=%s\n' "$version" >>"$GITHUB_OUTPUT"
 
       - name: Build and push image
         id: build
@@ -674,7 +633,7 @@ jobs:
           context: ${{ matrix.context }}
           file: ${{ matrix.dockerfile }}
           target: ${{ matrix.target }}
-          build-args: ${{ steps.fiberd-version.outputs.build-args || matrix.build_args }}
+          build-args: ${{ matrix.build_args }}
           platforms: linux/amd64
           push: true
           tags: ${{ steps.meta.outputs.tags }}

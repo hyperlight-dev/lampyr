@@ -31,6 +31,103 @@ def bash(script, *args, cwd=None, **env):
 
 
 class ClusterInputsTests(unittest.TestCase):
+    def test_upstream_images_are_pulled_and_only_the_helper_is_built(self):
+        body = recipe("cluster-inputs")
+        for fail in ("", "pull"):
+            with self.subTest(fail=fail), tempfile.TemporaryDirectory(dir=ROOT) as directory:
+                work = Path(directory)
+                (work / "bin").mkdir()
+                (work / "build/tools").mkdir(parents=True)
+                pins = work / "pins.env"
+                pins.write_text(
+                    "CONTROLLER_COMMIT=" + "1" * 40 + "\n"
+                    f"CONTROLLER_IMAGE=ghcr.io/azure/fiberd-k8s-controller@{DIGEST}\n"
+                    f"FIBERD_IMAGE=ghcr.io/azure/fiberd@{DIGEST}\n"
+                )
+                docker = work / "bin/docker"
+                docker.write_text(
+                    '#!/bin/bash\nset -euo pipefail\n'
+                    'printf "%s\\n" "$*" >> "$COMMANDS"\n'
+                    'case $1 in\n'
+                    'pull) [[ -z "$FAIL_PULL" ]] ;;\n'
+                    'tag) ;;\n'
+                    'save) touch "$3" ;;\n'
+                    'buildx)\n'
+                    '  while (($#)); do\n'
+                    '    if [[ $1 == --output ]]; then output=$2; break; fi\n'
+                    '    shift\n'
+                    '  done\n'
+                    '  path=${output#type=oci,dest=}; path=${path%,tar=false}\n'
+                    '  mkdir -p "$path"\n'
+                    '  printf \'{"manifests":[{"digest":"%s"}]}\' "$DIGEST" > "$path/index.json"\n'
+                    '  ;;\n'
+                    '*) exit 92 ;;\n'
+                    'esac\n'
+                )
+                just = work / "bin/just"
+                just.write_text(
+                    '#!/bin/bash\nset -euo pipefail\nshift 2\n'
+                    'case $1 in\n'
+                    'fiberd-template-tools)\n'
+                    '  for tool in hluk-helper zygotectl grant-issuer; do\n'
+                    '    printf "#!/bin/sh\\n" > "$ROOT/build/$tool"\n'
+                    '  done ;;\n'
+                    'providers::install-oras) ;;\n'
+                    'controller-manifest) printf "image: %s\\n" "$2" > "$3" ;;\n'
+                    '*) exit 93 ;;\n'
+                    'esac\n'
+                )
+                oras = work / "build/tools/oras"
+                oras.write_text(
+                    '#!/bin/bash\nset -euo pipefail\n'
+                    'printf "%s\\n" "$*" >> "$COMMANDS"\n'
+                    'for destination; do :; done\n'
+                    'path=${destination%:ci}; mkdir -p "$path"\n'
+                    'printf \'{"manifests":[{"digest":"%s"}]}\' "$DIGEST" > "$path/index.json"\n'
+                )
+                for command in (docker, just, oras):
+                    command.chmod(0o755)
+                script = body
+                for placeholder, value in {
+                    "repo-root": work, "project-root": work / "upstream",
+                    "sources": work / "build/upstream", "pins": pins,
+                }.items():
+                    script = script.replace("{{" + placeholder + "}}", str(value))
+                output = work / "cluster-inputs"
+                output.mkdir()
+                (output / "inputs.json").write_text('{"earlier":true}')
+                commands = work / "commands"
+                result = bash(
+                    script, str(output), cwd=work, ROOT=str(work), DIGEST=DIGEST,
+                    COMMANDS=str(commands), FAIL_PULL=fail,
+                    PATH=f"{work / 'bin'}:{os.environ['PATH']}",
+                )
+                if fail:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertEqual(json.loads((output / "inputs.json").read_text()), {"earlier": True})
+                    self.assertFalse(any(work.glob(".cluster-inputs.*")))
+                    continue
+                self.assertEqual(result.returncode, 0, result.stderr)
+                inputs = json.loads((output / "inputs.json").read_text())
+                self.assertEqual(inputs, {
+                    "controllerImage": "lampyr.local/fiberd-k8s-controller:" + "1" * 12,
+                    "grantDigest": DIGEST,
+                    "helperDigest": DIGEST,
+                })
+                self.assertTrue((output / "images/fiberd-k8s-controller.tar").is_file())
+                calls = commands.read_text().splitlines()
+                self.assertEqual(calls[0], (
+                    "pull --platform linux/amd64 "
+                    f"ghcr.io/azure/fiberd-k8s-controller@{DIGEST}"
+                ))
+                builds = [line for line in calls if line.startswith("buildx build")]
+                self.assertEqual(len(builds), 1)
+                self.assertIn("helper/ci.Dockerfile", builds[0])
+                self.assertTrue(any(
+                    f"cp --platform linux/amd64 --to-oci-layout ghcr.io/azure/fiberd@{DIGEST}" in line
+                    for line in calls
+                ))
+
     def test_digest_takes_only_one_sha256_manifest(self):
         body = recipe("cluster-inputs")
         program = re.search(r"jq -er '([^']*select\(length == 1\)[^']*)'", body)

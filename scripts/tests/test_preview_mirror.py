@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Fixture tests for verified preview image mirroring."""
 
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -17,10 +18,11 @@ IMAGES = (
     "azure-node-setup",
     "eventgrid-controller",
     "eventgrid-adapter",
+    "hluk-helper",
     "upstream-fiberd",
     "fiberd-k8s-controller",
-    "hluk-helper",
 )
+LAMPYR_IMAGES = IMAGES[:-2]
 SOURCE_DIGITS = {
     "fiberd": "1",
     "fiber-router": "2",
@@ -41,7 +43,8 @@ DESTINATION_DIGITS = {
     "fiberd-k8s-controller": "9",
     "hluk-helper": "0",
 }
-CONTROLLER = f"{SOURCE}/fiberd-k8s-controller@sha256:{'7' * 64}"
+GRANT = f"ghcr.io/azure/fiberd@sha256:{'6' * 64}"
+CONTROLLER = f"ghcr.io/azure/fiberd-k8s-controller@sha256:{'7' * 64}"
 MANIFEST = f"""apiVersion: apps/v1
 kind: Deployment
 spec:
@@ -62,14 +65,17 @@ if [[ ${0##*/} == gh ]]; then
         "auth status") exit 0 ;;
         "api repos/hyperlight-dev/lampyr/commits/preview-release")
             printf '%s\n' "$COMMIT"; exit 0 ;;
-        "attestation verify") exit 0 ;;
+        "attestation verify")
+            if [[ -n ${FAIL_VERIFY:-} && $3 == *"$FAIL_VERIFY"* ]]; then exit 32; fi
+            exit 0 ;;
         "release download")
             while (($#)); do [[ $1 == --dir ]] && dir=$2; shift; done
             root=$(mktemp -d "${FAKE_LOG%/*}/archive.XXXXXX")
             mkdir -p "$root/build"
             printf '%s' "$FAKE_MANIFEST" > "$root/build/fiberd-k8s-controller.yaml"
+            printf '%s' "$FAKE_INPUTS" > "$root/build/controller-inputs.json"
             tar --create --gzip --file "$dir/lampyr-platform-linux-amd64-preview.tar.gz" \
-                --directory "$root" build/fiberd-k8s-controller.yaml
+                --directory "$root" build/fiberd-k8s-controller.yaml build/controller-inputs.json
             rm -rf "$root"
             exit 0 ;;
     esac
@@ -126,6 +132,7 @@ class PreviewMirrorTest(unittest.TestCase):
             "FAKE_LOG": str(self.log),
             "COMMIT": COMMIT,
             "FAKE_MANIFEST": MANIFEST,
+            "FAKE_INPUTS": json.dumps({"grantImage": GRANT}),
         } | extra
         return subprocess.run(
             ["bash", str(self.script), destination],
@@ -146,8 +153,8 @@ class PreviewMirrorTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         inspects = self.calls("docker", ("buildx", "imagetools", "inspect"))
         self.assertEqual(
-            [call[3] for call in inspects[:len(IMAGES)]],
-            [f"{SOURCE}/{image}:{SOURCE_TAG}" for image in IMAGES])
+            [call[3] for call in inspects[:len(LAMPYR_IMAGES)]],
+            [f"{SOURCE}/{image}:{SOURCE_TAG}" for image in LAMPYR_IMAGES])
         self.assertEqual(
             self.calls("gh", ("api",)),
             [["api", "repos/hyperlight-dev/lampyr/commits/preview-release",
@@ -160,17 +167,30 @@ class PreviewMirrorTest(unittest.TestCase):
             "--deny-self-hosted-runners"]
         verified = self.calls("gh", ("attestation", "verify"))
         self.assertEqual(
-            verified[:-1],
+            verified[:len(LAMPYR_IMAGES)],
             [
                 ["attestation", "verify",
                  f"oci://{SOURCE}/{image}:{SOURCE_TAG}@sha256:{SOURCE_DIGITS[image] * 64}",
                  *policy]
-                for image in IMAGES])
+                for image in LAMPYR_IMAGES])
         # The platform archive carrying the controller manifest is verified
         # under the same policy.
-        self.assertEqual(verified[-1][3:], policy)
+        archive = verified[len(LAMPYR_IMAGES)]
+        self.assertEqual(archive[3:], policy)
         self.assertTrue(
-            verified[-1][2].endswith("/lampyr-platform-linux-amd64-preview.tar.gz"))
+            archive[2].endswith("/lampyr-platform-linux-amd64-preview.tar.gz"))
+        for call, reference, repository in zip(
+            verified[len(LAMPYR_IMAGES) + 1:],
+            (GRANT, CONTROLLER),
+            ("Azure/fiberd", "Azure/fiberd-k8s-controller"),
+            strict=True,
+        ):
+            self.assertEqual(call, [
+                "attestation", "verify", f"oci://{reference}",
+                "--repo", repository,
+                "--signer-workflow", f"{repository}/.github/workflows/release.yml",
+                "--deny-self-hosted-runners",
+            ])
         self.assertEqual(
             [call[:6] for call in self.calls("gh", ("release", "download"))],
             [["release", "download", "preview-release",
@@ -179,8 +199,25 @@ class PreviewMirrorTest(unittest.TestCase):
         self.assertTrue(all(call[3:5] == ["--platform", "linux/amd64"] for call in creates))
         self.assertEqual(
             [call[7] for call in creates],
-            [f"{SOURCE}/{image}:{SOURCE_TAG}@sha256:{SOURCE_DIGITS[image] * 64}"
-             for image in IMAGES])
+            [*(f"{SOURCE}/{image}:{SOURCE_TAG}@sha256:{SOURCE_DIGITS[image] * 64}"
+               for image in LAMPYR_IMAGES), GRANT, CONTROLLER])
+
+    def test_upstream_attestation_failure_copies_nothing(self):
+        for reference in (GRANT, CONTROLLER):
+            with self.subTest(reference=reference):
+                result = self.run_script(FAIL_VERIFY=reference)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("attestation verification failed", result.stderr)
+                self.assertEqual(self.calls("docker", ("buildx", "imagetools", "create")), [])
+                self.log.unlink()
+
+    def test_platform_cannot_substitute_a_non_upstream_grant_image(self):
+        result = self.run_script(
+            FAKE_INPUTS=json.dumps({"grantImage": f"{SOURCE}/upstream-fiberd@sha256:{'6' * 64}"})
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("not a digest-pinned upstream fiberd image", result.stderr)
+        self.assertEqual(self.calls("docker", ("buildx", "imagetools", "create")), [])
 
     def test_invalid_destinations_run_no_commands(self):
         invalid = (
@@ -213,7 +250,7 @@ class PreviewMirrorTest(unittest.TestCase):
             with self.subTest(image=image):
                 result = self.run_script(FAKE_MANIFEST=MANIFEST.replace(CONTROLLER, image))
                 self.assertNotEqual(result.returncode, 0)
-                self.assertIn("not a verified preview image", result.stderr)
+                self.assertIn("verified upstream controller image", result.stderr)
                 self.assertEqual(self.calls("docker", ("buildx", "imagetools", "create")), [])
                 self.log.unlink()
 
@@ -226,7 +263,7 @@ class PreviewMirrorTest(unittest.TestCase):
             for image in IMAGES}
         inspects = self.calls("docker", ("buildx", "imagetools", "inspect"))
         self.assertEqual(
-            [call[3] for call in inspects[len(IMAGES):]],
+            [call[3] for call in inspects[len(LAMPYR_IMAGES):]],
             [f"{destination}/{image}:preview" for image in IMAGES])
         manifest = self.root / "build" / "preview-fiberd-k8s-controller.yaml"
         self.assertEqual(

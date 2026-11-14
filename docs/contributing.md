@@ -125,8 +125,7 @@ the VM contracts. Both run in CI and through `just test`.
 The cluster suites (`just test-kind-integration` and its prebuilt variants,
 `just test-k3d-integration`, `just test-existing-kind-integration`,
 `just test-knative-portability` and `just test-azure-eventgrid-integration`)
-install fiberd-k8s-controller, which has no
-release yet. They read its installation inputs from the environment and stop
+install fiberd-k8s-controller. They read its installation inputs from the environment and stop
 before creating anything when one is missing:
 
 | Variable | Value |
@@ -151,9 +150,9 @@ just upstream::cluster-inputs build/cluster-inputs
 LAMPYR_CLUSTER_INPUTS="$PWD/build/cluster-inputs" just test-existing-kind-integration
 ```
 
-The recipe builds the stock fiberd image and fiberd-k8s-controller from the
-commits `upstream/pins.env` pins, and the helper, its image, `zygotectl` and
-`grant-issuer` from this checkout and that fiberd. Its buildx builder must
+The recipe verifies and pulls the upstream image digests in
+`upstream/pins.env`. It builds the helper and its image from this checkout,
+and `zygotectl` and `grant-issuer` from the pinned fiberd source. Its buildx builder must
 export OCI layouts, as a `docker-container` one does. A suite pushes the
 fiberd and helper images to its own registry, keeping their digests, and has
 its provider load the controller image, which the manifest names by a
@@ -209,13 +208,14 @@ all attested against `refs/tags/vX.Y.Z`. Source keeps `:preview` image tags;
 the release build stamps `X.Y.Z` into the CLI's default images and the packaged
 platform manifests. Install it with `scripts/install-ly.sh vX.Y.Z`.
 
-fiberd and fiberd-k8s-controller publish no images or install manifest yet,
-so every preview and versioned release builds them from the commits
-`upstream/pins.env` pins, as `upstream-fiberd` and `fiberd-k8s-controller`.
-Packaging then writes `build/fiberd-k8s-controller.yaml`, the controller's
-`config/default` running its published image by digest, and
-`build/controller-inputs.json`, which names that manifest and the published
-`upstream-fiberd` and `hluk-helper` digests, into both platform archives
+Releases use the signed upstream images for fiberd v0.4.0, with its Hyperlight
+backend, and fiberd-k8s-controller v0.1.0. `upstream/pins.env` pins their image
+digests and source commits. `just upstream::verify-images` verifies each image's
+provenance against its upstream release workflow and source commit.
+Packaging writes `build/fiberd-k8s-controller.yaml`, the controller release's
+`config/default` running its upstream image by digest, and
+`build/controller-inputs.json`, which names that manifest, the upstream fiberd
+digest and the published `hluk-helper` digest, into both platform archives
 (`just upstream::controller-inputs`). `ly cluster install` takes
 `controllerManifest`, `grantImage` and `helperImage` from them when an install
 is not given them, and `zygoteRegistries` defaults to the Kind or k3d
@@ -227,8 +227,8 @@ are made, and
 `build/zygotectl` and `build/grant-issuer`, which run on the user's machine,
 built from the pinned fiberd for each archive's own target into
 `build/template-tools/TARGET` (`just upstream::template-tools`). To move
-to new upstream commits, change `upstream/pins.env`, and `go.mod`'s
-`github.com/Azure/fiberd` with `FIBERD_COMMIT`.
+to new upstream releases, verify their image provenance and Hyperlight support,
+then update `upstream/pins.env` and `go.mod`'s `github.com/Azure/fiberd` together.
 
 ## Preview images
 
@@ -241,8 +241,6 @@ The workflow publishes these canonical GHCR image tags, where
 - `ghcr.io/hyperlight-dev/lampyr/azure-node-setup:preview-<full-release-commit>`
 - `ghcr.io/hyperlight-dev/lampyr/eventgrid-controller:preview-<full-release-commit>`
 - `ghcr.io/hyperlight-dev/lampyr/eventgrid-adapter:preview-<full-release-commit>`
-- `ghcr.io/hyperlight-dev/lampyr/upstream-fiberd:preview-<full-release-commit>`
-- `ghcr.io/hyperlight-dev/lampyr/fiberd-k8s-controller:preview-<full-release-commit>`
 
 The workflow also updates `:preview` convenience aliases. Those aliases move
 and are not the consistency boundary for a release, so do not use them for
@@ -256,9 +254,8 @@ checksummed and attested release asset; it similarly checks strict SHA-256 files
 and exact-commit GitHub attestations for the CLI and platform archives before
 installation.
 
-To consume the images from another registry, authenticate `gh` for
-attestations, authenticate Docker to the destination registry, and use Docker
-Buildx:
+To consume the images from another registry, install `jq`, authenticate `gh`
+for attestations, and authenticate Docker to the destination registry. Use Docker Buildx:
 
 ```bash
 gh auth status --hostname github.com
@@ -270,12 +267,12 @@ docker login REGISTRY
 just preview-mirror-images destination=REGISTRY/lampyr
 ```
 
-The mirror resolves the commit behind `preview-release`, selects all eight
+The mirror resolves the commit behind `preview-release`, selects all six
 canonical `preview-<full-release-commit>` tags automatically, and verifies
-every source digest's GitHub attestation before copying it. Those include the
-platform's default controller inputs, `upstream-fiberd`, `fiberd-k8s-controller`
-and `hluk-helper`. It also downloads the preview's Linux platform archive,
-verifies its attestation, and checks that every image its fiberd-k8s-controller
+every Lampyr source digest's GitHub attestation. It reads the upstream fiberd
+and controller digests from the verified Linux platform archive and verifies
+their attestations against the Azure release workflows before copying them.
+It checks that every image its fiberd-k8s-controller
 manifest pulls is one of the verified images. It then writes destination digest
 references to the Kind provider config at `build/preview-kind.yaml` and the
 Azure image-settings fragment at `build/preview-azure.yaml`, and the manifest,

@@ -5,9 +5,8 @@ repo-root := project-root / ".."
 pins := project-root / "pins.env"
 sources := repo-root / "build/upstream"
 
-# Neither fiberd nor fiberd-k8s-controller publishes images or an install
-# manifest yet, so Lampyr builds them from the commits pins.env pins. The
-# sources are checked out under build/upstream.
+# Sources supply the template tools and the controller install manifest.
+# Images come from the signed upstream releases in pins.env.
 
 # Check out the pinned fiberd or fiberd-k8s-controller under build/upstream.
 [positional-arguments]
@@ -28,17 +27,17 @@ source name:
     git -C "$checkout" -c advice.detachedHead=false checkout --quiet FETCH_HEAD; \
     [[ $(git -C "$checkout" rev-parse HEAD) == "$commit" ]]
 
-# The upstream-fiberd image is fiberd's own docker/fiberd build, so its
-# context is the checkout. Its VERSION build arg is what fiberd -version
-# prints: go.mod's github.com/Azure/fiberd, the pseudo-version of the
-# pinned commit, which the release tests keep on FIBERD_COMMIT.
-
-# Print the version the upstream-fiberd image is built as.
-fiberd-version:
-    @awk '$1 == "github.com/Azure/fiberd" {print $2; found=1} END {exit !found}' "{{repo-root}}/go.mod"
-
-# Check out the source the upstream-fiberd image builds from.
-prepare-fiberd-image: (source "fiberd")
+# Verify the signed image digests against their release source commits.
+verify-images:
+    . "{{pins}}"; \
+    gh attestation verify "oci://$FIBERD_IMAGE" \
+      --repo "$FIBERD_REPOSITORY" \
+      --signer-workflow "$FIBERD_REPOSITORY/.github/workflows/release.yml" \
+      --source-digest "$FIBERD_COMMIT" --deny-self-hosted-runners; \
+    gh attestation verify "oci://$CONTROLLER_IMAGE" \
+      --repo "$CONTROLLER_REPOSITORY" \
+      --signer-workflow "$CONTROLLER_REPOSITORY/.github/workflows/release.yml" \
+      --source-digest "$CONTROLLER_COMMIT" --deny-self-hosted-runners
 
 # ly deploy runs zygotectl and grant-issuer on the user's machine, so a
 # platform package carries them built for its own target, from the pinned
@@ -55,17 +54,6 @@ template-tools: (source "fiberd")
           -trimpath -ldflags="-s -w -buildid=" -o "$out/$tool" "./cmd/$tool"; \
       done; \
     done
-
-# The controller's go.mod may ask for a newer Go than Lampyr's, which
-# GOTOOLCHAIN=auto fetches. actions/setup-go exports GOTOOLCHAIN=local, so
-# the recipe sets auto for its own go build.
-
-# Prepare the Linux/amd64 fiberd-k8s-controller image context without publishing it.
-prepare-controller-image: (source "fiberd-k8s-controller")
-    mkdir -p "{{repo-root}}/build"
-    GOTOOLCHAIN=auto GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go -C "{{sources}}/fiberd-k8s-controller" build \
-      -trimpath -ldflags="-s -w -buildid=" -o "{{repo-root}}/build/fiberd-k8s-controller" ./cmd/fiberd-k8s-controller
-    python3 "{{repo-root}}/scripts/check_preview_images.py" --root "{{repo-root}}" --image fiberd-k8s-controller --require-binaries
 
 # The controller's install manifest is its config/default: the CRDs, RBAC,
 # fiberd CA, admission policies and the Deployment, which runs `image`.
@@ -96,7 +84,7 @@ controller-manifest image output: (source "fiberd-k8s-controller")
 
 # Write the controller inputs a platform package installs by default.
 [positional-arguments]
-controller-inputs controller-image grant-image helper-image:
+controller-inputs controller-image grant-image helper-image: verify-images
     for image in "$1" "$2" "$3"; do \
       [[ $image =~ ^[^@[:space:]]+@sha256:[0-9a-f]{64}$ ]] || { echo "not pinned by a sha256 digest: $image" >&2; exit 1; }; \
     done
@@ -106,7 +94,7 @@ controller-inputs controller-image grant-image helper-image:
       > "{{repo-root}}/build/controller-inputs.json"
 
 # The cluster suites take this directory as LAMPYR_CLUSTER_INPUTS in place
-# of published inputs: the upstream-fiberd and helper images as OCI layouts
+# of published inputs: the upstream fiberd and helper images as OCI layouts
 # a suite pushes to its registry, the controller image as a Docker archive
 # its provider loads, the manifest running it, and the helper, zygotectl
 # and grant-issuer that ly build and ly deploy seal templates with.
@@ -120,8 +108,9 @@ controller-inputs controller-image grant-image helper-image:
 # Build the cluster suites' controller inputs into `output`.
 [no-cd]
 [positional-arguments]
-cluster-inputs output: prepare-fiberd-image prepare-controller-image
+cluster-inputs output: verify-images (source "fiberd")
     just --justfile "{{repo-root}}/Justfile" fiberd-template-tools "{{sources}}/fiberd"
+    just --justfile "{{repo-root}}/Justfile" providers::install-oras
     . "{{pins}}"; \
     name=$(basename -- "$1"); \
     [[ $name != . && $name != .. && $name != / ]] || { \
@@ -139,19 +128,15 @@ cluster-inputs output: prepare-fiberd-image prepare-controller-image
     trap 'rm -rf -- "$staging"' EXIT; \
     chmod 0755 "$staging"; \
     mkdir -p "$staging/images" "$staging/bin"; \
-    fiberd_version=$(just --justfile "{{project-root}}/Justfile" fiberd-version); \
-    [[ -n $fiberd_version ]] || { echo "fiberd-version printed nothing" >&2; exit 1; }; \
     controller="lampyr.local/fiberd-k8s-controller:${CONTROLLER_COMMIT:0:12}"; \
-    docker buildx build --platform linux/amd64 --provenance=false --tag "$controller" \
-      --output "type=docker,dest=$staging/images/fiberd-k8s-controller.tar" \
-      --file "{{project-root}}/controller.Dockerfile" "{{repo-root}}"; \
+    docker pull --platform linux/amd64 "$CONTROLLER_IMAGE"; \
+    docker tag "$CONTROLLER_IMAGE" "$controller"; \
+    docker save --output "$staging/images/fiberd-k8s-controller.tar" "$controller"; \
     docker buildx build --platform linux/amd64 --provenance=false \
       --output "type=oci,dest=$staging/images/hluk-helper,tar=false" \
       --file "{{repo-root}}/helper/ci.Dockerfile" "{{repo-root}}"; \
-    docker buildx build --platform linux/amd64 --provenance=false --target fiberd \
-      --build-arg "VERSION=$fiberd_version" \
-      --output "type=oci,dest=$staging/images/upstream-fiberd,tar=false" \
-      --file "{{sources}}/fiberd/docker/fiberd/Dockerfile" "{{sources}}/fiberd"; \
+    "{{repo-root}}/build/tools/oras" cp --platform linux/amd64 --to-oci-layout \
+      "$FIBERD_IMAGE" "$staging/images/upstream-fiberd:ci"; \
     digest() { \
       jq -er '.manifests | select(length == 1) | .[0].digest | select(test("^sha256:[0-9a-f]{64}$"))' \
         "$staging/images/$1/index.json"; \

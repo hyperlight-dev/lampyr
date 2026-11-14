@@ -85,7 +85,7 @@ build-dev-supervisor:
 build-eventgrid: azure::build-eventgrid
 
 # Prepare every Linux/amd64 preview image context without publishing it.
-prepare-preview-images: prepare-fiberd-image prepare-fiber-router-image helper::prepare-image upstream::prepare-fiberd-image upstream::prepare-controller-image azure::prepare-preview-images
+prepare-preview-images: prepare-fiberd-image prepare-fiber-router-image helper::prepare-image azure::prepare-preview-images
     python3 "{{repo-root}}/scripts/check_preview_images.py" --root "{{repo-root}}" --require-binaries
 
 # Package all preview release assets, including the verified installer entrypoint.

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 
-# Shared by the cluster integration suites. fiberd-k8s-controller has no
-# release yet, so its manifest, the stock fiberd image grant Pods run and
-# Lampyr's helper image are installation inputs, as for ly cluster install:
+# Shared by the cluster integration suites. The controller manifest, the
+# upstream fiberd image and Lampyr's helper image are installation inputs,
+# as for ly cluster install:
 #
 #   LAMPYR_CONTROLLER_MANIFEST  the controller's install manifest, a path or
 #                               an https:// URL

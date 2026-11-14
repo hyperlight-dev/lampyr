@@ -7,7 +7,7 @@ toolchain go1.26.7
 require (
 	github.com/Azure/azure-sdk-for-go/sdk/azcore v1.23.3
 	github.com/Azure/azure-sdk-for-go/sdk/azidentity v1.15.0
-	github.com/Azure/fiberd v0.2.1-0.20261106172642-549f6168ca09
+	github.com/Azure/fiberd v0.4.0
 	github.com/cert-manager/cert-manager v1.16.3
 	github.com/gorilla/websocket v1.5.4-0.20250319132907-e064f32e3674
 	github.com/prometheus/client_golang v1.25.0

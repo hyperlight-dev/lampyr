@@ -308,7 +308,7 @@ class PackagingTests(unittest.TestCase):
             manifest.write_text("kind: Deployment\n")
             valid = {
                 "controllerManifest": "build/fiberd-k8s-controller.yaml",
-                "grantImage": f"ghcr.io/hyperlight-dev/lampyr/upstream-fiberd@{digest}",
+                "grantImage": f"ghcr.io/azure/fiberd@{digest}",
                 "helperImage": f"ghcr.io/hyperlight-dev/lampyr/hluk-helper@{digest}",
             }
             inputs.write_text(json.dumps(valid))
