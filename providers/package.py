@@ -13,6 +13,7 @@ import subprocess
 import sys
 
 from permissions import others_can_write
+import snapshot_oci
 
 
 def file_digest(path):
@@ -151,6 +152,12 @@ def main():
     shutil.copyfile(project / "provider.py", output / "provider.py")
     manifest["rootfs"] = file_digest(output / "rootfs.cpio")
     manifest["program"] = file_digest(output / "provider.py")
+    if args.kernel is not None:
+        shutil.copyfile(args.kernel, output / "kernel")
+        restrict_artifact_permissions(output, allow_stale_snapshot_symlinks=True)
+        manifest["kernel"] = file_digest(output / "kernel")
+    else:
+        manifest["kernel"] = None
     if args.cold_os is None:
         manifest.pop("coldCompatibility", None)
     else:
@@ -188,13 +195,15 @@ def main():
             command.extend([
                 "--rootfs",
                 str(output / "rootfs.cpio"),
+                "--program",
+                str(output / "provider.py"),
                 "--memory-mib",
                 str(manifest["memoryMiB"]),
                 "--output",
                 str(output / "snapshot"),
             ])
             if args.kernel is not None:
-                command.extend(["--kernel", str(args.kernel.resolve(strict=True))])
+                command.extend(["--kernel", str(output / "kernel")])
             subprocess.run(command, check=True)
             restrict_artifact_permissions(output)
             snapshot_directory = output / "snapshot"
@@ -206,15 +215,12 @@ def main():
                 f"provider snapshot not generated: {reason}; using cold-boot fallback",
                 file=sys.stderr,
             )
-    if args.kernel is not None:
-        shutil.copyfile(args.kernel, output / "kernel")
-        manifest["kernel"] = file_digest(output / "kernel")
-    else:
-        manifest["kernel"] = None
     temporary = output / ".manifest.json"
     temporary.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     temporary.replace(output / "manifest.json")
     restrict_artifact_permissions(output)
+    if manifest.get("snapshotIndex") is not None:
+        snapshot_oci.layout_files(output, all_assets=True)
     print(f"packaged {manifest['id']} {manifest['version']}: {output}")
 
 

@@ -576,6 +576,18 @@ fn fixture() -> Fixture {
             "dev.hyperlight.snapshot.cpu.vendor".into(),
             "GenuineIntel".into(),
         ),
+        (
+            "dev.lampyr.provider.rootfs.sha256".into(),
+            hex(&Sha256::digest(b"rootfs")),
+        ),
+        (
+            "dev.lampyr.provider.program.sha256".into(),
+            hex(&Sha256::digest(b"# provider")),
+        ),
+        (
+            "dev.lampyr.provider.kernel.sha256".into(),
+            crate::assets::embedded_kernel_sha256(&host().architecture).unwrap(),
+        ),
     ]);
     let index = serde_json::to_vec(&SnapshotIndex {
         schema_version: 2,
@@ -919,6 +931,53 @@ fn pulls_verified_layout_and_startup_consumes_it_offline() {
         Artifact::load_for_host_with_registry(source.path(), "test", &host(), Some(&registry))
             .is_err()
     );
+}
+
+#[test]
+fn provider_input_mismatch_from_registry_is_not_a_cold_boot_or_a_layer_download() {
+    for field in ["rootfs", "program", "kernel"] {
+        let mut fixture = fixture();
+        let original_route = format!("/v2/provider/test/manifests/{}", fixture.digest);
+        let mut index: SnapshotIndex =
+            serde_json::from_slice(&fixture.routes.remove(&original_route).unwrap()).unwrap();
+        index.manifests[0].annotations.insert(
+            format!("dev.lampyr.provider.{field}.sha256"),
+            "0".repeat(64),
+        );
+        let bytes = serde_json::to_vec(&index).unwrap();
+        fixture.digest = descriptor(&bytes, INDEX).digest;
+        let index_route = format!("/v2/provider/test/manifests/{}", fixture.digest);
+        fixture.routes.insert(index_route.clone(), bytes);
+        let digest = fixture.digest.clone();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let requests = calls.clone();
+        let mock = Mock::new(move |request| {
+            requests.lock().unwrap().push(request.path.clone());
+            Reply::new(200, fixture.routes[&request.path].clone())
+        });
+        let source = tempfile::tempdir().unwrap();
+        artifact(source.path(), &digest);
+        let cache = tempfile::tempdir().unwrap();
+        let registry = client(&mock, cache.path());
+        let error =
+            Artifact::load_for_host_with_registry(source.path(), "test", &host(), Some(&registry))
+                .err()
+                .expect("registry input mismatch must not cold-boot");
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("snapshot {field} digest")),
+            "{error}"
+        );
+        assert!(!SnapshotRegistry::is_unavailable(&error));
+        let calls = calls.lock().unwrap();
+        assert!(calls.contains(&index_route));
+        assert!(
+            calls
+                .iter()
+                .all(|path| path == "/v2/" || path == &index_route)
+        );
+    }
 }
 
 #[test]

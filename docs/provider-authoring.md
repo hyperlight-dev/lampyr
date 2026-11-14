@@ -145,12 +145,11 @@ snapshot key.
 It also records the kernel and host-contract `SNAPSHOT_KEY`.
 If KVM is not accessible, the script creates an artifact without a snapshot.
 
-The CLI restores a supplied single snapshot only if its compatibility metadata
-matches the host.
+The CLI restores a supplied snapshot only if its compatibility metadata
+matches the host and its input digests match the provider artifact.
 The snapshot key must match the current kernel and host contract.
-It checks single snapshots without matching metadata but does not restore them.
-If the artifact has no snapshot, the CLI starts the guest from the root
-filesystem. This procedure is called a cold boot.
+If the artifact has no host-compatible snapshot, the CLI starts the guest from
+the root filesystem. This procedure is called a cold boot.
 
 `ly` uses installed cold-boot assets in place; it does not copy the rootfs or a
 custom kernel into a temporary directory. The artifact directory and its files
@@ -200,6 +199,29 @@ Host detection supports Linux/KVM on x86_64 and macOS/HVF on Apple Silicon.
 For multiple matches, the smallest digest wins; size breaks equal-digest ties.
 No match causes a cold boot. `snapshotIndex` takes precedence over `snapshot`.
 An invalid index or corrupt selected snapshot causes an error, not a cold boot.
+
+Each manifest descriptor must also record these capture-input annotations:
+
+| Annotation | Value |
+|---|---|
+| `dev.lampyr.provider.rootfs.sha256` | SHA-256 of the exact rootfs bytes. |
+| `dev.lampyr.provider.program.sha256` | SHA-256 of the exact provider program bytes. |
+| `dev.lampyr.provider.kernel.sha256` | SHA-256 of the custom kernel, or the native embedded kernel when `kernel` is absent. |
+
+Use 64 lowercase hexadecimal characters without a `sha256:` prefix.
+`providers/package.py --snapshot-mode variant` records these values through
+`provider-snapshot`. Recapture the variant when any input changes. Old variants
+without these values are not accepted. A missing or different input digest in
+the selected variant causes an error, not a cold boot.
+
+Assembly checks each variant against its source artifact. For a shared Linux
+and macOS index, set `coldCompatibility` on each source artifact. The rootfs
+and kernel must match the cold assets for that platform; the program must match
+for every platform. Assembly, binding, and platform packaging check these values
+when the local layout is present. Release jobs build and capture both platforms
+again, check the complete layouts, and then omit them from release archives.
+The full embedded-kernel hashes are pinned in `cli/src/embedded-kernels.json`
+from the checksum-locked runtime crate. Update these pins with the runtime.
 
 These compatibility labels are the minimum selection keys, not a substitute
 for Hyperlight's restore-time checks of snapshot internals and CPU features.

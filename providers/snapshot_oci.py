@@ -219,6 +219,40 @@ def cold_files(directory):
     return manifest, files
 
 
+def embedded_kernel_hash(architecture):
+    pins = read_json(Path(__file__).resolve().parents[1] / "cli/src/embedded-kernels.json")
+    if pins["runtimeVersion"] != RUNTIME_VERSION:
+        raise ValueError("embedded provider kernel hashes need updating for this runtime")
+    try:
+        return pins["kernels"][architecture]
+    except KeyError:
+        raise ValueError("snapshot architecture has no pinned embedded kernel") from None
+
+
+def snapshot_platform(annotations):
+    return {
+        "os": {"hvf": "macos", "whp": "windows"}.get(annotations[HYPERVISOR], "linux"),
+        "architecture": annotations[ARCH],
+    }
+
+
+def checked_snapshot_inputs(annotations, manifest, all_assets=False):
+    same_platform = (
+        all_assets or manifest.get("coldCompatibility") is None
+        or manifest["coldCompatibility"] == snapshot_platform(annotations)
+    )
+    for field in ("rootfs", "program", "kernel"):
+        actual = annotations.get(f"dev.lampyr.provider.{field}.sha256")
+        if not isinstance(actual, str) or not re.fullmatch(r"[0-9a-f]{64}", actual):
+            raise ValueError(f"snapshot {field} digest is missing or invalid; recapture the variant")
+        if field != "program" and not same_platform:
+            continue
+        expected = manifest.get(field)
+        expected_hash = expected["sha256"] if expected is not None else embedded_kernel_hash(annotations[ARCH])
+        if actual != expected_hash:
+            raise ValueError(f"snapshot {field} digest does not match the provider's cold-boot asset")
+
+
 def identity(manifest):
     return {key: value for key, value in manifest.items()
             if key not in ("rootfs", "kernel", "coldCompatibility",
@@ -361,6 +395,8 @@ def assemble(artifact, variants, output):
                 raise ValueError("at most 128 snapshot variants are supported")
             for native in index["manifests"]:
                 annotations = native["annotations"]
+                checked_snapshot_inputs(annotations, candidate, all_assets=True)
+                checked_snapshot_inputs(annotations, manifest)
                 key = tuple(annotations[name] for name in (ARCH, HYPERVISOR, CPU_VENDOR, REF_NAME))
                 if key in seen:
                     raise ValueError("duplicate snapshot compatibility tuple")
@@ -434,7 +470,7 @@ def checked_annotations(item):
     return annotations
 
 
-def layout_files(directory):
+def layout_files(directory, *, all_assets=False):
     """Validate all variants, not just the current host's selected variant."""
     manifest, files = cold_files(directory)
     index_path = checked_file(directory, manifest["snapshotIndex"], JSON_LIMIT)
@@ -481,6 +517,7 @@ def layout_files(directory):
             ("arch", ARCH), ("hypervisor", HYPERVISOR), ("cpu_vendor", CPU_VENDOR),
         )):
             raise ValueError("snapshot config does not match compatibility annotations")
+        checked_snapshot_inputs(annotations, manifest, all_assets=all_assets)
         # The layers' kinds and declared total are checked before any memory layer is hashed.
         *memory_layers, transport_layer = image["layers"]
         if (not all(isinstance(layer, dict) for layer in image["layers"])

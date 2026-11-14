@@ -10,7 +10,7 @@ use cap_std::fs::Dir;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::{FileDigest, open_artifact_file};
+use super::{FileDigest, Manifest, open_artifact_file};
 use crate::runtime::PAYLOAD_LIMIT;
 
 const INDEX: &str = "application/vnd.oci.image.index.v1+json";
@@ -114,7 +114,12 @@ fn native_compatibility() -> Option<(String, String)> {
 }
 
 impl SnapshotIndex {
-    pub fn select(&self, host: &HostCompatibility) -> Result<Option<&OciDescriptor>> {
+    /// Prefetch has no provider manifest, but still requires complete input bindings.
+    pub fn select(
+        &self,
+        host: &HostCompatibility,
+        provider: Option<&Manifest>,
+    ) -> Result<Option<&OciDescriptor>> {
         ensure!(
             self.schema_version == 2 && self.media_type == INDEX,
             "unsupported provider snapshot OCI index"
@@ -126,7 +131,7 @@ impl SnapshotIndex {
         let (Some(hypervisor), Some(vendor)) = (&host.hypervisor, &host.cpu_vendor) else {
             return Ok(None);
         };
-        Ok(self
+        let selected = self
             .manifests
             .iter()
             .filter(|descriptor| {
@@ -139,7 +144,11 @@ impl SnapshotIndex {
                             .is_some_and(|release| release.ends_with('-'))
                     })
             })
-            .min_by(|left, right| (&left.digest, left.size).cmp(&(&right.digest, right.size))))
+            .min_by(|left, right| (&left.digest, left.size).cmp(&(&right.digest, right.size)));
+        if let Some(selected) = selected {
+            selected.validate_inputs(provider, &host.architecture)?;
+        }
+        Ok(selected)
     }
 }
 
@@ -148,6 +157,7 @@ pub(super) fn select_layout(
     file: &FileDigest,
     host: &HostCompatibility,
     artifact_path: &Path,
+    provider: &Manifest,
 ) -> Result<Option<(PathBuf, String)>> {
     let (bytes, _) = read_verified(directory, file, PAYLOAD_LIMIT as u64, true)?;
     let index: SnapshotIndex =
@@ -159,7 +169,7 @@ pub(super) fn select_layout(
             .is_some_and(|name| name == "index.json"),
         "provider snapshot index must name a native OCI index.json"
     );
-    let Some(descriptor) = index.select(host)? else {
+    let Some(descriptor) = index.select(host, Some(provider))? else {
         return Ok(None);
     };
     let parent = index_path
@@ -275,6 +285,46 @@ impl SnapshotManifest {
 }
 
 impl OciDescriptor {
+    fn validate_inputs(&self, provider: Option<&Manifest>, architecture: &str) -> Result<()> {
+        let kernel = provider
+            .map(|provider| {
+                provider.kernel.as_ref().map_or_else(
+                    || crate::assets::embedded_kernel_sha256(architecture),
+                    |file| Ok(file.sha256.clone()),
+                )
+            })
+            .transpose()?;
+        for (field, expected) in [
+            (
+                "rootfs",
+                provider.map(|provider| provider.rootfs.sha256.as_str()),
+            ),
+            (
+                "program",
+                provider.map(|provider| provider.program.sha256.as_str()),
+            ),
+            ("kernel", kernel.as_deref()),
+        ] {
+            let actual = self
+                .annotations
+                .get(&format!("dev.lampyr.provider.{field}.sha256"));
+            ensure!(
+                actual.is_some_and(|hash| hash.len() == 64
+                    && hash
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))),
+                "selected provider snapshot {field} digest is missing or invalid; recapture the variant"
+            );
+            if let Some(expected) = expected {
+                ensure!(
+                    actual.map(String::as_str) == Some(expected),
+                    "selected provider snapshot {field} digest does not match the provider's cold-boot asset"
+                );
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn hash(&self, limit: u64) -> Result<&str> {
         let hash = self
             .digest
@@ -347,6 +397,72 @@ fn read_verified(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn selected_variant_bindings_are_required_and_checked_before_blob_loading() {
+        let host = HostCompatibility {
+            architecture: "x86_64".into(),
+            hypervisor: Some("kvm".into()),
+            cpu_vendor: Some("GenuineIntel".into()),
+        };
+        let provider: Manifest = serde_json::from_value(json!({
+            "protocolVersion": 1, "id": "test", "version": "1",
+            "runtimeVersion": crate::assets::VERSION, "memoryMiB": 256,
+            "rootfs": {"path": "rootfs.cpio", "sha256": "a".repeat(64)},
+            "program": {"path": "provider.py", "sha256": "b".repeat(64)},
+            "operations": {"describe": []},
+        }))
+        .unwrap();
+        let mut selected = layer(MANIFEST, 1);
+        selected.annotations = BTreeMap::from([
+            (ARCH.into(), host.architecture.clone()),
+            (HYPERVISOR.into(), "kvm".into()),
+            (CPU_VENDOR.into(), "GenuineIntel".into()),
+            (
+                REF_NAME.into(),
+                format!(
+                    "{}-{}",
+                    crate::assets::VERSION,
+                    hyperlight_unikraft::SNAPSHOT_KEY
+                ),
+            ),
+            (
+                "dev.lampyr.provider.rootfs.sha256".into(),
+                provider.rootfs.sha256.clone(),
+            ),
+            (
+                "dev.lampyr.provider.program.sha256".into(),
+                provider.program.sha256.clone(),
+            ),
+            (
+                "dev.lampyr.provider.kernel.sha256".into(),
+                crate::assets::embedded_kernel_sha256(&host.architecture).unwrap(),
+            ),
+        ]);
+        let index = SnapshotIndex {
+            schema_version: 2,
+            media_type: INDEX.into(),
+            manifests: vec![selected],
+        };
+        assert!(index.select(&host, Some(&provider)).unwrap().is_some());
+        for field in ["rootfs", "program", "kernel"] {
+            for value in [None, Some("c".repeat(64)), Some("SHA256:bad".into())] {
+                let mut invalid = index.clone();
+                let key = format!("dev.lampyr.provider.{field}.sha256");
+                if let Some(value) = value {
+                    invalid.manifests[0].annotations.insert(key, value);
+                } else {
+                    invalid.manifests[0].annotations.remove(&key);
+                }
+                let error = invalid.select(&host, Some(&provider)).unwrap_err();
+                assert!(error.to_string().contains(field), "{error}");
+                let mut other = host.clone();
+                other.cpu_vendor = Some("AuthenticAMD".into());
+                assert!(invalid.select(&other, Some(&provider)).unwrap().is_none());
+            }
+        }
+    }
 
     fn layer(media_type: &str, size: u64) -> OciDescriptor {
         OciDescriptor {

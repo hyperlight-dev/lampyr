@@ -1,0 +1,7 @@
+{
+  "runtimeVersion": "0.21.0",
+  "kernels": {
+    "x86_64": "fb05f5f9150b9c48de9c035b94eee0fa4c580bd5332586b48f0cee2e860cf861",
+    "aarch64": "097a8080d7532764d557526b5a5da536cbf5269d52cdb09b7664d53a285ca5be"
+  }
+}

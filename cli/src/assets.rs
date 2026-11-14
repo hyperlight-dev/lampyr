@@ -18,7 +18,33 @@ pub(crate) const UNIKRAFT_COMMIT: &str = "3b7cba8816c02a497e7b5aa9c901655784a010
 const RELEASE: &str =
     "https://github.com/hyperlight-dev/hyperlight-unikraft/releases/download/v0.21.0";
 const KERNEL: &str = "https://raw.githubusercontent.com/hyperlight-dev/hyperlight-unikraft/34c0d647a9f8679c0ce53b76e174894b2c5bfa7a/kernel/elfloader_hyperlight-x86_64";
-const KERNEL_HASH: &str = "fb05f5f9150b9c48de9c035b94eee0fa4c580bd5332586b48f0cee2e860cf861";
+
+/// Full hashes of the kernels in the checksum-locked hyperlight-unikraft crate.
+pub fn embedded_kernel_sha256(architecture: &str) -> Result<String> {
+    let pins: serde_json::Value = serde_json::from_str(include_str!("embedded-kernels.json"))?;
+    ensure!(
+        pins["runtimeVersion"] == VERSION,
+        "embedded provider kernel hashes need updating for runtime {VERSION}"
+    );
+    let hash = pins["kernels"][architecture]
+        .as_str()
+        .map(str::to_owned)
+        .context("provider snapshot has no pinned embedded kernel for its architecture")?;
+    ensure!(
+        hash.len() == 64
+            && hash
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "invalid pinned embedded provider kernel hash"
+    );
+    if architecture == std::env::consts::ARCH {
+        ensure!(
+            hyperlight_unikraft::SNAPSHOT_KEY.starts_with(&format!("k{}-c", &hash[..16])),
+            "embedded provider kernel hash does not match the runtime snapshot key"
+        );
+    }
+    Ok(hash)
+}
 
 struct Binary {
     target: &'static str,
@@ -115,16 +141,17 @@ pub fn setup(root: &Path, host: &Host) -> Result<()> {
         install_binary(&native, &native_path(root), host)?;
     }
     let kernel = root.join("build/kernel");
-    if !matches(&kernel, KERNEL_HASH)? {
+    let kernel_hash = embedded_kernel_sha256("x86_64")?;
+    if !matches(&kernel, &kernel_hash)? {
         let file = download(
             KERNEL,
             root.join("build").as_path(),
-            KERNEL_HASH,
+            &kernel_hash,
             128 << 20,
             Duration::from_secs(120),
             host,
         )?;
-        install(file.reopen()?, &kernel, KERNEL_HASH)?;
+        install(file.reopen()?, &kernel, &kernel_hash)?;
     }
     Ok(())
 }
