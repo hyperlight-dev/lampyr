@@ -199,6 +199,12 @@ if [[ "$suite" == "full" || "$suite" == "runtime" ]]; then
     rm -rf "$project/services/$service/.lampyr"
     sed -i 's/^    cpu: 250m$/    cpu: 10m/' "$project/services/$service/lampyr.yaml"
   done
+  if [[ "${LAMPYR_CI_WORKER_WORKSPACE:-0}" == 1 ]]; then
+    for service in api processor reused; do
+      cp -a "$repo_root/demos/local-worker-workspace/services/$service" \
+        "$project/services/worker-$service"
+    done
+  fi
   expose_workspace_services "$project"
   "$repo_root/build/ly" build "$project"
   phase_done "build runtime examples"
@@ -637,6 +643,26 @@ print(fiberd_grants.router_fibers_busy(sys.argv[2], sys.argv[3]))
 done
 }
 
+run_worker_workspace_checks() {
+  local service
+  for service in worker-processor worker-reused worker-api; do
+    current_service=$service
+    "$repo_root/build/ly" deploy --context "$context" \
+      --image "$images/$service:$tag" "$project/services/$service"
+  done
+  kubectl --context "$context" -n kourier-system get secret lampyr-kourier-tls \
+    -o 'jsonpath={.data.tls\.crt}' | base64 --decode > "$project/ingress-trust.pem"
+  SSL_CERT_FILE="$project/ingress-trust.pem" \
+    python3 "$repo_root/tests/contracts/test_worker_workspace.py" \
+      --url "https://127.0.0.1:$https_port" \
+      --host "worker-api.default.localhost:$https_port" \
+      --direct-services
+  for service in worker-api worker-processor worker-reused; do
+    "$repo_root/build/ly" delete --context "$context" "$project/services/$service"
+  done
+  phase_done "verify worker workspace through trusted HTTPS ingress"
+}
+
 run_runtime_mode_checks() {
 reuse_dir="$project/services/reuse-mode"
 mkdir -p "$reuse_dir"
@@ -809,6 +835,9 @@ fi
 
 if [[ "$suite" == "full" || "$suite" == "runtime" ]]; then
   run_runtime_checks
+  if [[ "${LAMPYR_CI_WORKER_WORKSPACE:-0}" == 1 ]]; then
+    run_worker_workspace_checks
+  fi
 fi
 
 if [[ "$runtime_extras" == 1 ]]; then

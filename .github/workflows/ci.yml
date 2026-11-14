@@ -757,6 +757,7 @@ jobs:
             eventing: "0"
             extras: "0"
             release_gates: "0"
+            worker_workspace: "1"
           - name: node-eventing
             suite: runtime
             examples: hello-nodejs
@@ -923,6 +924,7 @@ jobs:
           LAMPYR_CI_RUNTIME_EXTRAS: ${{ matrix.extras }}
           LAMPYR_CI_RELEASE_GATES: ${{ matrix.release_gates }}
           LAMPYR_CI_MODE_CHECKS: ${{ matrix.mode_checks || 'all' }}
+          LAMPYR_CI_WORKER_WORKSPACE: ${{ matrix.worker_workspace || '0' }}
           LAMPYR_CLUSTER_INPUTS: ${{ github.workspace }}/build/cluster-inputs
         run: just test-kind-runtime-integration-prebuilt
 

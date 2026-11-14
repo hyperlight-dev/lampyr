@@ -230,6 +230,12 @@ python3 tests/contracts/test_worker_workspace.py \
   --url https://YOUR_CLUSTER_INGRESS --host worker-api.default.YOUR_DOMAIN
 ```
 
+To also check processor and reused services through ingress, expose all three
+services in `ingress.services`, redeploy them, and add `--direct-services`.
+Each request uses its service hostname for TLS SNI, certificate checks, and
+HTTP Host. An optional hostname port stays in HTTP Host, not TLS SNI.
+`--url` sets the connection address and port; `--host` does not change them.
+
 Only for a test cluster with a self-signed certificate, add `--insecure`.
 The runner checks fresh state, bindings, event content, explicit reuse and
 idle reset, errors, streaming, and client cancellation. The unchanged runner
