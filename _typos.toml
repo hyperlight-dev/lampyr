@@ -5,7 +5,7 @@ aks = "aks"
 xdescribe = "xdescribe"
 
 [files]
-extend-exclude = ["deps/"]
+extend-exclude = ["deps/", "k8s/upstream/*.yaml"]
 
 [type.patch]
 extend-glob = ["*.patch"]
