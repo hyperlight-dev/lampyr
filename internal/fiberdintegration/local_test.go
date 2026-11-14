@@ -71,6 +71,57 @@ func TestLocalBindingRequiresCapabilityBeforeAcquiringFiber(t *testing.T) {
 	}
 }
 
+func TestLocalBindingFollowsRelativeRedirects(t *testing.T) {
+	const capability = "/_lampyr/private"
+	for _, test := range []struct {
+		name     string
+		path     string
+		location string
+		target   string
+	}{
+		{name: "exact binding URL", path: "", location: "next", target: "/next"},
+		{name: "nested binding path", path: "/nested", location: "../target", target: "/target"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			router, client, route := routerFixture(t, project.ExecutionFresh)
+			client.handler = http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+				if request.URL.Path == test.target {
+					fmt.Fprint(w, "reached "+request.URL.Path)
+					return
+				}
+				start := test.path
+				if start == "" {
+					start = "/"
+				}
+				if request.URL.Path != start {
+					http.NotFound(w, request)
+					return
+				}
+				w.Header().Set("Location", test.location)
+				w.WriteHeader(http.StatusFound)
+			})
+			server := httptest.NewServer(localHandler(router, route.Revision, capability))
+			defer server.Close()
+			httpClient := server.Client()
+			httpClient.Timeout = 5 * time.Second
+			response, err := httpClient.Get(server.URL + capability + test.path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer response.Body.Close()
+			body, err := io.ReadAll(response.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if response.StatusCode != http.StatusOK || string(body) != "reached "+test.target ||
+				response.Request.URL.Path != capability+test.target {
+				t.Fatalf("followed %q redirect: status=%d URL=%s body=%q",
+					test.location, response.StatusCode, response.Request.URL, body)
+			}
+		})
+	}
+}
+
 func TestLocalIngressOnlyExposesDeclaredHostnames(t *testing.T) {
 	router, client, route := routerFixture(t, project.ExecutionFresh)
 	handler := localIngressHandler(router, map[string]string{"demo.default.localhost": route.Revision}, "8080")
