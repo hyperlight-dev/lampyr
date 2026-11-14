@@ -4,10 +4,12 @@
 package fiberdintegration
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -413,6 +415,194 @@ func TestRevisionReloadUpdatesReuseIdleTimeout(t *testing.T) {
 	if len(client.released) != 1 {
 		t.Fatal("reloaded idle timeout was not enforced")
 	}
+}
+
+func writeReloadRoute(t *testing.T, dir, name string, revision RevisionRoute) {
+	t.Helper()
+	data, err := json.Marshal(revision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, name), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func checkReloadReadiness(t *testing.T, router *Router, revision RevisionRoute, want int) {
+	t.Helper()
+	query := url.Values{
+		"namespace": {revision.Namespace},
+		"revision":  {revision.Revision},
+		"version":   {revision.Version()},
+	}
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, httptest.NewRequest("GET", "http://fiber-router/readyz?"+query.Encode(), nil))
+	if response.Code != want {
+		t.Fatalf("readiness for %s/%s at %s = %d, want %d",
+			revision.Namespace, revision.Revision, revision.Version(), response.Code, want)
+	}
+}
+
+func TestRevisionReloadSkipsInvalidFiles(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		data       string
+		directory  bool
+		diagnostic string
+	}{
+		{name: "malformed-json", data: "{", diagnostic: "decode route metadata"},
+		{name: "legacy", data: `{"host":"demo.default.localhost"}`, diagnostic: "not a Revision"},
+		{name: "invalid-field-type", data: `{"kind":"revision","routed":"yes"}`, diagnostic: "decode Revision route"},
+		{name: "invalid-policy", data: `{"kind":"revision","namespace":"default","revision":"bad","execution":{"mode":"invalid"},"timeout":"30s"}`, diagnostic: "Revision route"},
+		{name: "invalid-timeout", data: `{"kind":"revision","namespace":"default","revision":"bad","execution":{"mode":"fresh-per-request"},"timeout":"0s"}`, diagnostic: "positive duration"},
+		{name: "unreadable-entry", directory: true, diagnostic: "read"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			router, _, revision := routerFixture(t, project.ExecutionFresh)
+			const name = "000-invalid.json"
+			path := filepath.Join(router.routesDir, name)
+			if test.directory {
+				if err := os.Mkdir(path, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := os.WriteFile(path, []byte(test.data), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			var diagnostics bytes.Buffer
+			previous := log.Writer()
+			log.SetOutput(&diagnostics)
+			t.Cleanup(func() { log.SetOutput(previous) })
+			if err := router.Reload(); err != nil {
+				t.Fatalf("invalid file blocked valid routes: %v", err)
+			}
+			checkReloadReadiness(t, router, revision, http.StatusOK)
+			if len(router.revisions) != 1 {
+				t.Fatalf("loaded %d routes, want only the valid route", len(router.revisions))
+			}
+			if text := diagnostics.String(); !strings.Contains(text, name) || !strings.Contains(text, test.diagnostic) {
+				t.Fatalf("missing file and cause in diagnostics: %q", text)
+			}
+			started, err := NewRouter(testHomeResolver{client: &testFiberClient{}}, router.routesDir)
+			if err != nil {
+				t.Fatalf("invalid file prevented router startup: %v", err)
+			}
+			defer started.Close()
+			checkReloadReadiness(t, started, revision, http.StatusOK)
+		})
+	}
+}
+
+func TestRevisionReloadUpdatesAndRemovesWithInvalidFile(t *testing.T) {
+	router, client, revision := routerFixture(t, project.ExecutionReuse)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, revisionRequest("GET", "/test", revision))
+	if response.Code != http.StatusOK {
+		t.Fatalf("initial request = %d", response.Code)
+	}
+	previous := revision
+	revision.Execution.IdleTimeout = "1s"
+	const originalFile = "revision-default--demo-1234.json"
+	writeReloadRoute(t, router.routesDir, originalFile, revision)
+	added := revision
+	added.Revision = "other-1234"
+	t.Cleanup(func() { forgetRevision(added.Namespace, added.Revision) })
+	writeReloadRoute(t, router.routesDir, "other.json", added)
+	if err := os.WriteFile(filepath.Join(router.routesDir, "000-invalid.json"), []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := router.Reload(); err != nil {
+		t.Fatalf("invalid file blocked update: %v", err)
+	}
+	checkReloadReadiness(t, router, previous, http.StatusServiceUnavailable)
+	checkReloadReadiness(t, router, revision, http.StatusOK)
+	checkReloadReadiness(t, router, added, http.StatusOK)
+	pool := router.pools["default--demo-1234"]
+	if pool == nil || pool.idle != time.Second {
+		t.Fatal("valid update did not change the retained pool's idle timeout")
+	}
+	response = httptest.NewRecorder()
+	router.ServeHTTP(response, revisionRequest("GET", "/test", added))
+	if response.Code != http.StatusOK {
+		t.Fatalf("added route request = %d", response.Code)
+	}
+	revision.Routed = false
+	writeReloadRoute(t, router.routesDir, originalFile, revision)
+	if err := router.Reload(); err != nil {
+		t.Fatalf("invalid file blocked routing-state update: %v", err)
+	}
+	router.releases.Wait()
+	if !slices.Equal(client.released, []string{"1"}) || len(router.pools) != 1 || router.pools["default--other-1234"] == nil {
+		t.Fatalf("routing-state update released %v, pools = %v", client.released, router.pools)
+	}
+	checkReloadReadiness(t, router, revision, http.StatusOK)
+	for _, name := range []string{originalFile, "other.json"} {
+		if err := os.Remove(filepath.Join(router.routesDir, name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := router.Reload(); err != nil {
+		t.Fatalf("invalid file blocked removal: %v", err)
+	}
+	router.releases.Wait()
+	if !slices.Equal(client.released, []string{"1", "2"}) || len(router.pools) != 0 {
+		t.Fatalf("removal released %v, pools = %v", client.released, router.pools)
+	}
+	checkReloadReadiness(t, router, revision, http.StatusServiceUnavailable)
+	checkReloadReadiness(t, router, added, http.StatusServiceUnavailable)
+}
+
+func TestRevisionReloadRejectsAllDuplicates(t *testing.T) {
+	router, client, revision := routerFixture(t, project.ExecutionReuse)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, revisionRequest("GET", "/test", revision))
+	if response.Code != http.StatusOK {
+		t.Fatalf("initial request = %d", response.Code)
+	}
+	other := revision
+	other.Revision = "other-1234"
+	t.Cleanup(func() { forgetRevision(other.Namespace, other.Revision) })
+	writeReloadRoute(t, router.routesDir, "other.json", other)
+	conflict := revision
+	conflict.Timeout = "1s"
+	writeReloadRoute(t, router.routesDir, "000-duplicate.json", conflict)
+	conflict.Timeout = "2s"
+	writeReloadRoute(t, router.routesDir, "zzz-duplicate.json", conflict)
+	var diagnostics bytes.Buffer
+	previous := log.Writer()
+	log.SetOutput(&diagnostics)
+	t.Cleanup(func() { log.SetOutput(previous) })
+	for range 2 {
+		if err := router.Reload(); err != nil {
+			t.Fatalf("duplicate identity blocked unrelated route: %v", err)
+		}
+		checkReloadReadiness(t, router, other, http.StatusOK)
+		for _, timeout := range []string{"30s", "1s", "2s"} {
+			conflict.Timeout = timeout
+			checkReloadReadiness(t, router, conflict, http.StatusServiceUnavailable)
+		}
+		if len(router.revisions) != 1 {
+			t.Fatalf("loaded %d routes, want only the unambiguous route", len(router.revisions))
+		}
+	}
+	router.releases.Wait()
+	if !slices.Equal(client.released, []string{"1"}) {
+		t.Fatalf("ambiguous route retained its pool: releases = %v", client.released)
+	}
+	for _, want := range []string{"duplicate Revision route", "default/demo-1234", "000-duplicate.json", "revision-default--demo-1234.json", "zzz-duplicate.json"} {
+		if !strings.Contains(diagnostics.String(), want) {
+			t.Fatalf("missing %q in duplicate diagnostics: %q", want, diagnostics.String())
+		}
+	}
+	for _, name := range []string{"000-duplicate.json", "zzz-duplicate.json"} {
+		if err := os.Remove(filepath.Join(router.routesDir, name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := router.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	checkReloadReadiness(t, router, revision, http.StatusOK)
+	checkReloadReadiness(t, router, other, http.StatusOK)
 }
 
 func TestDomainMappingRestoresOriginalHost(t *testing.T) {
