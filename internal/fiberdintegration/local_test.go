@@ -122,6 +122,42 @@ func TestLocalBindingFollowsRelativeRedirects(t *testing.T) {
 	}
 }
 
+func TestLocalBindingRedirectReferences(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		path     string
+		location string
+		want     string
+	}{
+		{name: "escaped path", path: "/a%2Fb/start", location: "next%2Fpart?q=hello%20world#section", want: "/_lampyr/private/a%2Fb/next%2Fpart?q=hello%20world#section"},
+		{name: "query only", path: "/nested/start?old=value", location: "?new=value", want: "/_lampyr/private/nested/start?new=value"},
+		{name: "fragment only", path: "/nested/start?old=value", location: "#section", want: "/_lampyr/private/nested/start?old=value#section"},
+		{name: "traverse above root", path: "/nested/start", location: "../../../target", want: "/_lampyr/private/target"},
+		{name: "root relative", path: "/start", location: "/target?q=value#section", want: "/_lampyr/private/target?q=value#section"},
+		{name: "external", path: "/start", location: "https://example.com/target", want: "https://example.com/target"},
+		{name: "protocol relative", path: "/start", location: "//example.com/target", want: "//example.com/target"},
+		{name: "non HTTP scheme", path: "/start", location: "mailto:test@example.com", want: "mailto:test@example.com"},
+		{name: "invalid reference", path: "/start", location: "%invalid", want: "%invalid"},
+		{name: "no location", path: "/start"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			router, client, route := routerFixture(t, project.ExecutionFresh)
+			client.handler = http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				if test.location != "" {
+					w.Header().Set("Location", test.location)
+				}
+				w.WriteHeader(http.StatusFound)
+			})
+			response := httptest.NewRecorder()
+			request := httptest.NewRequest("GET", "http://unknown/_lampyr/private"+test.path, nil)
+			localHandler(router, route.Revision, "/_lampyr/private").ServeHTTP(response, request)
+			if got := response.Result().Header.Get("Location"); got != test.want {
+				t.Fatalf("Location = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
 func TestLocalIngressOnlyExposesDeclaredHostnames(t *testing.T) {
 	router, client, route := routerFixture(t, project.ExecutionFresh)
 	handler := localIngressHandler(router, map[string]string{"demo.default.localhost": route.Revision}, "8080")

@@ -151,6 +151,10 @@ explicitly exposed service. This is development access control, not a production
 tenant isolation or network-policy equivalence claim. Host-IP allowlisting
 is coarser than per-port isolation.
 
+Local bindings keep the capability in root-relative and path-relative
+redirects. Path-relative redirects use the application request path, without
+the capability prefix. External and protocol-relative redirects do not change.
+
 Fresh-per-request is the default for HTTP and direct CloudEvents. Explicit
 `execution.mode: reuse` retains revision-scoped live state until
 `execution.idleTimeout`. Streams keep their Fiber until completion or client
