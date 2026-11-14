@@ -97,6 +97,101 @@ class SnapshotTests(unittest.TestCase):
     def assemble(self, variants=None):
         return oci.assemble(self.intel, [self.intel, self.amd, self.arm] if variants is None else variants, self.output)
 
+    def record_snapshot_inputs(self, directory):
+        manifest = oci.read_json(directory / "manifest.json")
+        index_path = directory / manifest["snapshotIndex"]["path"]
+        index = oci.read_json(index_path)
+        for item in index["manifests"]:
+            for field in ("rootfs", "program", "kernel"):
+                item["annotations"][f"dev.lampyr.provider.{field}.sha256"] = manifest[field]["sha256"]
+        index_path.write_bytes(oci.json_bytes(index))
+        manifest["snapshotIndex"]["sha256"] = oci.file_hash(index_path)
+        (directory / "manifest.json").write_text(json.dumps(manifest))
+
+    def test_layout_and_platform_packaging_reject_stale_snapshot_inputs(self):
+        for field in ("rootfs", "program", "kernel"):
+            with self.subTest(field=field):
+                root = self.root / f"stale-{field}"
+                directory = root / "providers/test/build/rootfs"
+                directory.parent.mkdir(parents=True)
+                shutil.copytree(self.intel, directory)
+                self.record_snapshot_inputs(directory)
+                manifest = oci.read_json(directory / "manifest.json")
+                path = directory / manifest[field]["path"]
+                path.write_bytes(b"changed cold asset")
+                manifest[field] = package.file_digest(path)
+                (directory / "manifest.json").write_text(json.dumps(manifest))
+                for name, check in (
+                    ("layout", lambda: oci.layout_files(directory)),
+                    ("platform package", lambda: platform_package["provider_files"](root, "test")),
+                ):
+                    with self.subTest(check=name):
+                        with self.assertRaisesRegex(ValueError, "snapshot.*(digest|asset|input)"):
+                            check()
+
+    def test_assembly_rejects_snapshot_captured_from_different_same_platform_assets(self):
+        for field in ("rootfs", "kernel"):
+            with self.subTest(field=field):
+                candidate = self.root / f"different-{field}"
+                shutil.copytree(self.intel, candidate)
+                manifest = oci.read_json(candidate / "manifest.json")
+                path = candidate / manifest[field]["path"]
+                path.write_bytes(b"different capture input")
+                manifest[field] = package.file_digest(path)
+                (candidate / "manifest.json").write_text(json.dumps(manifest))
+                self.record_snapshot_inputs(candidate)
+                with self.assertRaisesRegex(ValueError, "snapshot.*(digest|asset|input)"):
+                    oci.assemble(self.intel, [candidate], self.root / f"assembled-{field}")
+
+    def test_layout_and_platform_packaging_reject_missing_snapshot_inputs(self):
+        for missing in ("rootfs", "program", "kernel", "all"):
+            with self.subTest(missing=missing):
+                root = self.root / f"missing-{missing}"
+                directory = root / "providers/test/build/rootfs"
+                directory.parent.mkdir(parents=True)
+                shutil.copytree(self.intel, directory)
+                self.record_snapshot_inputs(directory)
+                manifest = oci.read_json(directory / "manifest.json")
+                index_path = directory / manifest["snapshotIndex"]["path"]
+                index = oci.read_json(index_path)
+                for item in index["manifests"]:
+                    for field in ("rootfs", "program", "kernel"):
+                        if missing in (field, "all"):
+                            item["annotations"].pop(f"dev.lampyr.provider.{field}.sha256")
+                index_path.write_bytes(oci.json_bytes(index))
+                manifest["snapshotIndex"]["sha256"] = oci.file_hash(index_path)
+                (directory / "manifest.json").write_text(json.dumps(manifest))
+                for name, check in (
+                    ("layout", lambda: oci.layout_files(directory)),
+                    ("platform package", lambda: platform_package["provider_files"](root, "test")),
+                ):
+                    with self.subTest(check=name):
+                        with self.assertRaisesRegex(ValueError, "snapshot.*(digest|asset|input)"):
+                            check()
+
+    def test_distinct_platform_assets_still_assemble_and_bind(self):
+        for directory, operating_system, architecture in (
+            (self.intel, "linux", "x86_64"),
+            (self.arm, "macos", "aarch64"),
+        ):
+            manifest = oci.read_json(directory / "manifest.json")
+            manifest["coldCompatibility"] = {"os": operating_system, "architecture": architecture}
+            for field in ("rootfs", "kernel"):
+                path = directory / manifest[field]["path"]
+                path.write_bytes(f"{architecture} {field}".encode())
+                manifest[field] = package.file_digest(path)
+            (directory / "manifest.json").write_text(json.dumps(manifest))
+            self.record_snapshot_inputs(directory)
+        oci.assemble(self.intel, [self.intel, self.arm], self.output)
+        bound = self.root / "bound-distinct-arm"
+        oci.bind(self.arm, self.output, "ghcr.io/example/snapshots", bound)
+        for directory in (self.output, bound):
+            manifest, _ = oci.layout_files(directory)
+            self.assertEqual(len(oci.read_json(directory / "index.json")["manifests"]), 2)
+            architecture = manifest["coldCompatibility"]["architecture"]
+            self.assertEqual((directory / "rootfs.cpio").read_bytes(),
+                             f"{architecture} rootfs".encode())
+
     def test_multi_platform_index_is_reproducible_and_digest_pinned(self):
         digest = self.assemble()
         second = self.root / "second"

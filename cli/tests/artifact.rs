@@ -236,6 +236,59 @@ fn indexed_snapshots_select_the_exact_compatible_variant_without_copying() {
 }
 
 #[test]
+fn selected_snapshot_requires_all_cold_asset_digests_to_match() {
+    for (field, missing) in [
+        ("rootfs", false),
+        ("program", false),
+        ("kernel", false),
+        ("rootfs", true),
+        ("program", true),
+        ("kernel", true),
+        ("all", true),
+    ] {
+        let (root, mut manifest) = artifact();
+        let kernel = digest("kernel", b"test kernel");
+        std::fs::write(root.path().join("kernel"), b"test kernel").unwrap();
+        manifest.kernel = Some(kernel.clone());
+        let mut selected = variant(&root, &host());
+        for (asset, sha256) in [
+            ("rootfs", &manifest.rootfs.sha256),
+            ("program", &manifest.program.sha256),
+            ("kernel", &kernel.sha256),
+        ] {
+            selected.annotations.insert(
+                format!("dev.lampyr.provider.{asset}.sha256"),
+                sha256.clone(),
+            );
+        }
+        save_index(&root, &mut manifest, vec![selected.clone()]);
+        let matched =
+            Artifact::load_for_host_with_registry(root.path(), "test", &host(), None).unwrap();
+        assert!(matched.snapshot.is_some());
+        if missing {
+            for asset in ["rootfs", "program", "kernel"] {
+                if field == "all" || field == asset {
+                    selected
+                        .annotations
+                        .remove(&format!("dev.lampyr.provider.{asset}.sha256"));
+                }
+            }
+        } else {
+            selected.annotations.insert(
+                format!("dev.lampyr.provider.{field}.sha256"),
+                "0".repeat(64),
+            );
+        }
+        save_index(&root, &mut manifest, vec![selected]);
+        let result = Artifact::load_for_host_with_registry(root.path(), "test", &host(), None);
+        assert!(
+            result.is_err(),
+            "selected snapshot with invalid {field} binding (missing: {missing}) was accepted"
+        );
+    }
+}
+
+#[test]
 fn incompatible_or_unknown_hosts_cold_boot_without_loading_any_snapshot() {
     let (root, mut manifest) = artifact();
     let intel = variant(&root, &host());
