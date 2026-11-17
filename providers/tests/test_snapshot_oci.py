@@ -1644,6 +1644,7 @@ class SnapshotTests(unittest.TestCase):
             path = root / relative
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(b"fixture")
+        shutil.copytree(PROVIDERS.parent / "k8s/upstream", root / "k8s/upstream")
         (root / "cli").mkdir()
         (root / "cli/Cargo.toml").write_text('[package]\nversion = "1.2.3"\n')
         header = bytearray(20)
