@@ -1628,10 +1628,7 @@ metadata: {name: lampyr-grant-homes, namespace: default}
             .chain(std::fs::read_dir(k8s.join("upstream")).unwrap())
         {
             let path = entry.unwrap().path();
-            if !path
-                .extension()
-                .is_some_and(|extension| extension == "yaml")
-            {
+            if path.extension().is_none_or(|extension| extension != "yaml") {
                 continue;
             }
             let source = std::fs::read_to_string(path).unwrap();
