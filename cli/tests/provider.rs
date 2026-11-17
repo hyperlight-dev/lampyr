@@ -127,13 +127,21 @@ fn exercise_provider_scaffolding(snapshot: bool) {
     let artifact = artifact(include_str!("fixtures/provider.py"));
     if snapshot {
         let layout = artifact.path().join("snapshot");
-        let mut guest =
-            hyperlight_unikraft::SandboxBuilder::from_initrd(artifact.path().join("rootfs.cpio"))
-                .scratch_mb(256)
-                .boot()
-                .unwrap();
-        guest.snapshot_to(&layout).unwrap();
-        drop(guest);
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_provider-snapshot"))
+            .arg("--rootfs")
+            .arg(artifact.path().join("rootfs.cpio"))
+            .arg("--program")
+            .arg(artifact.path().join("provider.py"))
+            .arg("--output")
+            .arg(&layout)
+            .args(["--memory-mib", "256"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         let mut manifest: Manifest =
             serde_json::from_slice(&std::fs::read(artifact.path().join("manifest.json")).unwrap())
                 .unwrap();
