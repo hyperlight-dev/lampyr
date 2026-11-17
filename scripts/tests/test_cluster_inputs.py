@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[2]
 UPSTREAM_JUSTFILE = ROOT / "upstream/Justfile"
 USE_CLUSTER_INPUTS = ROOT / "scripts/use-cluster-inputs.sh"
 DIGEST = "sha256:" + "ab" * 32
+CONTROLLER_PLATFORM_DIGEST = "sha256:" + "cd" * 32
 
 
 def recipe(name):
@@ -81,6 +82,10 @@ class ClusterInputsTests(unittest.TestCase):
                 oras.write_text(
                     '#!/bin/bash\nset -euo pipefail\n'
                     'printf "%s\\n" "$*" >> "$COMMANDS"\n'
+                    'if [[ $1 == resolve ]]; then\n'
+                    '  printf "%s\\n" "$CONTROLLER_PLATFORM_DIGEST"\n'
+                    '  exit 0\n'
+                    'fi\n'
                     'for destination; do :; done\n'
                     'path=${destination%:ci}; mkdir -p "$path"\n'
                     'printf \'{"manifests":[{"digest":"%s"}]}\' "$DIGEST" > "$path/index.json"\n'
@@ -99,6 +104,7 @@ class ClusterInputsTests(unittest.TestCase):
                 commands = work / "commands"
                 result = bash(
                     script, str(output), cwd=work, ROOT=str(work), DIGEST=DIGEST,
+                    CONTROLLER_PLATFORM_DIGEST=CONTROLLER_PLATFORM_DIGEST,
                     COMMANDS=str(commands), FAIL_PULL=fail,
                     PATH=f"{work / 'bin'}:{os.environ['PATH']}",
                 )
@@ -117,9 +123,20 @@ class ClusterInputsTests(unittest.TestCase):
                 self.assertTrue((output / "images/fiberd-k8s-controller.tar").is_file())
                 calls = commands.read_text().splitlines()
                 self.assertEqual(calls[0], (
-                    "pull --platform linux/amd64 "
+                    "resolve --platform linux/amd64 "
                     f"ghcr.io/azure/fiberd-k8s-controller@{DIGEST}"
                 ))
+                # Importers request all platforms. Pull and tag the child
+                # manifest, not an index whose other platforms are absent.
+                controller = (
+                    "ghcr.io/azure/fiberd-k8s-controller@"
+                    + CONTROLLER_PLATFORM_DIGEST
+                )
+                self.assertIn(f"pull --platform linux/amd64 {controller}", calls)
+                self.assertIn(
+                    f"tag {controller} lampyr.local/fiberd-k8s-controller:" + "1" * 12,
+                    calls,
+                )
                 builds = [line for line in calls if line.startswith("buildx build")]
                 self.assertEqual(len(builds), 1)
                 self.assertIn("helper/ci.Dockerfile", builds[0])
