@@ -106,6 +106,8 @@ controller-inputs controller-image grant-image helper-image: verify-images
 # the directory it points to, which would then be replaced.
 
 # Build the cluster suites' controller inputs into `output`.
+# Resolve the controller's platform manifest before Docker pulls it. A
+# partial multi-platform index fails Kind and k3d's all-platform imports.
 [no-cd]
 [positional-arguments]
 cluster-inputs output: verify-images (source "fiberd")
@@ -129,8 +131,10 @@ cluster-inputs output: verify-images (source "fiberd")
     chmod 0755 "$staging"; \
     mkdir -p "$staging/images" "$staging/bin"; \
     controller="lampyr.local/fiberd-k8s-controller:${CONTROLLER_COMMIT:0:12}"; \
-    docker pull --platform linux/amd64 "$CONTROLLER_IMAGE"; \
-    docker tag "$CONTROLLER_IMAGE" "$controller"; \
+    controller_digest=$("{{repo-root}}/build/tools/oras" resolve --platform linux/amd64 "$CONTROLLER_IMAGE"); \
+    controller_source="${CONTROLLER_IMAGE%@*}@$controller_digest"; \
+    docker pull --platform linux/amd64 "$controller_source"; \
+    docker tag "$controller_source" "$controller"; \
     docker save --output "$staging/images/fiberd-k8s-controller.tar" "$controller"; \
     docker buildx build --platform linux/amd64 --provenance=false \
       --output "type=oci,dest=$staging/images/hluk-helper,tar=false" \

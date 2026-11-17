@@ -864,10 +864,9 @@ fn install_controller(
         "fiberd-k8s-controller",
         "180s",
     )?;
-    // The policy admits the fiberd and helper images and the templates only
-    // from listed repositories, each in a list of its own, and the
-    // hyperlight runtime runs privileged, which it allows only in a listed
-    // namespace.
+    // The runtime ceiling admits only Hyperlight. No runtime is allowed by
+    // default; only the tenant namespace gets the Hyperlight exception.
+    // The pinned controller does not allow privileged grant Pods.
     let policy = json!({
         "apiVersion": "fiberd.io/v1alpha1", "kind": "GrantPolicy",
         "metadata": { "name": "default" },
@@ -876,10 +875,16 @@ fn install_controller(
             "helperImages": [image_repository("helperImage", options.helper_image)?],
             "registries": options.zygote_registries,
             "runtimes": ["hyperlight"],
-            "privilegedNamespaces": ["default"],
+            "defaultRuntimes": [],
         }
     });
     apply_recorded_manifest(kube, options.installation_id, &policy, inventory)?;
+    kube.patch(
+        "default",
+        "namespace",
+        "default",
+        &json!({ "metadata": { "labels": { "runtimes.fiberd.io/hyperlight": "true" } } }),
+    )?;
     let tenant = options.root.join("k8s/fiberd-tenant.yaml");
     apply_recorded_source(
         kube,
