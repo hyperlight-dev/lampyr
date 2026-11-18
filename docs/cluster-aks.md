@@ -16,10 +16,8 @@ Run this walkthrough from a Lampyr repository checkout. You need:
 - an Azure subscription where you can create resource groups, AKS, and related
   networking resources;
 - Docker, `kubectl` on `PATH`, `just`, and the repository build prerequisites;
-- local `/dev/kvm` access for the Azure provider and `ly dev`;
-- an OCI registry where you can push images and the cluster can pull them; and
-- a domain you control if you want normal public DNS instead of the temporary
-  `curl --resolve` test below.
+- local `/dev/kvm` access for the Azure provider and `ly dev`; and
+- an OCI registry where you can push images and the cluster can pull them.
 
 Lampyr publishes rolling preview infrastructure images to
 `ghcr.io/hyperlight-dev/lampyr`. Resolve each `:preview` tag to its digest
@@ -64,10 +62,9 @@ Set the values used throughout the walkthrough:
 ```bash
 export SUBSCRIPTION_ID=11111111-1111-1111-1111-111111111111
 export REGISTRY=docker.io/OWNER
-export DOMAIN=services.example.com
 ```
 
-Replace the example subscription, registry, and domain. Log in to the registry
+Replace the example subscription and registry. Log in to the registry
 with its normal Docker authentication flow before continuing. This example
 uses a repository named `lampyr-app` for the service image and one named
 `lampyr-templates` for its fiberd templates; create both as public
@@ -96,7 +93,6 @@ subscriptionId: $SUBSCRIPTION_ID
 fiberdImage: ghcr.io/hyperlight-dev/lampyr/fiberd:preview@sha256:FIBERD_DIGEST
 routerImage: ghcr.io/hyperlight-dev/lampyr/fiber-router:preview@sha256:ROUTER_DIGEST
 nodeSetupImage: ghcr.io/hyperlight-dev/lampyr/azure-node-setup:preview@sha256:NODE_SETUP_DIGEST
-domain: $DOMAIN
 authenticationMode: browser
 zygoteRegistries:
   - $REGISTRY/lampyr-templates
@@ -246,14 +242,13 @@ INGRESS_IP=$(
 printf '%s\n' "$INGRESS_IP"
 ```
 
-For normal public access, create a wildcard DNS record for
-`*.default.$DOMAIN` pointing to this address. Until DNS propagates, test the
-deployed route directly:
+Test the deployed route directly against the ingress address. Use the host
+name from the Service URL that `ly deploy` printed as the `Host` header:
 
 ```bash
 curl --fail --insecure \
-  --resolve "app.default.$DOMAIN:443:$INGRESS_IP" \
-  "https://app.default.$DOMAIN/test"
+  -H 'Host: HOST_FROM_SERVICE_URL' \
+  "https://$INGRESS_IP/test"
 ```
 
 The response is:
@@ -261,6 +256,9 @@ The response is:
 ```json
 {"message":"hello from Hyperlight edge","path":"/test"}
 ```
+
+To use a real domain later, set `domain` in `azure.yaml` and create a wildcard
+DNS record for `*.default.<domain>` pointing to the ingress address.
 
 The generated development certificate is self-signed, so this example uses
 `--insecure`. Replace it with production certificate management before serving
