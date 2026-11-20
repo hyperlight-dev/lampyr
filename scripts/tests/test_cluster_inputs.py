@@ -6,7 +6,9 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -33,6 +35,215 @@ def bash(script, *args, cwd=None, **env):
 
 
 class ClusterInputsTests(unittest.TestCase):
+    def test_release_asset_supports_gnu_and_bsd_checksum_tools(self):
+        body = recipe("release-asset")
+        payload = b"published release asset"
+        checksum = hashlib.sha256(payload).hexdigest()
+        for checksum_tool in ("sha256sum", "shasum", None):
+            with self.subTest(checksum_tool=checksum_tool), tempfile.TemporaryDirectory() as directory:
+                work = Path(directory)
+                bin_dir = work / "bin"
+                bin_dir.mkdir()
+                for command in ("awk", "bash", "basename", "dirname", "install", "mkdir", "mktemp", "rm"):
+                    target = shutil.which(command)
+                    self.assertIsNotNone(target, f"{command} is required by this test")
+                    (bin_dir / command).symlink_to(target)
+                source = work / "source"
+                source.write_bytes(payload)
+                output = work / "output"
+                curl = bin_dir / "curl"
+                curl.write_text(
+                    '#!/bin/bash\nset -euo pipefail\n'
+                    'while (($#)); do\n'
+                    '  if [[ $1 == --output ]]; then /bin/cp "$SOURCE" "$2"; exit 0; fi\n'
+                    '  shift\n'
+                    'done\n'
+                    'exit 90\n'
+                )
+                gh = bin_dir / "gh"
+                gh.write_text("#!/bin/bash\nexit 0\n")
+                commands = [curl, gh]
+                if checksum_tool is not None:
+                    checksum_command = bin_dir / checksum_tool
+                    checksum_command.write_text(
+                        f"#!{sys.executable}\n"
+                        "import hashlib, json, os, pathlib, sys\n"
+                        'expected = ["-a", "256"] if pathlib.Path(sys.argv[0]).name == "shasum" else []\n'
+                        "if sys.argv[1:-1] != expected:\n"
+                        "    raise SystemExit(64)\n"
+                        'pathlib.Path(os.environ["CHECKSUM_ARGS"]).write_text(json.dumps(sys.argv[1:]))\n'
+                        'path = pathlib.Path(sys.argv[-1])\n'
+                        'print(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path}")\n'
+                    )
+                    commands.append(checksum_command)
+                for command in commands:
+                    command.chmod(0o755)
+                checksum_args = work / "checksum-args"
+                result = bash(
+                    body,
+                    "Azure/fiberd",
+                    "1" * 40,
+                    "0.4.0",
+                    "fiberd.tar.gz",
+                    checksum,
+                    str(output),
+                    SOURCE=str(source),
+                    CHECKSUM_ARGS=str(checksum_args),
+                    PATH=str(bin_dir),
+                )
+                if checksum_tool is None:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("sha256sum or shasum is required", result.stderr)
+                    self.assertFalse(output.exists())
+                    continue
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(output.read_bytes(), payload)
+                args = json.loads(checksum_args.read_text())
+                expected_prefix = ["-a", "256"] if checksum_tool == "shasum" else []
+                self.assertEqual(args[:-1], expected_prefix)
+                self.assertTrue(args[-1].endswith("/fiberd.tar.gz"))
+
+    @unittest.skipIf(os.geteuid() == 0, "root can search an unsearchable output directory")
+    def test_release_asset_stops_when_output_parent_cannot_resolve(self):
+        body = recipe("release-asset")
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            locked = work / "locked"
+            locked.mkdir()
+            locked.chmod(0o600)
+            bin_dir = work / "bin"
+            bin_dir.mkdir()
+            mktemp_args = work / "mktemp-args"
+            safe_tmp = work / "safe-tmp"
+            for name, script in {
+                "mktemp": (
+                    '#!/bin/bash\nprintf "%s\\n" "$*" > "$MKTEMP_ARGS"\n'
+                    'mkdir -p "$SAFE_TMP"\nprintf "%s\\n" "$SAFE_TMP"\n'
+                ),
+                "curl": '#!/bin/bash\nexit 0\n',
+                "sha256sum": '#!/bin/bash\nprintf "%s  %s\\n" "$CHECKSUM" "$1"\n',
+                "gh": '#!/bin/bash\nexit 0\n',
+                "install": '#!/bin/bash\nexit 0\n',
+            }.items():
+                command = bin_dir / name
+                command.write_text(script)
+                command.chmod(0o755)
+            try:
+                result = bash(
+                    body,
+                    "Azure/fiberd",
+                    "1" * 40,
+                    "0.4.0",
+                    "fiberd.tar.gz",
+                    "0" * 64,
+                    str(locked / "output"),
+                    MKTEMP_ARGS=str(mktemp_args),
+                    SAFE_TMP=str(safe_tmp),
+                    CHECKSUM="0" * 64,
+                    PATH=f"{bin_dir}:{os.environ['PATH']}",
+                )
+            finally:
+                locked.chmod(0o700)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(mktemp_args.exists(), "recipe continued after output resolution failed")
+
+    def test_controller_manifest_rewrites_only_the_literal_pinned_image(self):
+        body = recipe("controller-manifest")
+        pinned = "ghcr.io/azure/fiberd-k8s-controller@sha256:" + "12" * 32
+        replacement = "lampyr.local/fiberd-k8s-controller:0123456789ab"
+        lookalike = pinned.replace("ghcr.io", "ghcrXio")
+        for name, source, expected, count in (
+            ("one match", f"image: {pinned}\nimage: {lookalike}\n",
+             f"image: {replacement}\nimage: {lookalike}\n", 1),
+            ("no matches", f"image: {lookalike}\n", None, 0),
+            ("two matches", f"image: {pinned}\nimage: {pinned}\n", None, 2),
+        ):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                work = Path(directory)
+                pins = work / "pins.env"
+                pins.write_text(
+                    "CONTROLLER_REPOSITORY=Azure/fiberd-k8s-controller\n"
+                    f"CONTROLLER_COMMIT={'1' * 40}\n"
+                    "CONTROLLER_VERSION=0.1.0\n"
+                    f"CONTROLLER_IMAGE={pinned}\n"
+                    f"CONTROLLER_MANIFEST_SHA256={'2' * 64}\n"
+                )
+                bin_dir = work / "bin"
+                bin_dir.mkdir()
+                just = bin_dir / "just"
+                just.write_text(
+                    '#!/bin/bash\nset -euo pipefail\n'
+                    'for output; do :; done\n'
+                    'cp "$SOURCE_MANIFEST" "$output"\n'
+                )
+                just.chmod(0o755)
+                source_manifest = work / "source.yaml"
+                source_manifest.write_text(source)
+                output = work / "output.yaml"
+                script = body.replace("{{ pins }}", str(pins))
+                script = script.replace("{{ project-root }}", str(work))
+                result = bash(
+                    script,
+                    replacement,
+                    str(output),
+                    SOURCE_MANIFEST=str(source_manifest),
+                    PATH=f"{bin_dir}:{os.environ['PATH']}",
+                )
+                if expected is None:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(f"names its pinned image {count} times", result.stderr)
+                    self.assertFalse(output.exists())
+                else:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(output.read_text(), expected)
+
+    def test_release_outputs_refuse_symbolic_links(self):
+        release_body = recipe("release-asset")
+        controller_body = recipe("controller-manifest")
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            target = work / "target"
+            target.write_text("unchanged")
+            output = work / "output"
+            output.symlink_to(target)
+            bin_dir = work / "bin"
+            bin_dir.mkdir()
+            called = work / "called"
+            for name in ("curl", "just"):
+                command = bin_dir / name
+                command.write_text(
+                    '#!/bin/bash\nprintf "%s\\n" "$0" >> "$CALLED"\nexit 90\n'
+                )
+                command.chmod(0o755)
+            pins = work / "pins.env"
+            pins.write_text("")
+            controller_script = controller_body.replace("{{ pins }}", str(pins))
+            controller_script = controller_script.replace("{{ project-root }}", str(work))
+            cases = (
+                (
+                    "release asset",
+                    release_body,
+                    ("Azure/fiberd", "1" * 40, "0.4.0", "fiberd.tar.gz", "2" * 64, str(output)),
+                ),
+                (
+                    "controller manifest",
+                    controller_script,
+                    ("lampyr.local/fiberd-k8s-controller:0123456789ab", str(output)),
+                ),
+            )
+            for name, script, args in cases:
+                with self.subTest(name=name):
+                    result = bash(
+                        script,
+                        *args,
+                        CALLED=str(called),
+                        PATH=f"{bin_dir}:{os.environ['PATH']}",
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("refusing symbolic link output", result.stderr)
+                    self.assertEqual(target.read_text(), "unchanged")
+                    self.assertFalse(called.exists())
+
     def test_release_asset_checks_checksum_and_attestation_before_replacement(self):
         body = recipe("release-asset")
         payload = b"published release asset"
@@ -237,7 +448,7 @@ class ClusterInputsTests(unittest.TestCase):
         # handling runs before the guard as it does in the recipe.
         guard = re.search(r"^ +([^\n]*\"\$1\".*?^ +fi;) \\$", body, re.M | re.S)
         self.assertIsNotNone(guard, "cluster-inputs no longer guards its output")
-        self.assertIn(".resolve()", guard.group(1), "cluster-inputs no longer resolves its output")
+        self.assertIn("pwd -P", guard.group(1), "cluster-inputs no longer resolves its output")
         script = re.sub(r" \\$", "", guard.group(1), flags=re.M)
         with tempfile.TemporaryDirectory() as work:
             work = Path(work)

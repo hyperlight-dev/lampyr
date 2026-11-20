@@ -929,6 +929,7 @@ class PreviewWorkflowPolicyTests(unittest.TestCase):
         self.assertNotIn("kubectl kustomize", upstream)
         self.assertNotIn("realpath -m", upstream)
         self.assertNotIn("hashlib.file_digest", upstream)
+        self.assertNotIn("python3 -c", upstream)
         self.assertNotIn('(upstream::source "fiberd")', root)
         for value in (
             "fiberd_${FIBERD_VERSION}_${os}_${arch}.tar.gz",
