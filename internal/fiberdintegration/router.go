@@ -826,7 +826,7 @@ func (router *Router) ServeHTTP(w http.ResponseWriter, request *http.Request) {
 		})
 	}()
 	received := time.Now()
-	var websocketStarted, websocketEnded time.Time
+	var websocketStarted time.Time
 	recorder.onSwitch = func() {
 		websocketStarted = time.Now()
 		metrics.record(func() {
@@ -837,14 +837,6 @@ func (router *Router) ServeHTTP(w http.ResponseWriter, request *http.Request) {
 		status := requestStatus(recorder, clientCtx, revisionCtx)
 		metrics.record(func() {
 			observeRequest(namespace, revision.Revision, status, received)
-			if recorder.switched {
-				websocketSessions.WithLabelValues(namespace, revision.Revision).Dec()
-				websocketSessionSeconds.WithLabelValues(
-					namespace,
-					revision.Revision,
-					websocketOutcome(recorder, revisionCtx),
-				).Observe(websocketEnded.Sub(websocketStarted).Seconds())
-			}
 		})
 		if router.observer != nil {
 			metric.Status = status
@@ -974,17 +966,25 @@ func (router *Router) ServeHTTP(w http.ResponseWriter, request *http.Request) {
 	// the request isn't recorded as its upstream status and the Fiber isn't
 	// pooled again, then let the server abort the connection.
 	defer func() {
+		if recorder.switched {
+			ended := time.Now()
+			metrics.record(func() {
+				websocketSessions.WithLabelValues(namespace, revision.Revision).Dec()
+				websocketSessionSeconds.WithLabelValues(
+					namespace,
+					revision.Revision,
+					websocketOutcome(recorder, revisionCtx),
+				).Observe(ended.Sub(websocketStarted).Seconds())
+			})
+		}
+	}()
+	defer func() {
 		if failure := recover(); failure != nil {
 			if failure == http.ErrAbortHandler {
 				gone = true
 				recorder.fail()
 			}
 			panic(failure)
-		}
-	}()
-	defer func() {
-		if recorder.switched {
-			websocketEnded = time.Now()
 		}
 	}()
 	proxy.ServeHTTP(w, request)
