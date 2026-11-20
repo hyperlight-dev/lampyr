@@ -18,9 +18,9 @@ import (
 	"fmt"
 	"io"
 	"math/big"
-	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -28,6 +28,7 @@ import (
 
 	"github.com/Azure/fiberd/pkg/tlsconf"
 	"github.com/google/go-containerregistry/pkg/name"
+	"github.com/hyperlight-dev/lampyr/internal/fiberdintegration"
 	"github.com/hyperlight-dev/lampyr/internal/project"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -36,6 +37,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/apimachinery/pkg/util/validation"
 	utilyaml "k8s.io/apimachinery/pkg/util/yaml"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
 	"k8s.io/client-go/kubernetes/fake"
@@ -806,6 +808,101 @@ func TestValidateRevisionRequiresFiberdTemplate(t *testing.T) {
 	}
 }
 
+func TestRevisionRouterMetadataKeepsCompoundIdentitiesDistinct(t *testing.T) {
+	ctx := context.Background()
+	client := fake.NewSimpleClientset(&corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "lampyr-routes", Namespace: systemNamespace},
+	})
+	reconciler := &Reconciler{kube: client}
+	revisions := []*servingv1.Revision{
+		{ObjectMeta: metav1.ObjectMeta{Namespace: "a--b", Name: "c"}},
+		{ObjectMeta: metav1.ObjectMeta{Namespace: "a", Name: "b--c"}},
+	}
+	spec := revisionSpec{execution: project.ExecutionPolicy{Mode: project.ExecutionFresh}, timeout: time.Second}
+	for _, revision := range revisions {
+		if _, err := reconciler.publishRevision(ctx, revision, spec); err != nil {
+			t.Fatal(err)
+		}
+		key := revisionMetadataKey(revision)
+		if errors := validation.IsConfigMapKey(key); len(errors) != 0 {
+			t.Errorf("route filename %q is not a valid ConfigMap key: %v", key, errors)
+		}
+	}
+	config, err := client.CoreV1().ConfigMaps(systemNamespace).Get(ctx, "lampyr-routes", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(config.Data) != 2 {
+		t.Fatalf("published %d route files, want 2 independent Revisions: %v", len(config.Data), config.Data)
+	}
+	if err := reconciler.FinalizeKind(ctx, revisions[0]); err != nil {
+		t.Fatal(err)
+	}
+	config, err = client.CoreV1().ConfigMaps(systemNamespace).Get(ctx, "lampyr-routes", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := config.Data[revisionMetadataKey(revisions[1])]; !exists {
+		t.Fatal("finalizing one Revision removed the other Revision's metadata")
+	}
+}
+
+func TestRevisionRouterMetadataMigratesLegacyFilename(t *testing.T) {
+	const legacyKey = "revision-a--b--c.json"
+	for _, operation := range []string{"publish", "republish", "finalize"} {
+		for _, legacy := range []struct {
+			name, document string
+			owned          bool
+		}{
+			{"matching", `{"kind":"revision","namespace":"a--b","revision":"c"}`, true},
+			{"colliding", `{"kind":"revision","namespace":"a","revision":"b--c"}`, false},
+			{"invalid", `not-json`, false},
+		} {
+			t.Run(operation+"/"+legacy.name, func(t *testing.T) {
+				ctx := context.Background()
+				client := fake.NewSimpleClientset(&corev1.ConfigMap{
+					ObjectMeta: metav1.ObjectMeta{Name: "lampyr-routes", Namespace: systemNamespace},
+					Data:       map[string]string{legacyKey: legacy.document},
+				})
+				reconciler := &Reconciler{kube: client}
+				revision := &servingv1.Revision{ObjectMeta: metav1.ObjectMeta{Namespace: "a--b", Name: "c"}}
+				spec := revisionSpec{execution: project.ExecutionPolicy{Mode: project.ExecutionFresh}, timeout: time.Second}
+				if operation == "republish" {
+					if _, err := reconciler.publishRevision(ctx, revision, spec); err != nil {
+						t.Fatal(err)
+					}
+					config, err := client.CoreV1().ConfigMaps(systemNamespace).Get(ctx, "lampyr-routes", metav1.GetOptions{})
+					if err != nil {
+						t.Fatal(err)
+					}
+					config.Data[legacyKey] = legacy.document
+					if _, err := client.CoreV1().ConfigMaps(systemNamespace).Update(ctx, config, metav1.UpdateOptions{}); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if operation != "finalize" {
+					if _, err := reconciler.publishRevision(ctx, revision, spec); err != nil {
+						t.Fatal(err)
+					}
+				} else if err := reconciler.FinalizeKind(ctx, revision); err != nil {
+					t.Fatal(err)
+				}
+				config, err := client.CoreV1().ConfigMaps(systemNamespace).Get(ctx, "lampyr-routes", metav1.GetOptions{})
+				if err != nil {
+					t.Fatal(err)
+				}
+				document, exists := config.Data[legacyKey]
+				if legacy.owned && exists {
+					t.Error("owned legacy filename survived migration")
+				}
+				if !legacy.owned && (!exists || document != legacy.document) {
+					t.Error("legacy metadata without a matching identity was changed")
+				}
+			})
+		}
+	}
+}
+
 func TestRevisionRouterMetadataLifecycle(t *testing.T) {
 	ctx := context.Background()
 	client := fake.NewSimpleClientset(&corev1.ConfigMap{
@@ -860,19 +957,29 @@ func TestRevisionRouterMetadataLifecycle(t *testing.T) {
 		!document.Routed {
 		t.Fatalf("router metadata = %#v", document)
 	}
-	router := httptest.NewServer(http.HandlerFunc(func(
-		response http.ResponseWriter,
-		request *http.Request,
-	) {
-		if request.URL.Query().Get("namespace") != revision.Namespace ||
-			request.URL.Query().Get("revision") != revision.Name ||
-			request.URL.Query().Get("version") != version {
-			http.Error(response, "unexpected projection", http.StatusServiceUnavailable)
-		}
-	}))
+	routes := t.TempDir()
+	legacyFile := filepath.Join(routes, "revision-default--demo-00001.json")
+	if err := os.WriteFile(legacyFile, []byte(config.Data[key]), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	consumer, err := fiberdintegration.NewRouter(&fiberdintegration.CallerGrants{}, routes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer consumer.Close()
+	router := httptest.NewServer(consumer)
 	defer router.Close()
 	reconciler.http = router.Client()
-	reconciler.router = router.URL
+	reconciler.router = router.URL + "/readyz"
+	if err := reconciler.waitForRouter(ctx, revision, version); err != nil {
+		t.Fatalf("legacy projection is not ready: %v", err)
+	}
+	if err := os.Rename(legacyFile, filepath.Join(routes, key)); err != nil {
+		t.Fatal(err)
+	}
+	if err := consumer.Reload(); err != nil {
+		t.Fatal(err)
+	}
 	if err := reconciler.waitForRouter(ctx, revision, version); err != nil {
 		t.Fatal(err)
 	}

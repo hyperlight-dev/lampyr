@@ -740,7 +740,7 @@ func TestAPooledSlotLetsItsPrunedConnectionCloseWhenItEnds(t *testing.T) {
 		t.Fatal("a prune closed the connection a pooled slot holds")
 	}
 	router.mu.RLock()
-	pool := router.pools["default--demo"]
+	pool := router.pools["default/demo"]
 	router.mu.RUnlock()
 	router.endPool(pool, true, time.Now())
 	router.releases.Wait()

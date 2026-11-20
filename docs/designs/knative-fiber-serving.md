@@ -92,6 +92,18 @@ fresh-per-request and reuse execution, request completion, streams,
 WebSockets, cancellation, and timeouts for the Revision already selected by
 Knative routing.
 
+### Revision route identities
+
+The router uses `namespace/revision` as its pool key. The controller writes
+`revision-<namespace>_<revision>.json` in the `lampyr-routes` ConfigMap.
+Kubernetes namespace and Revision names cannot contain an underscore.
+
+The router can still read the old filenames. When the controller publishes
+a route, it removes the old `--` filename only if its document identifies
+the same Revision. One ConfigMap update removes the old file and adds the
+new file. The readiness check still uses the namespace, Revision name,
+and document version. This change does not enable other namespaces.
+
 ## Revision backend feasibility gate
 
 The upstream Route reconciler routes each traffic target to a Kubernetes Service

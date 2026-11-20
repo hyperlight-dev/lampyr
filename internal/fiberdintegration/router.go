@@ -15,6 +15,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -257,9 +258,50 @@ func newH2CTransport() http.RoundTripper {
 }
 
 func (router *Router) Reload() error {
-	entries, err := os.ReadDir(router.routesDir)
+	return router.reload(os.ReadFile)
+}
+
+func (router *Router) reload(readFile func(string) ([]byte, error)) error {
+	for range 3 {
+		directory, generation, err := projectedRoutesDirectory(router.routesDir)
+		if err != nil {
+			return err
+		}
+		revisions, scanErr := readRevisionRoutes(directory, readFile)
+		_, current, err := projectedRoutesDirectory(router.routesDir)
+		if err != nil {
+			return err
+		}
+		if current != generation {
+			continue
+		}
+		if scanErr != nil {
+			return scanErr
+		}
+		router.applyRevisions(revisions)
+		return nil
+	}
+	return fmt.Errorf("route metadata projection changed during reload")
+}
+
+func projectedRoutesDirectory(routesDir string) (string, string, error) {
+	generation, err := os.Readlink(filepath.Join(routesDir, "..data"))
+	if errors.Is(err, os.ErrNotExist) {
+		return routesDir, "", nil
+	}
 	if err != nil {
-		return err
+		return "", "", fmt.Errorf("read route metadata projection: %w", err)
+	}
+	if generation == "" || filepath.IsAbs(generation) || filepath.Base(generation) != generation {
+		return "", "", fmt.Errorf("route metadata projection has invalid generation %q", generation)
+	}
+	return filepath.Join(routesDir, generation), generation, nil
+}
+
+func readRevisionRoutes(directory string, readFile func(string) ([]byte, error)) (map[string]RevisionRoute, error) {
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		return nil, err
 	}
 	revisions := map[string]RevisionRoute{}
 	sources := map[string]string{}
@@ -267,7 +309,7 @@ func (router *Router) Reload() error {
 		if !strings.HasSuffix(entry.Name(), ".json") {
 			continue
 		}
-		data, err := os.ReadFile(router.routesDir + "/" + entry.Name())
+		data, err := readFile(filepath.Join(directory, entry.Name()))
 		if err != nil {
 			log.Printf("read route metadata %s: %v", entry.Name(), err)
 			continue
@@ -303,16 +345,19 @@ func (router *Router) Reload() error {
 		sources[key] = entry.Name()
 		revisions[key] = revision
 	}
+	return revisions, nil
+}
+
+func (router *Router) applyRevisions(revisions map[string]RevisionRoute) {
 	retain := map[string]bool{}
 	routed := map[string]bool{}
 	idle := map[string]time.Duration{}
 	for key, revision := range revisions {
-		poolKey := revision.Namespace + "--" + revision.Revision
 		if revision.Routed {
-			retain[poolKey] = true
+			retain[key] = true
 			routed[key] = true
 			execution, _ := (project.Manifest{Execution: &revision.Execution}).EffectiveExecution()
-			idle[poolKey], _ = time.ParseDuration(execution.IdleTimeout)
+			idle[key], _ = time.ParseDuration(execution.IdleTimeout)
 		}
 	}
 	router.mu.Lock()
@@ -345,7 +390,6 @@ func (router *Router) Reload() error {
 		router.endPool(pool, true, time.Now())
 	}
 	router.homes.Retain(routed)
-	return nil
 }
 
 func (router *Router) Handler() http.Handler { return probe.NewHandler(router) }
@@ -621,7 +665,7 @@ func pause(request context.Context, deadline time.Time, d time.Duration) bool {
 // measures what is left of that from when the Clone arrives, so a slow
 // connect does not give the helper more time than the request has.
 func (router *Router) clone(request context.Context, deadline time.Time, whole bool, namespace, revision string, execution project.ExecutionPolicy, grant HomeGrant) (consumer.Fiber, func(bool), error) {
-	uid := namespace + "--" + revision
+	poolKey := namespace + "/" + revision
 	if execution.Mode == project.ExecutionFresh {
 		cloneCtx, cancel := context.WithDeadline(request, deadline)
 		fiber, err := grant.Client.Clone(cloneCtx, grant.Token, "", time.Until(deadline), nil)
@@ -642,10 +686,10 @@ func (router *Router) clone(request context.Context, deadline time.Time, whole b
 		return consumer.Fiber{}, nil, err
 	}
 	router.mu.Lock()
-	pool := router.pools[uid]
+	pool := router.pools[poolKey]
 	if pool == nil {
 		pool = &routerPool{idle: idle}
-		router.pools[uid] = pool
+		router.pools[poolKey] = pool
 	}
 	router.mu.Unlock()
 	pool.mu.Lock()
