@@ -5,7 +5,9 @@ package fiberdintegration
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -13,6 +15,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -23,6 +26,85 @@ import (
 	"github.com/hyperlight-dev/lampyr/internal/project"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 )
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (roundTrip roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return roundTrip(request)
+}
+
+type failedUpgradeBody struct{}
+
+func (*failedUpgradeBody) Read([]byte) (int, error) {
+	return 0, errors.New("upgraded backend read failed")
+}
+func (*failedUpgradeBody) Write(data []byte) (int, error) { return len(data), nil }
+func (*failedUpgradeBody) Close() error                   { return nil }
+
+type closedUpgradeBody struct{}
+
+func (*closedUpgradeBody) Read([]byte) (int, error)  { return 0, net.ErrClosed }
+func (*closedUpgradeBody) Write([]byte) (int, error) { return 0, io.ErrClosedPipe }
+func (*closedUpgradeBody) Close() error              { return nil }
+func (*closedUpgradeBody) CloseWrite() error         { return net.ErrClosed }
+
+type delayedFiberClient struct {
+	client       *testFiberClient
+	cloneDelay   time.Duration
+	releaseDelay time.Duration
+}
+
+type blockingReleaseFiberClient struct {
+	client  *testFiberClient
+	started chan struct{}
+	release chan struct{}
+}
+
+func (client blockingReleaseFiberClient) Clone(
+	ctx context.Context,
+	token, session string,
+	timeout time.Duration,
+	facts []byte,
+) (consumer.Fiber, error) {
+	return client.client.Clone(ctx, token, session, timeout, facts)
+}
+
+func (client blockingReleaseFiberClient) Release(ctx context.Context, id string, gone bool) error {
+	close(client.started)
+	<-client.release
+	return client.client.Release(ctx, id, gone)
+}
+
+func (client delayedFiberClient) Clone(
+	ctx context.Context,
+	token, session string,
+	timeout time.Duration,
+	facts []byte,
+) (consumer.Fiber, error) {
+	time.Sleep(client.cloneDelay)
+	return client.client.Clone(ctx, token, session, timeout, facts)
+}
+
+func (client delayedFiberClient) Release(ctx context.Context, id string, gone bool) error {
+	time.Sleep(client.releaseDelay)
+	return client.client.Release(ctx, id, gone)
+}
+
+func sampleValue(t *testing.T, body, prefix string) float64 {
+	t.Helper()
+	for line := range strings.Lines(body) {
+		if strings.HasPrefix(line, prefix) {
+			fields := strings.Fields(line)
+			value, err := strconv.ParseFloat(fields[len(fields)-1], 64)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return value
+		}
+	}
+	t.Fatalf("metric sample %q is missing:\n%s", prefix, body)
+	return 0
+}
 
 func namedRouter(t *testing.T, name, timeout, mode string) (*Router, *testFiberClient, RevisionRoute, string) {
 	routes := t.TempDir()
@@ -55,6 +137,262 @@ func serveRouter(router *Router, route RevisionRoute) *httptest.Server {
 		r.Header.Set("Knative-Serving-Revision", route.Revision)
 		router.ServeHTTP(w, r)
 	}))
+}
+
+func TestRouterMetricsClassifyUpgradedBackendCopyFailure(t *testing.T) {
+	router, _, route, _ := namedRouter(t, "ws-error-4444", "30s", project.ExecutionFresh)
+	router.transport = roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		return &http.Response{
+			Status:     "101 Switching Protocols",
+			StatusCode: http.StatusSwitchingProtocols,
+			Header: http.Header{
+				"Connection": {"Upgrade"},
+				"Upgrade":    {"websocket"},
+			},
+			Body:    &failedUpgradeBody{},
+			Request: request,
+		}, nil
+	})
+	server := serveRouter(router, route)
+	defer server.Close()
+	address := strings.TrimPrefix(server.URL, "http://")
+	connection, err := net.Dial("tcp", address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fmt.Fprintf(connection,
+		"GET /socket HTTP/1.1\r\nHost: fiber-router\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n")
+	status, err := bufio.NewReader(connection).ReadString('\n')
+	if err != nil || !strings.Contains(status, "101") {
+		t.Fatalf("upgrade status = %q, %v", status, err)
+	}
+	connection.Close()
+	deadline := time.Now().Add(time.Second)
+	prefix := `lampyr_router_websocket_session_duration_seconds_count{namespace="default",outcome="error",revision="` + route.Revision + `"} `
+	for !strings.Contains(scrape(), prefix+"1") && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if body := scrape(); !strings.Contains(body, prefix+"1") {
+		t.Fatalf("upgraded copy failure was not recorded as an error:\n%s", lines(body, route.Revision))
+	}
+}
+
+func TestRouterMetricsIgnoreProxyUpgradeCloseErrors(t *testing.T) {
+	recorder := &statusRecorder{ResponseWriter: httptest.NewRecorder()}
+	connection := recorder.observeUpgrade(&closedUpgradeBody{})
+	connection.Read(nil)
+	connection.Write(nil)
+	connection.(interface{ CloseWrite() error }).CloseWrite()
+	if recorder.failed.Load() {
+		t.Fatal("proxy teardown was classified as an upgraded backend failure")
+	}
+}
+
+func TestRouterMetricsMeasureOnlyWebSocketSession(t *testing.T) {
+	const delay = 150 * time.Millisecond
+	routes := t.TempDir()
+	route := RevisionRoute{
+		Kind:      "revision",
+		Namespace: "default",
+		Revision:  "ws-duration-4445",
+		Execution: project.ExecutionPolicy{Mode: project.ExecutionFresh},
+		Timeout:   "30s",
+		Routed:    true,
+	}
+	data, _ := json.Marshal(route)
+	if err := os.WriteFile(filepath.Join(routes, "r.json"), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	client := &testFiberClient{
+		sessions: map[string]consumer.Fiber{},
+		servers:  map[string]*httptest.Server{},
+	}
+	upgrader := websocket.Upgrader{}
+	client.handler = http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		connection, err := upgrader.Upgrade(w, request, nil)
+		if err != nil {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+		connection.Close()
+	})
+	router, err := NewRouter(
+		testHomeResolver{client: delayedFiberClient{
+			client: client, cloneDelay: delay, releaseDelay: delay,
+		}},
+		routes,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		router.Close()
+		for _, server := range client.servers {
+			server.Close()
+		}
+		forgetRevision(route.Namespace, route.Revision)
+	})
+	server := serveRouter(router, route)
+	defer server.Close()
+	connection, _, err := websocket.DefaultDialer.Dial(
+		"ws"+strings.TrimPrefix(server.URL, "http"),
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	connection.ReadMessage()
+	connection.Close()
+	prefix := `lampyr_router_websocket_session_duration_seconds_sum{namespace="default",outcome="closed",revision="` + route.Revision + `"} `
+	deadline := time.Now().Add(time.Second)
+	for !strings.Contains(scrape(), prefix) && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if duration := sampleValue(t, scrape(), prefix); duration >= delay.Seconds() {
+		t.Fatalf("WebSocket session duration includes clone or release: %fs", duration)
+	}
+}
+
+func TestRouterMetricsFinalizeWebSocketBeforeRelease(t *testing.T) {
+	routes := t.TempDir()
+	route := RevisionRoute{
+		Kind:      "revision",
+		Namespace: "default",
+		Revision:  "ws-release-4446",
+		Execution: project.ExecutionPolicy{Mode: project.ExecutionFresh},
+		Timeout:   "100ms",
+		Routed:    true,
+	}
+	data, _ := json.Marshal(route)
+	if err := os.WriteFile(filepath.Join(routes, "r.json"), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	client := &testFiberClient{
+		sessions: map[string]consumer.Fiber{},
+		servers:  map[string]*httptest.Server{},
+	}
+	upgrader := websocket.Upgrader{}
+	client.handler = http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		connection, err := upgrader.Upgrade(w, request, nil)
+		if err != nil {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+		connection.Close()
+	})
+	releaseStarted := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	unblockRelease := func() { releaseOnce.Do(func() { close(release) }) }
+	defer unblockRelease()
+	router, err := NewRouter(
+		testHomeResolver{client: blockingReleaseFiberClient{
+			client: client, started: releaseStarted, release: release,
+		}},
+		routes,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		router.Close()
+		for _, server := range client.servers {
+			server.Close()
+		}
+		forgetRevision(route.Namespace, route.Revision)
+	})
+	server := serveRouter(router, route)
+	defer server.Close()
+	connection, _, err := websocket.DefaultDialer.Dial(
+		"ws"+strings.TrimPrefix(server.URL, "http"),
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	connection.ReadMessage()
+	connection.Close()
+	select {
+	case <-releaseStarted:
+	case <-time.After(time.Second):
+		t.Fatal("Fiber release did not start")
+	}
+	if got := testutil.ToFloat64(websocketSessions.WithLabelValues(route.Namespace, route.Revision)); got != 0 {
+		t.Fatalf("WebSocket session remained active during Fiber release: %v", got)
+	}
+	body := scrape()
+	closed := `lampyr_router_websocket_session_duration_seconds_count{namespace="default",outcome="closed",revision="` + route.Revision + `"} 1`
+	if !strings.Contains(body, closed) {
+		t.Fatalf("closed session was not finalized before Fiber release:\n%s", lines(body, route.Revision))
+	}
+	time.Sleep(120 * time.Millisecond)
+	unblockRelease()
+	body = scrape()
+	if strings.Contains(body, `outcome="timeout",revision="`+route.Revision+`"} 1`) {
+		t.Fatalf("slow Fiber release changed the WebSocket outcome:\n%s", lines(body, route.Revision))
+	}
+}
+
+func TestRouterMetricsFinalizeProxyStageBeforeRelease(t *testing.T) {
+	routes := t.TempDir()
+	route := RevisionRoute{
+		Kind:      "revision",
+		Namespace: "default",
+		Revision:  "proxy-release-4447",
+		Execution: project.ExecutionPolicy{Mode: project.ExecutionFresh},
+		Timeout:   "30s",
+		Routed:    true,
+	}
+	data, _ := json.Marshal(route)
+	if err := os.WriteFile(filepath.Join(routes, "r.json"), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	client := &testFiberClient{
+		sessions: map[string]consumer.Fiber{},
+		servers:  map[string]*httptest.Server{},
+	}
+	releaseStarted := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	unblockRelease := func() { releaseOnce.Do(func() { close(release) }) }
+	defer unblockRelease()
+	router, err := NewRouter(
+		testHomeResolver{client: blockingReleaseFiberClient{
+			client: client, started: releaseStarted, release: release,
+		}},
+		routes,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		router.Close()
+		for _, server := range client.servers {
+			server.Close()
+		}
+		forgetRevision(route.Namespace, route.Revision)
+	})
+	response := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		router.ServeHTTP(response, revisionRequest("GET", "/", route))
+		close(done)
+	}()
+	select {
+	case <-releaseStarted:
+	case <-time.After(time.Second):
+		t.Fatal("Fiber release did not start")
+	}
+	if got := testutil.ToFloat64(requestsInFlight.WithLabelValues(
+		route.Namespace, route.Revision, "proxy",
+	)); got != 0 {
+		t.Fatalf("proxy stage remained active during Fiber release: %v", got)
+	}
+	unblockRelease()
+	<-done
+	if response.Code != http.StatusOK {
+		t.Fatalf("request = %d", response.Code)
+	}
 }
 
 // A WebSocket session that runs to the Revision timeout is not a request.

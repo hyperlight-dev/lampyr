@@ -5,6 +5,8 @@ package fiberdintegration
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -40,6 +42,69 @@ func TestRouterMetricsCountFibersAndRequests(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Fatalf("metrics are missing %q", want)
 		}
+	}
+}
+
+func TestRouterMetricsTrackRequestStages(t *testing.T) {
+	router, client, route, _ := namedRouter(t, "stages-1001", "30s", project.ExecutionFresh)
+	entered := make(chan struct{})
+	finish := make(chan struct{})
+	client.handler = http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		close(entered)
+		<-finish
+		fmt.Fprint(w, "done")
+	})
+	done := make(chan struct{})
+	go func() {
+		router.ServeHTTP(httptest.NewRecorder(), revisionRequest("GET", "/", route))
+		close(done)
+	}()
+	<-entered
+	if got := testutil.ToFloat64(requestsInFlight.WithLabelValues(route.Namespace, route.Revision, "acquire")); got != 0 {
+		t.Fatalf("acquiring requests after proxy began = %v", got)
+	}
+	if got := testutil.ToFloat64(requestsInFlight.WithLabelValues(route.Namespace, route.Revision, "proxy")); got != 1 {
+		t.Fatalf("proxying requests = %v, want 1", got)
+	}
+	close(finish)
+	<-done
+	if got := testutil.ToFloat64(requestsInFlight.WithLabelValues(route.Namespace, route.Revision, "proxy")); got != 0 {
+		t.Fatalf("proxying requests after completion = %v", got)
+	}
+}
+
+func TestRouterMetricsTrackRequestAcquisition(t *testing.T) {
+	routes := t.TempDir()
+	route := RevisionRoute{Kind: "revision", Namespace: "default", Revision: "acquiring-1001",
+		Execution: project.ExecutionPolicy{Mode: project.ExecutionFresh}, Timeout: "30s", Routed: true}
+	data, _ := json.Marshal(route)
+	if err := os.WriteFile(filepath.Join(routes, "route.json"), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	router, err := NewRouter(testHomeResolver{client: blockingFiberClient{}}, routes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer router.Close()
+	t.Cleanup(func() { forgetRevision(route.Namespace, route.Revision) })
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan struct{})
+	go func() {
+		router.ServeHTTP(httptest.NewRecorder(), revisionRequest("GET", "/", route).WithContext(ctx))
+		close(done)
+	}()
+	labels := []string{route.Namespace, route.Revision, "acquire"}
+	deadline := time.Now().Add(time.Second)
+	for testutil.ToFloat64(requestsInFlight.WithLabelValues(labels...)) != 1 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := testutil.ToFloat64(requestsInFlight.WithLabelValues(labels...)); got != 1 {
+		t.Fatalf("acquiring requests = %v, want 1", got)
+	}
+	cancel()
+	<-done
+	if got := testutil.ToFloat64(requestsInFlight.WithLabelValues(labels...)); got != 0 {
+		t.Fatalf("acquiring requests after cancellation = %v", got)
 	}
 }
 
@@ -81,12 +146,27 @@ func TestRouterMetricsKeepWebSocketUpgrades(t *testing.T) {
 	if err != nil {
 		t.Fatalf("upgrade through the router: %v", err)
 	}
-	defer connection.Close()
+	if got := testutil.ToFloat64(websocketSessions.WithLabelValues(route.Namespace, route.Revision)); got != 1 {
+		t.Fatalf("active WebSocket sessions = %v, want 1", got)
+	}
 	if err := connection.WriteMessage(websocket.TextMessage, []byte("ping")); err != nil {
 		t.Fatal(err)
 	}
 	if _, message, err := connection.ReadMessage(); err != nil || string(message) != "ping" {
 		t.Fatalf("echo = %q, %v", message, err)
+	}
+	connection.Close()
+	deadline := time.Now().Add(time.Second)
+	duration := `lampyr_router_websocket_session_duration_seconds_count{namespace="default",outcome="closed",revision="` + route.Revision + `"} 1`
+	for !strings.Contains(scrape(), duration) && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := testutil.ToFloat64(websocketSessions.WithLabelValues(route.Namespace, route.Revision)); got != 0 {
+		t.Fatalf("active WebSocket sessions after close = %v", got)
+	}
+	body := scrape()
+	if !strings.Contains(body, duration) {
+		t.Fatalf("closed WebSocket session was not observed:\n%s", lines(body, route.Revision))
 	}
 }
 

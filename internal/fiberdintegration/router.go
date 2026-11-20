@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"math/rand/v2"
 	"net/http"
@@ -872,7 +873,37 @@ func (router *Router) ServeHTTP(w http.ResponseWriter, request *http.Request) {
 	w = recorder
 	clientCtx := request.Context()
 	var revisionCtx context.Context
+	stage := "acquire"
+	finishStage := func() {
+		if stage == "" {
+			return
+		}
+		finished := stage
+		stage = ""
+		metrics.record(func() {
+			requestsInFlight.WithLabelValues(namespace, revision.Revision, finished).Dec()
+		})
+	}
+	transitionStage := func(next string) {
+		previous := stage
+		stage = next
+		metrics.record(func() {
+			requestsInFlight.WithLabelValues(namespace, revision.Revision, previous).Dec()
+			requestsInFlight.WithLabelValues(namespace, revision.Revision, next).Inc()
+		})
+	}
+	metrics.record(func() {
+		requestsInFlight.WithLabelValues(namespace, revision.Revision, stage).Inc()
+	})
+	defer finishStage()
 	received := time.Now()
+	var websocketStarted time.Time
+	recorder.onSwitch = func() {
+		websocketStarted = time.Now()
+		metrics.record(func() {
+			websocketSessions.WithLabelValues(namespace, revision.Revision).Inc()
+		})
+	}
 	defer func() {
 		status := requestStatus(recorder, clientCtx, revisionCtx)
 		metrics.record(func() {
@@ -910,7 +941,7 @@ func (router *Router) ServeHTTP(w http.ResponseWriter, request *http.Request) {
 	stopAcquire()
 	metric.CloneDuration = time.Since(start)
 	if err != nil {
-		recorder.failed = true
+		recorder.fail()
 		outcome := "error"
 		if clientCtx.Err() != nil {
 			outcome = "canceled"
@@ -944,6 +975,7 @@ func (router *Router) ServeHTTP(w http.ResponseWriter, request *http.Request) {
 		http.Error(w, "no Fiber is available for this Revision", http.StatusServiceUnavailable)
 		return
 	}
+	transitionStage("proxy")
 	acquired := metric.CloneDuration
 	cloneMS := acquired.Milliseconds()
 	metrics.record(func() {
@@ -957,6 +989,7 @@ func (router *Router) ServeHTTP(w http.ResponseWriter, request *http.Request) {
 		metrics.record(func() { fibersBusy.WithLabelValues(namespace, revision.Revision).Dec() })
 		finish(gone)
 	}()
+	defer finishStage()
 	target, err := url.Parse(strings.Replace(fiber.Endpoint, "tcp://", "http://", 1))
 	if err != nil || target.Scheme != "http" || target.Host == "" {
 		gone = true
@@ -970,6 +1003,11 @@ func (router *Router) ServeHTTP(w http.ResponseWriter, request *http.Request) {
 	}
 	proxy.FlushInterval = -1
 	proxy.ModifyResponse = func(response *http.Response) error {
+		if response.StatusCode == http.StatusSwitchingProtocols {
+			if connection, ok := response.Body.(io.ReadWriteCloser); ok {
+				response.Body = recorder.observeUpgrade(connection)
+			}
+		}
 		if _, present := response.Header["Content-Type"]; !present {
 			// Preserve untyped streams instead of letting net/http sniff HTML.
 			w.Header()["Content-Type"] = nil
@@ -980,7 +1018,7 @@ func (router *Router) ServeHTTP(w http.ResponseWriter, request *http.Request) {
 	}
 	proxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, err error) {
 		gone = true
-		recorder.failed = true
+		recorder.fail()
 		log.Printf("proxy revision %s fiber %s endpoint %s: %v", revision.Revision, fiber.ID, fiber.Endpoint, err)
 		// The error names the Fiber's address on its home, which is the
 		// operator's to read, in the log above, not the client's.
@@ -996,10 +1034,23 @@ func (router *Router) ServeHTTP(w http.ResponseWriter, request *http.Request) {
 	// the request isn't recorded as its upstream status and the Fiber isn't
 	// pooled again, then let the server abort the connection.
 	defer func() {
+		if recorder.switched {
+			ended := time.Now()
+			metrics.record(func() {
+				websocketSessions.WithLabelValues(namespace, revision.Revision).Dec()
+				websocketSessionSeconds.WithLabelValues(
+					namespace,
+					revision.Revision,
+					websocketOutcome(recorder, revisionCtx),
+				).Observe(ended.Sub(websocketStarted).Seconds())
+			})
+		}
+	}()
+	defer func() {
 		if failure := recover(); failure != nil {
 			if failure == http.ErrAbortHandler {
 				gone = true
-				recorder.failed = true
+				recorder.fail()
 			}
 			panic(failure)
 		}
