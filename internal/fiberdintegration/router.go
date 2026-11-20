@@ -817,14 +817,28 @@ func (router *Router) ServeHTTP(w http.ResponseWriter, request *http.Request) {
 	clientCtx := request.Context()
 	var revisionCtx context.Context
 	stage := "acquire"
+	finishStage := func() {
+		if stage == "" {
+			return
+		}
+		finished := stage
+		stage = ""
+		metrics.record(func() {
+			requestsInFlight.WithLabelValues(namespace, revision.Revision, finished).Dec()
+		})
+	}
+	transitionStage := func(next string) {
+		previous := stage
+		stage = next
+		metrics.record(func() {
+			requestsInFlight.WithLabelValues(namespace, revision.Revision, previous).Dec()
+			requestsInFlight.WithLabelValues(namespace, revision.Revision, next).Inc()
+		})
+	}
 	metrics.record(func() {
 		requestsInFlight.WithLabelValues(namespace, revision.Revision, stage).Inc()
 	})
-	defer func() {
-		metrics.record(func() {
-			requestsInFlight.WithLabelValues(namespace, revision.Revision, stage).Dec()
-		})
-	}()
+	defer finishStage()
 	received := time.Now()
 	var websocketStarted time.Time
 	recorder.onSwitch = func() {
@@ -904,11 +918,7 @@ func (router *Router) ServeHTTP(w http.ResponseWriter, request *http.Request) {
 		http.Error(w, "no Fiber is available for this Revision", http.StatusServiceUnavailable)
 		return
 	}
-	metrics.record(func() {
-		requestsInFlight.WithLabelValues(namespace, revision.Revision, stage).Dec()
-		stage = "proxy"
-		requestsInFlight.WithLabelValues(namespace, revision.Revision, stage).Inc()
-	})
+	transitionStage("proxy")
 	acquired := metric.CloneDuration
 	cloneMS := acquired.Milliseconds()
 	metrics.record(func() {
@@ -922,6 +932,7 @@ func (router *Router) ServeHTTP(w http.ResponseWriter, request *http.Request) {
 		metrics.record(func() { fibersBusy.WithLabelValues(namespace, revision.Revision).Dec() })
 		finish(gone)
 	}()
+	defer finishStage()
 	target, err := url.Parse(strings.Replace(fiber.Endpoint, "tcp://", "http://", 1))
 	if err != nil || target.Scheme != "http" || target.Host == "" {
 		gone = true

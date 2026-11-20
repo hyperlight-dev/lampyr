@@ -157,18 +157,15 @@ func TestRouterMetricsKeepWebSocketUpgrades(t *testing.T) {
 	}
 	connection.Close()
 	deadline := time.Now().Add(time.Second)
-	for testutil.ToFloat64(websocketSessions.WithLabelValues(route.Namespace, route.Revision)) != 0 &&
-		time.Now().Before(deadline) {
+	duration := `lampyr_router_websocket_session_duration_seconds_count{namespace="default",outcome="closed",revision="` + route.Revision + `"} 1`
+	for !strings.Contains(scrape(), duration) && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}
 	if got := testutil.ToFloat64(websocketSessions.WithLabelValues(route.Namespace, route.Revision)); got != 0 {
 		t.Fatalf("active WebSocket sessions after close = %v", got)
 	}
 	body := scrape()
-	if !strings.Contains(
-		body,
-		`lampyr_router_websocket_session_duration_seconds_count{namespace="default",outcome="closed",revision="`+route.Revision+`"} 1`,
-	) {
+	if !strings.Contains(body, duration) {
 		t.Fatalf("closed WebSocket session was not observed:\n%s", lines(body, route.Revision))
 	}
 }

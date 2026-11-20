@@ -333,6 +333,68 @@ func TestRouterMetricsFinalizeWebSocketBeforeRelease(t *testing.T) {
 	}
 }
 
+func TestRouterMetricsFinalizeProxyStageBeforeRelease(t *testing.T) {
+	routes := t.TempDir()
+	route := RevisionRoute{
+		Kind:      "revision",
+		Namespace: "default",
+		Revision:  "proxy-release-4447",
+		Execution: project.ExecutionPolicy{Mode: project.ExecutionFresh},
+		Timeout:   "30s",
+		Routed:    true,
+	}
+	data, _ := json.Marshal(route)
+	if err := os.WriteFile(filepath.Join(routes, "r.json"), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	client := &testFiberClient{
+		sessions: map[string]consumer.Fiber{},
+		servers:  map[string]*httptest.Server{},
+	}
+	releaseStarted := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	unblockRelease := func() { releaseOnce.Do(func() { close(release) }) }
+	defer unblockRelease()
+	router, err := NewRouter(
+		testHomeResolver{client: blockingReleaseFiberClient{
+			client: client, started: releaseStarted, release: release,
+		}},
+		routes,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		router.Close()
+		for _, server := range client.servers {
+			server.Close()
+		}
+		forgetRevision(route.Namespace, route.Revision)
+	})
+	response := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		router.ServeHTTP(response, revisionRequest("GET", "/", route))
+		close(done)
+	}()
+	select {
+	case <-releaseStarted:
+	case <-time.After(time.Second):
+		t.Fatal("Fiber release did not start")
+	}
+	if got := testutil.ToFloat64(requestsInFlight.WithLabelValues(
+		route.Namespace, route.Revision, "proxy",
+	)); got != 0 {
+		t.Fatalf("proxy stage remained active during Fiber release: %v", got)
+	}
+	unblockRelease()
+	<-done
+	if response.Code != http.StatusOK {
+		t.Fatalf("request = %d", response.Code)
+	}
+}
+
 // A WebSocket session that runs to the Revision timeout is not a request.
 func TestRouterMetricsSkipWebSocketAtRevisionTimeout(t *testing.T) {
 	router, client, route, _ := namedRouter(t, "ws-5555", "1s", project.ExecutionFresh)
