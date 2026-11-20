@@ -586,7 +586,7 @@ func TestRevisionReloadUpdatesAndRemovesWithInvalidFile(t *testing.T) {
 	checkReloadReadiness(t, router, previous, http.StatusServiceUnavailable)
 	checkReloadReadiness(t, router, revision, http.StatusOK)
 	checkReloadReadiness(t, router, added, http.StatusOK)
-	pool := router.pools["default--demo-1234"]
+	pool := router.pools["default/demo-1234"]
 	if pool == nil || pool.idle != time.Second {
 		t.Fatal("valid update did not change the retained pool's idle timeout")
 	}
@@ -601,7 +601,7 @@ func TestRevisionReloadUpdatesAndRemovesWithInvalidFile(t *testing.T) {
 		t.Fatalf("invalid file blocked routing-state update: %v", err)
 	}
 	router.releases.Wait()
-	if !slices.Equal(client.released, []string{"1"}) || len(router.pools) != 1 || router.pools["default--other-1234"] == nil {
+	if !slices.Equal(client.released, []string{"1"}) || len(router.pools) != 1 || router.pools["default/other-1234"] == nil {
 		t.Fatalf("routing-state update released %v, pools = %v", client.released, router.pools)
 	}
 	checkReloadReadiness(t, router, revision, http.StatusOK)
