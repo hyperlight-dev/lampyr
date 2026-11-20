@@ -230,8 +230,17 @@ func TestFreshReleaseOnApplicationAndTransportErrors(t *testing.T) {
 }
 
 func TestFreshStreamRetainsFiberUntilCompletionOrCancellation(t *testing.T) {
-	for _, cancelStream := range []bool{false, true} {
-		t.Run(fmt.Sprint(cancelStream), func(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		binding      bool
+		cancelStream bool
+	}{
+		{name: "router completion"},
+		{name: "router cancellation", cancelStream: true},
+		{name: "binding completion", binding: true},
+		{name: "binding cancellation", binding: true, cancelStream: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
 			router, client, route := routerFixture(t, project.ExecutionFresh)
 			end := make(chan struct{})
 			client.handler = http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
@@ -243,15 +252,19 @@ func TestFreshStreamRetainsFiberUntilCompletionOrCancellation(t *testing.T) {
 					fmt.Fprint(w, "end\n")
 				}
 			})
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+			var handler http.Handler = http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 				request.Header.Set("Knative-Serving-Namespace", route.Namespace)
 				request.Header.Set("Knative-Serving-Revision", route.Revision)
 				router.ServeHTTP(w, request)
-			}))
+			})
+			if test.binding {
+				handler = localHandler(router, route.Revision, "/_lampyr/private")
+			}
+			server := httptest.NewServer(handler)
 			defer server.Close()
 			ctx, cancel := context.WithCancel(t.Context())
 			defer cancel()
-			request, _ := http.NewRequestWithContext(ctx, "GET", server.URL, nil)
+			request, _ := http.NewRequestWithContext(ctx, "GET", server.URL+"/_lampyr/private", nil)
 			response, err := http.DefaultClient.Do(request)
 			if err != nil {
 				t.Fatal(err)
@@ -266,7 +279,7 @@ func TestFreshStreamRetainsFiberUntilCompletionOrCancellation(t *testing.T) {
 			if released != 0 {
 				t.Fatal("stream released before completion")
 			}
-			if cancelStream {
+			if test.cancelStream {
 				cancel()
 			} else {
 				close(end)

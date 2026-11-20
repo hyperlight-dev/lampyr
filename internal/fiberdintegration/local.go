@@ -14,6 +14,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -621,6 +622,12 @@ func localHandler(router *Router, name, capability string) http.Handler {
 		localForward(router, name, &localBindingResponseWriter{
 			ResponseWriter: w,
 			capability:     capability,
+			requestURL: url.URL{
+				Path:       request.URL.Path,
+				RawPath:    request.URL.RawPath,
+				RawQuery:   request.URL.RawQuery,
+				ForceQuery: request.URL.ForceQuery,
+			},
 		}, request)
 	})
 }
@@ -628,6 +635,7 @@ func localHandler(router *Router, name, capability string) http.Handler {
 type localBindingResponseWriter struct {
 	http.ResponseWriter
 	capability string
+	requestURL url.URL
 	rewritten  bool
 }
 
@@ -653,9 +661,19 @@ func (writer *localBindingResponseWriter) rewriteLocation() {
 	}
 	writer.rewritten = true
 	location := writer.Header().Get("Location")
-	if strings.HasPrefix(location, "/") && !strings.HasPrefix(location, "//") {
-		writer.Header().Set("Location", writer.capability+location)
+	if location == "" || strings.HasPrefix(location, "//") {
+		return
 	}
+	if strings.HasPrefix(location, "/") {
+		writer.Header().Set("Location", writer.capability+location)
+		return
+	}
+	reference, err := url.Parse(location)
+	if err != nil || reference.IsAbs() || reference.Host != "" {
+		return
+	}
+	resolved := writer.requestURL.ResolveReference(reference)
+	writer.Header().Set("Location", writer.capability+resolved.String())
 }
 
 func localIngressHandler(router *Router, exposed map[string]string, port string) http.Handler {
