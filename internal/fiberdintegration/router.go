@@ -290,6 +290,11 @@ func NewRouter(homes HomeResolver, routesDir string) (*Router, error) {
 }
 
 func tracedTransport(transport http.RoundTripper, options ...otelhttp.Option) http.RoundTripper {
+	options = append([]otelhttp.Option{
+		otelhttp.WithFilter(func(request *http.Request) bool {
+			return request.Header.Get("Upgrade") == ""
+		}),
+	}, options...)
 	return otelhttp.NewTransport(transport, options...)
 }
 
