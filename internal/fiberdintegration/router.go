@@ -26,6 +26,11 @@ import (
 	"github.com/Azure/fiberd/pkg/core"
 	consumer "github.com/Azure/fiberd/sdk/go/client"
 	"github.com/hyperlight-dev/lampyr/internal/project"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	otelcodes "go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	netheader "knative.dev/networking/pkg/http/header"
@@ -35,6 +40,8 @@ import (
 // Namespaces and names arrive in requests, so only those a Kubernetes
 // object could have are looked up.
 var grantName = regexp.MustCompile(`^[a-z0-9][a-z0-9_.-]*$`)
+
+const tracerName = "github.com/hyperlight-dev/lampyr/internal/fiberdintegration"
 
 func tokenDigest(token []byte) string {
 	return fmt.Sprintf("sha256:%x", sha256.Sum256(token))
@@ -243,7 +250,13 @@ func NewRouter(homes HomeResolver, routesDir string) (*Router, error) {
 		revisions:   make(map[string]RevisionRoute),
 		generations: make(map[string]uint64),
 		pools:       make(map[string]*routerPool),
-		transport:   http.DefaultTransport, h2cTransport: newH2CTransport(),
+		transport:   otelhttp.NewTransport(http.DefaultTransport),
+		h2cTransport: otelhttp.NewTransport(
+			newH2CTransport(),
+			otelhttp.WithSpanNameFormatter(func(_ string, request *http.Request) string {
+				return request.Method + " Fiber"
+			}),
+		),
 		AcquireTimeout: DefaultAcquireTimeout,
 		requests:       newRequestTracker(),
 	}
@@ -967,14 +980,29 @@ func (router *Router) ServeHTTP(w http.ResponseWriter, request *http.Request) {
 	defer cancel()
 	revisionCtx = ctx
 	request = request.WithContext(ctx)
+	serverSpan := trace.SpanFromContext(request.Context())
+	serverSpan.SetAttributes(
+		attribute.String("lampyr.namespace", namespace),
+		attribute.String("lampyr.revision", revision.Revision),
+		attribute.String("lampyr.execution.mode", execution.Mode),
+	)
 	start := time.Now()
-	acquireCtx, stopAcquire := context.WithTimeout(ctx, router.AcquireTimeout)
-	fiber, finish, err := router.acquire(acquireCtx, ctx, namespace, revision.Revision, execution, func(reason string) {
+	acquireTraceCtx, acquireSpan := otel.Tracer(tracerName).Start(ctx, "lampyr.fiber.acquire")
+	acquireSpan.SetAttributes(
+		attribute.String("lampyr.namespace", namespace),
+		attribute.String("lampyr.revision", revision.Revision),
+		attribute.String("lampyr.execution.mode", execution.Mode),
+	)
+	acquireCtx, stopAcquire := context.WithTimeout(acquireTraceCtx, router.AcquireTimeout)
+	fiber, finish, err := router.acquire(acquireCtx, acquireTraceCtx, namespace, revision.Revision, execution, func(reason string) {
 		metrics.record(func() { cloneRetriesTotal.WithLabelValues(namespace, revision.Revision, reason).Inc() })
 	})
 	stopAcquire()
 	metric.CloneDuration = time.Since(start)
 	if err != nil {
+		acquireSpan.RecordError(err)
+		acquireSpan.SetStatus(otelcodes.Error, "Fiber acquisition failed")
+		acquireSpan.End()
 		recorder.fail()
 		outcome := "error"
 		if clientCtx.Err() != nil {
@@ -1009,6 +1037,15 @@ func (router *Router) ServeHTTP(w http.ResponseWriter, request *http.Request) {
 		http.Error(w, "no Fiber is available for this Revision", http.StatusServiceUnavailable)
 		return
 	}
+	acquireSpan.SetAttributes(
+		attribute.String("lampyr.fiber.id", fiber.ID),
+		attribute.String("lampyr.fiber.kind", fiber.Kind.String()),
+	)
+	acquireSpan.End()
+	serverSpan.SetAttributes(
+		attribute.String("lampyr.fiber.id", fiber.ID),
+		attribute.String("lampyr.fiber.kind", fiber.Kind.String()),
+	)
 	transitionStage("proxy")
 	acquired := metric.CloneDuration
 	cloneMS := acquired.Milliseconds()

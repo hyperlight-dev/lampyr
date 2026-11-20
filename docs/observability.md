@@ -74,3 +74,20 @@ curl -s localhost:9090/metrics | grep '^lampyr_router_'
 
 On a CNI that doesn't enforce NetworkPolicy, any Pod in the cluster can read
 these metrics, and with them the namespace and Revision names.
+
+## Export request traces
+
+fiber-router exports OpenTelemetry traces only when
+`OTEL_EXPORTER_OTLP_ENDPOINT` or `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` is set.
+It uses the standard OTLP gRPC exporter environment variables. Set
+`OTEL_SDK_DISABLED=true` to disable export explicitly.
+
+Each routed request produces:
+
+- `lampyr.router.request`, the incoming HTTP server span;
+- `lampyr.fiber.acquire`, the clone or attach operation; and
+- an HTTP client span for the request proxied to the Fiber.
+
+The request and acquire spans include the namespace, Revision, execution mode,
+Fiber ID, and clone kind when available. Trace context is propagated to the
+Fiber's HTTP server. Health and readiness probes are not traced.
