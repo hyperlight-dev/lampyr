@@ -15,6 +15,11 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"go.opentelemetry.io/otel"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	"go.opentelemetry.io/otel/trace"
 )
 
 func TestWriteProbeResponse(t *testing.T) {
@@ -87,6 +92,30 @@ func TestTraceRouterRequestExcludesOnlyRouterProbes(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestTraceRouterHandlerUsesStableServerSpanName(t *testing.T) {
+	previous := otel.GetTracerProvider()
+	recorder := tracetest.NewSpanRecorder()
+	provider := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(recorder))
+	otel.SetTracerProvider(provider)
+	t.Cleanup(func() {
+		_ = provider.Shutdown(t.Context())
+		otel.SetTracerProvider(previous)
+	})
+	handler := traceRouterHandler(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "http://router/application", nil))
+	for _, span := range recorder.Ended() {
+		if span.SpanKind() == trace.SpanKindServer {
+			if got := span.Name(); got != "lampyr.router.request" {
+				t.Fatalf("server span name = %q, want lampyr.router.request", got)
+			}
+			return
+		}
+	}
+	t.Fatal("server span was not recorded")
 }
 
 // order records what a shutdown did, in order.

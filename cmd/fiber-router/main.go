@@ -108,11 +108,7 @@ func main() {
 	protocols := new(http.Protocols)
 	protocols.SetHTTP1(true)
 	protocols.SetUnencryptedHTTP2(true)
-	handler := otelhttp.NewHandler(
-		router.Handler(),
-		"lampyr.router.request",
-		otelhttp.WithFilter(traceRouterRequest),
-	)
+	handler := traceRouterHandler(router.Handler())
 	server := &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second, Protocols: protocols}
 	listener, err := net.Listen("tcp", *listen)
 	if err != nil {
@@ -125,6 +121,17 @@ func main() {
 		log.Println(err)
 		os.Exit(1)
 	}
+}
+
+func traceRouterHandler(handler http.Handler) http.Handler {
+	return otelhttp.NewHandler(
+		handler,
+		"lampyr.router.request",
+		otelhttp.WithFilter(traceRouterRequest),
+		otelhttp.WithSpanNameFormatter(func(string, *http.Request) string {
+			return "lampyr.router.request"
+		}),
+	)
 }
 
 func traceRouterRequest(request *http.Request) bool {

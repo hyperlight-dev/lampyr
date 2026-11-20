@@ -146,25 +146,6 @@ func TestRouterTracesFiberAcquisitionAndPropagatesContext(t *testing.T) {
 	}
 }
 
-func TestTracedRouterUsesStableServerSpanName(t *testing.T) {
-	recorder := recordSpans(t)
-	router, client, revision := routerFixture(t, project.ExecutionFresh)
-	client.handler = http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusNoContent)
-	})
-	server := tracedRouterServer(router, revision)
-	defer server.Close()
-	response, err := http.Get(server.URL)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_ = response.Body.Close()
-	span := waitForServerSpan(t, recorder)
-	if got := span.Name(); got != "lampyr.router.request" {
-		t.Fatalf("server span name = %q, want lampyr.router.request", got)
-	}
-}
-
 func TestRouterTracesWebSocketUpgradeAs101(t *testing.T) {
 	recorder := recordSpans(t)
 	router, client, revision := routerFixture(t, project.ExecutionFresh)
