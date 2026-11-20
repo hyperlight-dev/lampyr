@@ -5,7 +5,9 @@ package fiberdintegration
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -13,6 +15,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -23,6 +26,57 @@ import (
 	"github.com/hyperlight-dev/lampyr/internal/project"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 )
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (roundTrip roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return roundTrip(request)
+}
+
+type failedUpgradeBody struct{}
+
+func (*failedUpgradeBody) Read([]byte) (int, error) {
+	return 0, errors.New("upgraded backend read failed")
+}
+func (*failedUpgradeBody) Write(data []byte) (int, error) { return len(data), nil }
+func (*failedUpgradeBody) Close() error                   { return nil }
+
+type delayedFiberClient struct {
+	client       *testFiberClient
+	cloneDelay   time.Duration
+	releaseDelay time.Duration
+}
+
+func (client delayedFiberClient) Clone(
+	ctx context.Context,
+	token, session string,
+	timeout time.Duration,
+	facts []byte,
+) (consumer.Fiber, error) {
+	time.Sleep(client.cloneDelay)
+	return client.client.Clone(ctx, token, session, timeout, facts)
+}
+
+func (client delayedFiberClient) Release(ctx context.Context, id string, gone bool) error {
+	time.Sleep(client.releaseDelay)
+	return client.client.Release(ctx, id, gone)
+}
+
+func sampleValue(t *testing.T, body, prefix string) float64 {
+	t.Helper()
+	for line := range strings.Lines(body) {
+		if strings.HasPrefix(line, prefix) {
+			fields := strings.Fields(line)
+			value, err := strconv.ParseFloat(fields[len(fields)-1], 64)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return value
+		}
+	}
+	t.Fatalf("metric sample %q is missing:\n%s", prefix, body)
+	return 0
+}
 
 func namedRouter(t *testing.T, name, timeout, mode string) (*Router, *testFiberClient, RevisionRoute, string) {
 	routes := t.TempDir()
@@ -55,6 +109,109 @@ func serveRouter(router *Router, route RevisionRoute) *httptest.Server {
 		r.Header.Set("Knative-Serving-Revision", route.Revision)
 		router.ServeHTTP(w, r)
 	}))
+}
+
+func TestRouterMetricsClassifyUpgradedBackendCopyFailure(t *testing.T) {
+	router, _, route, _ := namedRouter(t, "ws-error-4444", "30s", project.ExecutionFresh)
+	router.transport = roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		return &http.Response{
+			Status:     "101 Switching Protocols",
+			StatusCode: http.StatusSwitchingProtocols,
+			Header: http.Header{
+				"Connection": {"Upgrade"},
+				"Upgrade":    {"websocket"},
+			},
+			Body:    &failedUpgradeBody{},
+			Request: request,
+		}, nil
+	})
+	server := serveRouter(router, route)
+	defer server.Close()
+	address := strings.TrimPrefix(server.URL, "http://")
+	connection, err := net.Dial("tcp", address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fmt.Fprintf(connection,
+		"GET /socket HTTP/1.1\r\nHost: fiber-router\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n")
+	status, err := bufio.NewReader(connection).ReadString('\n')
+	if err != nil || !strings.Contains(status, "101") {
+		t.Fatalf("upgrade status = %q, %v", status, err)
+	}
+	connection.Close()
+	deadline := time.Now().Add(time.Second)
+	prefix := `lampyr_router_websocket_session_duration_seconds_count{namespace="default",outcome="error",revision="` + route.Revision + `"} `
+	for !strings.Contains(scrape(), prefix+"1") && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if body := scrape(); !strings.Contains(body, prefix+"1") {
+		t.Fatalf("upgraded copy failure was not recorded as an error:\n%s", lines(body, route.Revision))
+	}
+}
+
+func TestRouterMetricsMeasureOnlyWebSocketSession(t *testing.T) {
+	const delay = 150 * time.Millisecond
+	routes := t.TempDir()
+	route := RevisionRoute{
+		Kind:      "revision",
+		Namespace: "default",
+		Revision:  "ws-duration-4445",
+		Execution: project.ExecutionPolicy{Mode: project.ExecutionFresh},
+		Timeout:   "30s",
+		Routed:    true,
+	}
+	data, _ := json.Marshal(route)
+	if err := os.WriteFile(filepath.Join(routes, "r.json"), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	client := &testFiberClient{
+		sessions: map[string]consumer.Fiber{},
+		servers:  map[string]*httptest.Server{},
+	}
+	upgrader := websocket.Upgrader{}
+	client.handler = http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		connection, err := upgrader.Upgrade(w, request, nil)
+		if err != nil {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+		connection.Close()
+	})
+	router, err := NewRouter(
+		testHomeResolver{client: delayedFiberClient{
+			client: client, cloneDelay: delay, releaseDelay: delay,
+		}},
+		routes,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		router.Close()
+		for _, server := range client.servers {
+			server.Close()
+		}
+		forgetRevision(route.Namespace, route.Revision)
+	})
+	server := serveRouter(router, route)
+	defer server.Close()
+	connection, _, err := websocket.DefaultDialer.Dial(
+		"ws"+strings.TrimPrefix(server.URL, "http"),
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	connection.ReadMessage()
+	connection.Close()
+	prefix := `lampyr_router_websocket_session_duration_seconds_sum{namespace="default",outcome="closed",revision="` + route.Revision + `"} `
+	deadline := time.Now().Add(time.Second)
+	for !strings.Contains(scrape(), prefix) && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if duration := sampleValue(t, scrape(), prefix); duration >= delay.Seconds() {
+		t.Fatalf("WebSocket session duration includes clone or release: %fs", duration)
+	}
 }
 
 // A WebSocket session that runs to the Revision timeout is not a request.

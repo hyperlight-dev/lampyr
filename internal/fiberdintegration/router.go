@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"math/rand/v2"
 	"net/http"
@@ -825,7 +826,9 @@ func (router *Router) ServeHTTP(w http.ResponseWriter, request *http.Request) {
 		})
 	}()
 	received := time.Now()
+	var websocketStarted, websocketEnded time.Time
 	recorder.onSwitch = func() {
+		websocketStarted = time.Now()
 		metrics.record(func() {
 			websocketSessions.WithLabelValues(namespace, revision.Revision).Inc()
 		})
@@ -840,7 +843,7 @@ func (router *Router) ServeHTTP(w http.ResponseWriter, request *http.Request) {
 					namespace,
 					revision.Revision,
 					websocketOutcome(recorder, revisionCtx),
-				).Observe(time.Since(received).Seconds())
+				).Observe(websocketEnded.Sub(websocketStarted).Seconds())
 			}
 		})
 		if router.observer != nil {
@@ -875,7 +878,7 @@ func (router *Router) ServeHTTP(w http.ResponseWriter, request *http.Request) {
 	stopAcquire()
 	metric.CloneDuration = time.Since(start)
 	if err != nil {
-		recorder.failed = true
+		recorder.fail()
 		outcome := "error"
 		if clientCtx.Err() != nil {
 			outcome = "canceled"
@@ -940,6 +943,11 @@ func (router *Router) ServeHTTP(w http.ResponseWriter, request *http.Request) {
 	}
 	proxy.FlushInterval = -1
 	proxy.ModifyResponse = func(response *http.Response) error {
+		if response.StatusCode == http.StatusSwitchingProtocols {
+			if connection, ok := response.Body.(io.ReadWriteCloser); ok {
+				response.Body = recorder.observeUpgrade(connection)
+			}
+		}
 		if _, present := response.Header["Content-Type"]; !present {
 			// Preserve untyped streams instead of letting net/http sniff HTML.
 			w.Header()["Content-Type"] = nil
@@ -950,7 +958,7 @@ func (router *Router) ServeHTTP(w http.ResponseWriter, request *http.Request) {
 	}
 	proxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, err error) {
 		gone = true
-		recorder.failed = true
+		recorder.fail()
 		log.Printf("proxy revision %s fiber %s endpoint %s: %v", revision.Revision, fiber.ID, fiber.Endpoint, err)
 		// The error names the Fiber's address on its home, which is the
 		// operator's to read, in the log above, not the client's.
@@ -969,9 +977,14 @@ func (router *Router) ServeHTTP(w http.ResponseWriter, request *http.Request) {
 		if failure := recover(); failure != nil {
 			if failure == http.ErrAbortHandler {
 				gone = true
-				recorder.failed = true
+				recorder.fail()
 			}
 			panic(failure)
+		}
+	}()
+	defer func() {
+		if recorder.switched {
+			websocketEnded = time.Now()
 		}
 	}()
 	proxy.ServeHTTP(w, request)

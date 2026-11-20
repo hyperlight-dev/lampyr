@@ -7,9 +7,11 @@ import (
 	"bufio"
 	"context"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -90,7 +92,7 @@ type statusRecorder struct {
 	onSwitch func()
 	// failed is set when the router saw the request fail: no Fiber, a
 	// proxy error, or a response copy that broke after the headers.
-	failed bool
+	failed atomic.Bool
 }
 
 func (recorder *statusRecorder) WriteHeader(code int) {
@@ -111,6 +113,8 @@ func (recorder *statusRecorder) Write(data []byte) (int, error) {
 
 func (recorder *statusRecorder) Unwrap() http.ResponseWriter { return recorder.ResponseWriter }
 
+func (recorder *statusRecorder) fail() { recorder.failed.Store(true) }
+
 // Hijack marks the request as a protocol switch (WebSocket), which is not
 // observed as a request: the session's length isn't request latency.
 func (recorder *statusRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
@@ -127,6 +131,54 @@ func (recorder *statusRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	return connection, buffer, err
 }
 
+type observedUpgradeConnection struct {
+	io.ReadWriteCloser
+	failed *atomic.Bool
+}
+
+func (connection *observedUpgradeConnection) Read(data []byte) (int, error) {
+	count, err := connection.ReadWriteCloser.Read(data)
+	if err != nil && !errors.Is(err, io.EOF) {
+		connection.failed.Store(true)
+	}
+	return count, err
+}
+
+func (connection *observedUpgradeConnection) Write(data []byte) (int, error) {
+	count, err := connection.ReadWriteCloser.Write(data)
+	if err != nil {
+		connection.failed.Store(true)
+	}
+	return count, err
+}
+
+type observedUpgradeConnectionWithCloseWrite struct {
+	*observedUpgradeConnection
+	closeWriter interface{ CloseWrite() error }
+}
+
+func (connection *observedUpgradeConnectionWithCloseWrite) CloseWrite() error {
+	err := connection.closeWriter.CloseWrite()
+	if err != nil {
+		connection.failed.Store(true)
+	}
+	return err
+}
+
+func (recorder *statusRecorder) observeUpgrade(body io.ReadWriteCloser) io.ReadWriteCloser {
+	observed := &observedUpgradeConnection{
+		ReadWriteCloser: body,
+		failed:          &recorder.failed,
+	}
+	if closeWriter, ok := body.(interface{ CloseWrite() error }); ok {
+		return &observedUpgradeConnectionWithCloseWrite{
+			observedUpgradeConnection: observed,
+			closeWriter:               closeWriter,
+		}
+	}
+	return observed
+}
+
 // statusClientClosed marks requests whose client went away, as nginx does.
 const statusClientClosed = 499
 
@@ -139,7 +191,7 @@ func requestStatus(recorder *statusRecorder, client, revision context.Context) i
 	if recorder.code == http.StatusSwitchingProtocols {
 		return recorder.code
 	}
-	if !recorder.failed && recorder.code != 0 {
+	if !recorder.failed.Load() && recorder.code != 0 {
 		return recorder.code
 	}
 	switch {
@@ -176,7 +228,7 @@ func websocketOutcome(recorder *statusRecorder, revision context.Context) string
 	switch {
 	case revision != nil && errors.Is(revision.Err(), context.DeadlineExceeded):
 		return "timeout"
-	case recorder.failed:
+	case recorder.failed.Load():
 		return "error"
 	default:
 		return "closed"
