@@ -272,8 +272,8 @@ func NewRouter(homes HomeResolver, routesDir string) (*Router, error) {
 		revisions:   make(map[string]RevisionRoute),
 		generations: make(map[string]uint64),
 		pools:       make(map[string]*routerPool),
-		transport:   otelhttp.NewTransport(http.DefaultTransport),
-		h2cTransport: otelhttp.NewTransport(
+		transport:   tracedTransport(http.DefaultTransport),
+		h2cTransport: tracedTransport(
 			newH2CTransport(),
 			otelhttp.WithSpanNameFormatter(func(_ string, request *http.Request) string {
 				return request.Method + " Fiber"
@@ -287,6 +287,10 @@ func NewRouter(homes HomeResolver, routesDir string) (*Router, error) {
 		return nil, err
 	}
 	return router, nil
+}
+
+func tracedTransport(transport http.RoundTripper, options ...otelhttp.Option) http.RoundTripper {
+	return otelhttp.NewTransport(transport, options...)
 }
 
 func newH2CTransport() http.RoundTripper {
