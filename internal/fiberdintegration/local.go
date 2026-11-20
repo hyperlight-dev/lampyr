@@ -44,6 +44,7 @@ type LocalConfig struct {
 	ExposedServices []string       `json:"exposedServices"`
 	Services        []LocalService `json:"services"`
 	Metrics         bool           `json:"metrics"`
+	Observability   bool           `json:"observability"`
 }
 
 type localMetrics struct {
@@ -431,7 +432,7 @@ func (home *localHome) Release(_ context.Context, id string, _ bool) error {
 func RunLocal(ctx context.Context, config LocalConfig) (returnErr error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	if config.SchemaVersion != 3 {
+	if config.SchemaVersion != 4 {
 		return fmt.Errorf("unsupported local plan schema; install or rebuild the matching ly and ly-dev")
 	}
 	if config.Binary == "" || len(config.Services) == 0 {
@@ -513,6 +514,15 @@ func RunLocal(ctx context.Context, config LocalConfig) (returnErr error) {
 			return err
 		}
 	}
+	var observability *localObservability
+	if config.Observability {
+		fmt.Println("starting local Prometheus and Jaeger (first use can download images)")
+		observability, err = startLocalObservability(ctx, filepath.Dir(config.Services[0].Snapshot), localDockerCommand)
+		if err != nil {
+			return err
+		}
+		defer func() { returnErr = errors.Join(returnErr, observability.Close()) }()
+	}
 	router, err := NewRouter(homes, routesDir)
 	if err != nil {
 		return err
@@ -528,12 +538,16 @@ func RunLocal(ctx context.Context, config LocalConfig) (returnErr error) {
 		router.Observe(metrics.Observe)
 		defer metrics.Summary()
 	}
-	if len(exposed) > 0 {
+	if len(exposed) > 0 || observability != nil {
 		ingress, err := net.Listen("tcp4", config.Listen)
 		if err != nil {
 			return err
 		}
 		listeners = append(listeners, ingress)
+		if observability != nil {
+			_, port, _ := net.SplitHostPort(ingress.Addr().String())
+			fmt.Printf("observability: http://localhost:%s/\n", port)
+		}
 		for _, name := range config.ExposedServices {
 			_, port, _ := net.SplitHostPort(ingress.Addr().String())
 			fmt.Printf("running %s at http://%s.default.localhost:%s\n", name, name, port)
@@ -544,7 +558,7 @@ func RunLocal(ctx context.Context, config LocalConfig) (returnErr error) {
 	failures := make(chan error, len(listeners))
 	for index, listener := range listeners {
 		_, port, _ := net.SplitHostPort(listener.Addr().String())
-		handler := localIngressHandler(router, exposed, port)
+		handler := localIngressHandler(router, exposed, port, observability)
 		if index < len(config.Services) {
 			name := config.Services[index].Name
 			handler = localHandler(router, name, tokens[name])
@@ -676,7 +690,7 @@ func (writer *localBindingResponseWriter) rewriteLocation() {
 	writer.Header().Set("Location", writer.capability+resolved.String())
 }
 
-func localIngressHandler(router *Router, exposed map[string]string, port string) http.Handler {
+func localIngressHandler(router *Router, exposed map[string]string, port string, observability ...*localObservability) http.Handler {
 	type serviceLink struct {
 		Name string
 		URL  string
@@ -694,7 +708,14 @@ func localIngressHandler(router *Router, exposed map[string]string, port string)
 		})
 	}
 	var page strings.Builder
-	pageErr := localIndexTemplate.Execute(&page, links)
+	var telemetry *localObservability
+	if len(observability) > 0 {
+		telemetry = observability[0]
+	}
+	pageErr := localIndexTemplate.Execute(&page, struct {
+		Services      []serviceLink
+		Observability *localObservability
+	}{links, telemetry})
 	return http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		host := request.Host
 		if strings.Contains(host, ":") {
@@ -710,15 +731,15 @@ func localIngressHandler(router *Router, exposed map[string]string, port string)
 		host = strings.ToLower(strings.TrimSuffix(host, "."))
 		name, ok := exposed[host]
 		if !ok {
+			landingHost := host == "localhost" || host == "127.0.0.1" || host == "::1"
+			readPage := request.Method == http.MethodGet || request.Method == http.MethodHead
 			if pageErr != nil {
 				log.Printf("render local service index: %v", pageErr)
 				http.Error(w, "could not render local service index", http.StatusInternalServerError)
 				return
 			}
 			status := http.StatusNotFound
-			if (host == "localhost" || host == "127.0.0.1" || host == "::1") &&
-				request.URL.Path == "/" &&
-				(request.Method == http.MethodGet || request.Method == http.MethodHead) {
+			if landingHost && request.URL.Path == "/" && readPage {
 				status = http.StatusOK
 			}
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -734,7 +755,14 @@ func localIngressHandler(router *Router, exposed map[string]string, port string)
 var localIndexTemplate = template.Must(template.New("services").Parse(`<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><title>Lampyr local services</title></head>
 <body><h1>Lampyr local services</h1><p>Choose an exposed service:</p>
-<ul>{{range .}}<li><a href="{{.URL}}">{{.Name}}</a></li>{{else}}<li>No services are exposed.</li>{{end}}</ul>
+<ul>{{range .Services}}<li><a href="{{.URL}}">{{.Name}}</a></li>{{else}}<li>No services are exposed.</li>{{end}}</ul>
+{{with .Observability}}<h2>Observability</h2>
+<p>Metrics and traces for all services, including calls through bindings.</p>
+<ul><li><a href="{{.Prometheus}}/query">Prometheus — metrics</a>
+(try <code>lampyr_router_request_duration_seconds_count</code>).</li>
+<li><a href="{{.Jaeger}}/search?service=lampyr-local">Jaeger — traces</a>
+(send a request, then select Find Traces).</li></ul>
+<p>Session data is removed when <code>ly dev</code> exits.</p>{{end}}
 </body></html>
 `))
 

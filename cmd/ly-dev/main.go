@@ -23,7 +23,7 @@ func main() {
 
 func run() error {
 	if len(os.Args) == 2 && os.Args[1] == "--protocol-version" {
-		fmt.Println("3")
+		fmt.Println("4")
 		return nil
 	}
 	if len(os.Args) != 2 {
