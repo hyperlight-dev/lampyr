@@ -59,11 +59,11 @@ def main():
     assert base.scheme in ("http", "https") and base.hostname
     hostname = args.host or ("worker-api.default.localhost" if base.scheme == "http" else base.netloc)
 
-    def connect():
-        return open_connection(base, hostname, args.insecure)
+    def connect(host=None):
+        return open_connection(base, host or hostname, args.insecure)
 
     def request(path, status=200, host=None, content_type=False):
-        connection = connect()
+        connection = connect(host)
         connection.request("GET", path, headers={"Host": host or hostname})
         response = connection.getresponse()
         body = response.read()
