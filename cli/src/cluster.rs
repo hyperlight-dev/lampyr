@@ -240,11 +240,12 @@ pub(crate) const RUNTIME_SECRET: &str = "lampyr-runtime";
 /// The installation inputs for fiberd-k8s-controller, which only the
 /// platform reads. Providers refuse configuration keys they do not know, so
 /// these never reach them, and a reinstall keeps the ones it was given.
-const CONTROLLER_INPUTS: [&str; 4] = [
+const PLATFORM_INPUTS: [&str; 5] = [
     "controllerManifest",
     "grantImage",
     "helperImage",
     "zygoteRegistries",
+    "ingress",
 ];
 
 /// Where a platform package records the controller inputs it installs when
@@ -537,10 +538,11 @@ fn apply_existing_cluster_defaults(
     Ok(())
 }
 
-/// Fills each controller input the install was not given from the last
-/// install's, as fiberdImage and routerImage are.
-fn keep_controller_inputs(config: &mut Value, previous: &Value) {
-    for field in CONTROLLER_INPUTS {
+/// Fills each platform-only input the install was not given from the last
+/// install's. Providers refuse these settings because only the platform uses
+/// them.
+fn keep_platform_inputs(config: &mut Value, previous: &Value) {
+    for field in PLATFORM_INPUTS {
         if config.get(field).is_none()
             && let Some(value) = previous.get(field)
         {
@@ -549,23 +551,23 @@ fn keep_controller_inputs(config: &mut Value, previous: &Value) {
     }
 }
 
-fn without_controller_inputs(config: &Value) -> Result<Value> {
+fn without_platform_inputs(config: &Value) -> Result<Value> {
     let mut provider_config = config.clone();
     let mapping = provider_config
         .as_object_mut()
         .context("provider configuration must be a mapping")?;
-    for field in CONTROLLER_INPUTS {
+    for field in PLATFORM_INPUTS {
         mapping.remove(field);
     }
     Ok(provider_config)
 }
 
 /// What the provider is given for an operation other than install: the
-/// configuration without the controller inputs, which an uninstall may be
+/// configuration without the platform-only inputs, which an uninstall may be
 /// given in the same --provider-config as the install and the provider
 /// would refuse, and marked as a teardown for an uninstall.
 fn teardown_config(config: &Value, operation: Operation) -> Result<Value> {
-    let mut provider_config = without_controller_inputs(config)?;
+    let mut provider_config = without_platform_inputs(config)?;
     if operation == Operation::Uninstall {
         provider_config["teardown"] = true.into();
     }
@@ -598,7 +600,7 @@ fn install_config(
             "{field} must be nonempty text"
         );
     }
-    keep_controller_inputs(&mut config, previous);
+    keep_platform_inputs(&mut config, previous);
     let defaulted = fill_controller_defaults(
         config
             .as_object_mut()
@@ -668,7 +670,7 @@ fn lifecycle(
         let (config, defaulted) = install_config(config, &previous, &controller_defaults(root)?)?;
         require_template_registry(&installation.record.provider, &config)?;
         let eventing = config["eventing"] == true || previous["eventing"] == true;
-        let provider_config = without_controller_inputs(&config)?;
+        let provider_config = without_platform_inputs(&config)?;
         installation.invoke(Operation::Init, provider_config.clone(), host)?;
         let infrastructure_existed =
             installation.invoke(Operation::Inspect, provider_config.clone(), host)?["exists"]
@@ -699,7 +701,7 @@ fn lifecycle(
         for field in ["domain", "fiberdImage", "routerImage"] {
             settings.insert(field.into(), config[field].clone());
         }
-        for field in CONTROLLER_INPUTS {
+        for field in PLATFORM_INPUTS {
             if let Some(value) = config.get(field) {
                 settings.insert(field.into(), value.clone());
             }
@@ -1417,22 +1419,23 @@ mod tests {
     }
 
     #[test]
-    fn controller_inputs_stay_with_the_platform_across_reinstalls() {
+    fn platform_inputs_stay_with_the_platform_across_reinstalls() {
         let given = json!({
             "fiberdImage": "custom/fiberd:v1",
             "controllerManifest": "/controller.yaml",
             "grantImage": "registry/fiberd@sha256:1",
             "helperImage": "registry/helper@sha256:2",
             "zygoteRegistries": ["http://registry:5000/ci"],
+            "ingress": {"tls":{"mode":"existingSecret","secretName":"tls","secretNamespace":"security"}},
             "registryPort": 5002,
         });
         assert_eq!(
-            without_controller_inputs(&given).unwrap(),
+            without_platform_inputs(&given).unwrap(),
             json!({"fiberdImage": "custom/fiberd:v1", "registryPort": 5002})
         );
 
         let mut reinstall = json!({"grantImage": "registry/fiberd@sha256:3"});
-        keep_controller_inputs(&mut reinstall, &given);
+        keep_platform_inputs(&mut reinstall, &given);
         assert_eq!(reinstall["grantImage"], "registry/fiberd@sha256:3");
         assert_eq!(reinstall["controllerManifest"], "/controller.yaml");
         assert_eq!(reinstall["helperImage"], "registry/helper@sha256:2");
@@ -1440,10 +1443,11 @@ mod tests {
             reinstall["zygoteRegistries"],
             json!(["http://registry:5000/ci"])
         );
+        assert_eq!(reinstall["ingress"], given["ingress"]);
         assert!(reinstall.get("registryPort").is_none());
 
         let mut first = json!({});
-        keep_controller_inputs(&mut first, &json!({}));
+        keep_platform_inputs(&mut first, &json!({}));
         assert_eq!(first, json!({}));
     }
 
@@ -1456,6 +1460,7 @@ mod tests {
             "grantImage": "registry/fiberd@sha256:1",
             "helperImage": "registry/helper@sha256:2",
             "zygoteRegistries": ["http://registry:5000/ci"],
+            "ingress": {"tls":{"mode":"existingSecret","secretName":"tls","secretNamespace":"security"}},
         });
         assert_eq!(
             teardown_config(&given, Operation::Uninstall).unwrap(),
@@ -1483,7 +1488,11 @@ mod tests {
             json!([default_fiberd_image(), default_router_image()])
         );
         assert!(defaulted.is_empty());
-        for field in CONTROLLER_INPUTS {
+        for field in PLATFORM_INPUTS
+            .iter()
+            .copied()
+            .filter(|field| *field != "ingress")
+        {
             let mut missing = given.clone();
             missing.as_object_mut().unwrap().remove(field);
             // zygoteRegistries defaults to the installation's template
