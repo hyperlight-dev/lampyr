@@ -26,6 +26,7 @@ PLATFORM_STATIC = [
     "k8s/fiberd-tenant.yaml",
     "k8s/hyperlight-device-plugin.yaml",
     "k8s/serving-controller.yaml",
+    "upstream/pins.env",
 ]
 # Linux/amd64 for every platform target, but for ly-dev, which a
 # darwin-arm64 platform carries built for macOS: the rest run where a
@@ -49,6 +50,11 @@ TEMPLATE_TOOLS_DIRECTORY = "build/template-tools"
 # fiberd-k8s-controller input an install is not given from them.
 CONTROLLER_INPUTS = "build/controller-inputs.json"
 CONTROLLER_MANIFEST = "build/fiberd-k8s-controller.yaml"
+BOOTSTRAP_SOURCES = "k8s/upstream/sources.json"
+BOOTSTRAP_MANIFESTS = {
+    f"k8s/upstream/{name}.yaml"
+    for name in ("serving-crds", "serving-core", "kourier", "cert-manager")
+}
 PINNED_IMAGE = re.compile(r"[^@\s]+@sha256:[0-9a-f]{64}")
 MANIFEST_IMAGE = re.compile(r"^\s+(?:- )?image:\s*[\"']?([^\s\"']+)", re.MULTILINE)
 LOCAL_REGISTRY = re.compile(r"(?:localhost|127(?:\.\d{1,3}){3}|\[::1\])(?::\d+)?")
@@ -200,6 +206,7 @@ def platform_base_files(root, version, source_commit, image_tag=None, platform_t
             if name.endswith(".yaml"):
                 text = PREVIEW_IMAGE.sub(rf"\g<1>:{image_tag}", path.read_text())
                 files[name] = text.encode()
+    files.update(bootstrap_manifest_files(root))
     for name in PLATFORM_BINARIES:
         if name == "ly-dev" and platform_target == "darwin-arm64":
             source = root / "build/ly-dev-darwin-arm64"
@@ -215,6 +222,41 @@ def platform_base_files(root, version, source_commit, image_tag=None, platform_t
     files.update(controller_input_files(root))
     files[".lampyr-platform"] = (version + "\n").encode()
     files[".lampyr-platform-commit"] = (source_commit + "\n").encode()
+    return files
+
+
+def bootstrap_manifest_files(root):
+    source = regular(root / BOOTSTRAP_SOURCES).read_bytes()
+    document = json.loads(source)
+    if (not isinstance(document, dict)
+            or set(document) != {"schemaVersion", "manifests"}
+            or type(document["schemaVersion"]) is not int
+            or document["schemaVersion"] != 1
+            or not isinstance(document["manifests"], list)):
+        raise ValueError(f"{BOOTSTRAP_SOURCES} has an invalid manifest inventory")
+    files = {BOOTSTRAP_SOURCES: source}
+    for manifest in document["manifests"]:
+        if (not isinstance(manifest, dict)
+                or set(manifest) != {"path", "version", "url", "license", "sha256"}
+                or not isinstance(manifest["path"], str)
+                or manifest["path"] not in BOOTSTRAP_MANIFESTS
+                or manifest["path"] in files
+                or not isinstance(manifest["version"], str)
+                or not manifest["version"]
+                or not isinstance(manifest["url"], str)
+                or not manifest["url"].startswith("https://")
+                or manifest["license"] != "Apache-2.0"
+                or not isinstance(manifest["sha256"], str)
+                or not re.fullmatch(r"[0-9a-f]{64}", manifest["sha256"])):
+            raise ValueError(f"{BOOTSTRAP_SOURCES} has an invalid manifest entry")
+        name = manifest["path"]
+        content = regular(root / name).read_bytes()
+        checksum = hashlib.sha256(content).hexdigest()
+        if not content or checksum != manifest["sha256"]:
+            raise ValueError(f"{name} has SHA-256 {checksum}, not the pinned {manifest['sha256']}")
+        files[name] = content
+    if files.keys() - {BOOTSTRAP_SOURCES} != BOOTSTRAP_MANIFESTS:
+        raise ValueError(f"{BOOTSTRAP_SOURCES} must list every bundled bootstrap manifest")
     return files
 
 

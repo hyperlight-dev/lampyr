@@ -4,6 +4,7 @@ import io
 import json
 from pathlib import Path
 import runpy
+import shutil
 import sys
 import tarfile
 import tempfile
@@ -23,6 +24,10 @@ MACHO_ARM64 = b"\xcf\xfa\xed\xfe\x0c\x00\x00\x01" + bytes(24)
 
 
 def write_template_tools(root, linux):
+    shutil.copytree(
+        Path(__file__).resolve().parents[2] / "k8s/upstream",
+        root / "k8s/upstream",
+    )
     for target, header in (("linux-amd64", linux), ("darwin-arm64", MACHO_ARM64)):
         for name in packaging["TEMPLATE_TOOLS"]:
             path = root / packaging["TEMPLATE_TOOLS_DIRECTORY"] / target / name
@@ -223,6 +228,8 @@ class PackagingTests(unittest.TestCase):
             self.assertEqual(
                 set(files),
                 {
+                    *packaging["BOOTSTRAP_MANIFESTS"],
+                    packaging["BOOTSTRAP_SOURCES"],
                     ".lampyr-platform",
                     ".lampyr-platform-commit",
                     "LICENSE",
@@ -237,6 +244,7 @@ class PackagingTests(unittest.TestCase):
                     "k8s/fiberd-tenant.yaml",
                     "k8s/hyperlight-device-plugin.yaml",
                     "k8s/serving-controller.yaml",
+                    "upstream/pins.env",
                 },
             )
             for excluded in (
@@ -305,7 +313,15 @@ class PackagingTests(unittest.TestCase):
             digest = "sha256:" + "ab" * 32
             inputs = root / "build/controller-inputs.json"
             manifest = root / "build/fiberd-k8s-controller.yaml"
-            manifest.write_text("kind: Deployment\n")
+            manifest.write_text(
+                "apiVersion: apiextensions.k8s.io/v1\n"
+                "kind: CustomResourceDefinition\n"
+                "metadata: {name: capacitygrants.fiberd.io}\n"
+                "---\n"
+                "apiVersion: apiextensions.k8s.io/v1\n"
+                "kind: CustomResourceDefinition\n"
+                "metadata: {name: grantpolicies.fiberd.io}\n"
+            )
             valid = {
                 "controllerManifest": "build/fiberd-k8s-controller.yaml",
                 "grantImage": f"ghcr.io/hyperlight-dev/lampyr/upstream-fiberd@{digest}",
@@ -317,6 +333,13 @@ class PackagingTests(unittest.TestCase):
 
             self.assertEqual(files["build/controller-inputs.json"], inputs)
             self.assertEqual(files["build/fiberd-k8s-controller.yaml"], manifest)
+            archive = root / "platform.tar.gz"
+            packaging["archive"](archive, files)
+            with tarfile.open(archive, "r:gz") as bundle:
+                self.assertEqual(
+                    bundle.extractfile("build/fiberd-k8s-controller.yaml").read(),
+                    manifest.read_bytes(),
+                )
             for invalid, message in (
                 ({**valid, "grantImage": "ghcr.io/team/fiberd:v1"}, "grantImage must be pinned"),
                 ({**valid, "controllerManifest": "../controller.yaml"}, "must name"),

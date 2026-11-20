@@ -94,6 +94,7 @@ test-handler-contracts: build
 # Check standalone archive integrity and filesystem boundaries.
 test-packaging:
     python3 "{{repo-root}}/scripts/tests/test_package_platform.py"
+    python3 "{{repo-root}}/scripts/tests/test_bootstrap_manifests.py"
     just --justfile "{{repo-root}}/providers/Justfile" test-snapshots
 
 # Use the same executable intent documents as the Go baseline.

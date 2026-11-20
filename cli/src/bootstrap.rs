@@ -13,11 +13,13 @@ use serde_json::{Value, json};
 
 use crate::kube::{Kube, SYSTEM};
 
-const SERVING: &str = "https://github.com/knative/serving/releases/download/knative-v1.23.0";
-const KOURIER: &str =
-    "https://github.com/knative/net-kourier/releases/download/knative-v1.23.0/kourier.yaml";
-const CERT_MANAGER: &str =
-    "https://github.com/cert-manager/cert-manager/releases/download/v1.21.3/cert-manager.yaml";
+const BUNDLED_SOURCES: &str = include_str!("../../k8s/upstream/sources.json");
+const BUNDLED_MANIFESTS: &[&str] = &[
+    "serving-crds.yaml",
+    "serving-core.yaml",
+    "kourier.yaml",
+    "cert-manager.yaml",
+];
 /// fiberd-k8s-controller labels every grant Pod it creates with this.
 const GRANT_POD_SELECTOR: &str = "app.kubernetes.io/managed-by=fiberd-k8s-controller";
 const CONTROLLER_NAMESPACE: &str = "fiberd-system";
@@ -78,37 +80,57 @@ struct CoreInventory {
 pub(crate) const CORE_INVENTORY_KEY: &str = "coreManifestInventory";
 const CORE_INVENTORY_LIMIT: usize = 384 * 1024;
 
-/// The SHA-256 of downloaded manifests the release publishes no checksum
-/// for, so a replaced release asset is refused rather than applied.
-const PINNED_MANIFESTS: &[(&str, &str)] = &[(
-    CERT_MANAGER,
-    "c04a51295adda2b1a775146751f973e787190778c7f35180861d9678876e5c74",
-)];
+fn bundled_manifest(root: &Path, name: &str) -> Result<String> {
+    use sha2::Digest as _;
+    ensure!(
+        BUNDLED_MANIFESTS.contains(&name),
+        "unknown bundled manifest {name}"
+    );
+    let relative = format!("k8s/upstream/{name}");
+    let sources: Value = serde_json::from_str(BUNDLED_SOURCES)?;
+    let expected = sources["manifests"]
+        .as_array()
+        .context("bundled manifest source inventory is invalid")?
+        .iter()
+        .find(|manifest| manifest["path"] == relative)
+        .and_then(|manifest| manifest["sha256"].as_str())
+        .context("bundled manifest checksum is missing")?;
+    let path = root.join(&relative);
+    let source = std::fs::read_to_string(&path).with_context(|| {
+        format!(
+            "read bundled platform manifest {}; restore the platform bundle",
+            path.display()
+        )
+    })?;
+    let digest: String = sha2::Sha256::digest(source.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    ensure!(
+        digest == expected,
+        "bundled platform manifest {} has SHA-256 {digest}, not the pinned {expected}; restore the platform bundle",
+        path.display()
+    );
+    Ok(source)
+}
+
+fn apply_bundled_manifest(
+    kube: &Kube<'_>,
+    options: &Options<'_>,
+    name: &str,
+    inventory: &mut Vec<Value>,
+) -> Result<()> {
+    let source = bundled_manifest(options.root, name)?;
+    apply_recorded_text_with(kube, options.installation_id, &source, inventory, &[])
+}
 
 fn manifest_source(kube: &Kube<'_>, source: &str) -> Result<String> {
     if source.starts_with("https://") {
-        let text = crate::platform::download_text(source, 8 * 1024 * 1024, kube.host)
-            .context("download platform manifest")?;
-        check_pinned_manifest(source, &text)?;
-        Ok(text)
+        crate::platform::download_text(source, 8 * 1024 * 1024, kube.host)
+            .context("download platform manifest")
     } else {
         std::fs::read_to_string(source).with_context(|| format!("read {source}"))
     }
-}
-
-fn check_pinned_manifest(source: &str, text: &str) -> Result<()> {
-    use sha2::Digest as _;
-    if let Some((_, expected)) = PINNED_MANIFESTS.iter().find(|(url, _)| *url == source) {
-        let digest: String = sha2::Sha256::digest(text.as_bytes())
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect();
-        ensure!(
-            digest == *expected,
-            "{source} has SHA-256 {digest}, not the pinned {expected}"
-        );
-    }
-    Ok(())
 }
 
 fn manifest_items(source: &str) -> Result<Vec<Value>> {
@@ -179,7 +201,17 @@ fn apply_recorded_source_with(
     flags: &[&str],
 ) -> Result<()> {
     let source = manifest_source(kube, source)?;
-    let items = manifest_items(&source)?;
+    apply_recorded_text_with(kube, installation_id, &source, inventory, flags)
+}
+
+fn apply_recorded_text_with(
+    kube: &Kube<'_>,
+    installation_id: &str,
+    source: &str,
+    inventory: &mut Vec<Value>,
+    flags: &[&str],
+) -> Result<()> {
+    let items = manifest_items(source)?;
     for item in &items {
         record_manifest(item, inventory)?;
     }
@@ -426,6 +458,9 @@ pub fn install(kube: &Kube<'_>, options: &Options<'_>) -> Result<()> {
     );
     ensure!(options.https_port > 0, "HTTPS port must be positive");
     crate::project::validate_name(options.name)?;
+    for &name in BUNDLED_MANIFESTS {
+        bundled_manifest(options.root, name)?;
+    }
     claim(
         kube,
         options.name,
@@ -596,12 +631,7 @@ fn install_platform(
                     "--timeout=120s",
                 ],
             )?;
-            apply_recorded_source(
-                kube,
-                options.installation_id,
-                &format!("{SERVING}/serving-crds.yaml"),
-                inventory,
-            )?;
+            apply_bundled_manifest(kube, options, "serving-crds.yaml", inventory)?;
             kube.wait_crds(
                 &["images.caching.internal.knative.dev"],
                 Duration::from_secs(180),
@@ -618,7 +648,7 @@ fn install_platform(
                     );
                 }
             }
-            let source = manifest_source(kube, &format!("{SERVING}/serving-core.yaml"))?;
+            let source = bundled_manifest(options.root, "serving-core.yaml")?;
             let core = minimal_serving_core(&source)?;
             apply_recorded_manifest(kube, options.installation_id, &core, inventory)?;
             rollout(kube, "knative-serving", "deployment", "webhook", "180s")?;
@@ -627,7 +657,7 @@ fn install_platform(
         })?;
     kube.host
         .step("Wiring your network and HTTPS ingress", || {
-            apply_recorded_source(kube, options.installation_id, KOURIER, inventory)?;
+            apply_bundled_manifest(kube, options, "kourier.yaml", inventory)?;
             rollout(
                 kube,
                 "knative-serving",
@@ -777,7 +807,7 @@ fn install_controller(
         .optional("default", "crd", "certificates.cert-manager.io")?
         .is_none()
     {
-        apply_recorded_source(kube, options.installation_id, CERT_MANAGER, inventory)?;
+        apply_bundled_manifest(kube, options, "cert-manager.yaml", inventory)?;
         for deployment in [
             "cert-manager",
             "cert-manager-cainjector",
@@ -1445,6 +1475,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn bundled_manifests_load_locally_and_preserve_filtered_serving_inventory() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let mut inventory = Vec::new();
+        for &name in BUNDLED_MANIFESTS {
+            let source = bundled_manifest(root, name).unwrap();
+            let items = if name == "serving-core.yaml" {
+                let core = minimal_serving_core(&source).unwrap();
+                let items = core["items"].as_array().unwrap().clone();
+                assert!(items.iter().all(|item| !stock_serving_resource(item)));
+                assert!(items.iter().any(|item| {
+                    item["kind"] == "Deployment" && item["metadata"]["name"] == "webhook"
+                }));
+                items
+            } else {
+                manifest_items(&source).unwrap()
+            };
+            assert!(!items.is_empty(), "{name}");
+            for item in &items {
+                record_manifest(item, &mut inventory).unwrap();
+            }
+        }
+        for name in [
+            "services.serving.knative.dev",
+            "certificates.cert-manager.io",
+        ] {
+            assert!(inventory.iter().any(|item| {
+                item["kind"] == "CustomResourceDefinition" && item["metadata"]["name"] == name
+            }));
+        }
+        assert!(!inventory.iter().any(|item| {
+            item["kind"] == "Deployment" && item["metadata"]["name"] == "controller"
+        }));
+    }
+
+    #[test]
     fn crd_kinds_reads_one_group_and_kind_a_line() {
         assert!(crd_kinds("").is_empty());
         assert_eq!(
@@ -1558,8 +1623,15 @@ metadata: {name: lampyr-grant-homes, namespace: default}
         // No current manifest applies a retired object, which a reinstall
         // would otherwise delete and apply again.
         let k8s = Path::new(env!("CARGO_MANIFEST_DIR")).join("../k8s");
-        for entry in std::fs::read_dir(k8s).unwrap() {
-            let source = std::fs::read_to_string(entry.unwrap().path()).unwrap();
+        for entry in std::fs::read_dir(&k8s)
+            .unwrap()
+            .chain(std::fs::read_dir(k8s.join("upstream")).unwrap())
+        {
+            let path = entry.unwrap().path();
+            if path.extension().is_none_or(|extension| extension != "yaml") {
+                continue;
+            }
+            let source = std::fs::read_to_string(path).unwrap();
             let mut current = Vec::new();
             for item in manifest_items(&source).unwrap() {
                 record_manifest(&item, &mut current).unwrap();
@@ -1625,11 +1697,33 @@ metadata: {name: lampyr-grant-homes, namespace: default}
     }
 
     #[test]
-    fn pinned_manifests_must_match_their_checksum() {
-        let error = check_pinned_manifest(CERT_MANAGER, "kind: Namespace\n").unwrap_err();
-        assert!(error.to_string().contains("not the pinned"), "{error}");
-        check_pinned_manifest(&format!("{SERVING}/serving-crds.yaml"), "anything").unwrap();
-        check_pinned_manifest("k8s/fiber-router.yaml", "anything").unwrap();
+    fn bundled_manifests_refuse_missing_or_invalid_files_without_download_fallback() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let directory = tempfile::tempdir_in(root).unwrap();
+        std::fs::create_dir_all(directory.path().join("k8s/upstream")).unwrap();
+        for &name in BUNDLED_MANIFESTS {
+            let path = directory.path().join("k8s/upstream").join(name);
+            let error = bundled_manifest(directory.path(), name).unwrap_err();
+            assert!(
+                error.to_string().contains(&path.display().to_string()),
+                "{error}"
+            );
+            assert!(
+                error.to_string().contains("bundled platform manifest"),
+                "{error}"
+            );
+            std::fs::copy(root.join("k8s/upstream").join(name), &path).unwrap();
+            assert_eq!(
+                bundled_manifest(directory.path(), name).unwrap(),
+                bundled_manifest(root, name).unwrap()
+            );
+            for invalid in ["", "invalid: [yaml", "kind: Namespace\n"] {
+                std::fs::write(&path, invalid).unwrap();
+                let error = bundled_manifest(directory.path(), name).unwrap_err();
+                assert!(error.to_string().contains("not the pinned"), "{error}");
+                assert!(error.to_string().contains(name), "{error}");
+            }
+        }
     }
 
     #[test]
