@@ -215,6 +215,38 @@ func TestTracingTransportPreservesUpgradeCloseWrite(t *testing.T) {
 	}
 }
 
+func TestTracedRoundTripperRestoresUpgradeWriter(t *testing.T) {
+	body := &closedUpgradeBody{}
+	transport := &tracedRoundTripper{transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		capture := request.Context().Value(upgradeCloseWriteCaptureKey{}).(*upgradeCloseWriteCapture)
+		capture.closeWriter = body
+		return &http.Response{
+			Status:     "101 Switching Protocols",
+			StatusCode: http.StatusSwitchingProtocols,
+			Header: http.Header{
+				"Connection": {"Upgrade"},
+				"Upgrade":    {"websocket"},
+			},
+			Body:    struct{ io.ReadCloser }{body},
+			Request: request,
+		}, nil
+	})}
+	request := httptest.NewRequest("GET", "http://fiber/socket", nil)
+	request.Header.Set("Connection", "Upgrade")
+	request.Header.Set("Upgrade", "websocket")
+	response, err := transport.RoundTrip(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if _, ok := response.Body.(io.ReadWriteCloser); !ok {
+		t.Fatal("traced upgrade body did not restore io.ReadWriteCloser")
+	}
+	if _, ok := response.Body.(interface{ CloseWrite() error }); !ok {
+		t.Fatal("traced upgrade body did not restore CloseWrite")
+	}
+}
+
 func TestRouterMetricsMeasureOnlyWebSocketSession(t *testing.T) {
 	const delay = 150 * time.Millisecond
 	routes := t.TempDir()

@@ -289,13 +289,86 @@ func NewRouter(homes HomeResolver, routesDir string) (*Router, error) {
 	return router, nil
 }
 
+type upgradeCloseWriter interface {
+	CloseWrite() error
+}
+
+type upgradeCloseWriteCapture struct {
+	closeWriter upgradeCloseWriter
+}
+
+type upgradeCloseWriteCaptureKey struct{}
+
+type upgradeCloseWriteTransport struct {
+	transport http.RoundTripper
+}
+
+func (transport upgradeCloseWriteTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	response, err := transport.transport.RoundTrip(request)
+	if err != nil || response == nil || response.StatusCode != http.StatusSwitchingProtocols {
+		return response, err
+	}
+	capture, _ := request.Context().Value(upgradeCloseWriteCaptureKey{}).(*upgradeCloseWriteCapture)
+	if capture != nil {
+		capture.closeWriter, _ = response.Body.(upgradeCloseWriter)
+	}
+	return response, nil
+}
+
+type tracedRoundTripper struct {
+	transport http.RoundTripper
+}
+
+type tracedUpgradeBody struct {
+	io.ReadCloser
+	writer      io.Writer
+	closeWriter upgradeCloseWriter
+}
+
+func (body *tracedUpgradeBody) Write(data []byte) (int, error) {
+	return body.writer.Write(data)
+}
+
+func (body *tracedUpgradeBody) CloseWrite() error {
+	return body.closeWriter.CloseWrite()
+}
+
+func (transport *tracedRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
+	if request.Header.Get("Upgrade") == "" {
+		return transport.transport.RoundTrip(request)
+	}
+	capture := new(upgradeCloseWriteCapture)
+	request = request.WithContext(
+		context.WithValue(request.Context(), upgradeCloseWriteCaptureKey{}, capture),
+	)
+	response, err := transport.transport.RoundTrip(request)
+	if err != nil || response == nil || response.StatusCode != http.StatusSwitchingProtocols ||
+		capture.closeWriter == nil {
+		return response, err
+	}
+	writer, ok := response.Body.(io.Writer)
+	if !ok {
+		writer, ok = capture.closeWriter.(io.Writer)
+	}
+	if !ok {
+		_ = response.Body.Close()
+		return nil, fmt.Errorf("traced upgrade response body %T is not writable", response.Body)
+	}
+	response.Body = &tracedUpgradeBody{
+		ReadCloser:  response.Body,
+		writer:      writer,
+		closeWriter: capture.closeWriter,
+	}
+	return response, nil
+}
+
 func tracedTransport(transport http.RoundTripper, options ...otelhttp.Option) http.RoundTripper {
-	options = append([]otelhttp.Option{
-		otelhttp.WithFilter(func(request *http.Request) bool {
-			return request.Header.Get("Upgrade") == ""
-		}),
-	}, options...)
-	return otelhttp.NewTransport(transport, options...)
+	return &tracedRoundTripper{
+		transport: otelhttp.NewTransport(
+			upgradeCloseWriteTransport{transport: transport},
+			options...,
+		),
+	}
 }
 
 func newH2CTransport() http.RoundTripper {
