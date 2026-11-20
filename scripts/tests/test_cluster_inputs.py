@@ -103,14 +103,15 @@ class ClusterInputsTests(unittest.TestCase):
                 self.assertEqual(args[:-1], expected_prefix)
                 self.assertTrue(args[-1].endswith("/fiberd.tar.gz"))
 
-    @unittest.skipIf(os.geteuid() == 0, "root can search an unsearchable output directory")
     def test_release_asset_stops_when_output_parent_cannot_resolve(self):
-        body = recipe("release-asset")
+        body = (
+            'cd() { [[ $1 != "$FAIL_CD" ]] || return 1; builtin cd "$@"; }\n'
+            + recipe("release-asset")
+        )
         with tempfile.TemporaryDirectory() as directory:
             work = Path(directory)
             locked = work / "locked"
             locked.mkdir()
-            locked.chmod(0o600)
             bin_dir = work / "bin"
             bin_dir.mkdir()
             mktemp_args = work / "mktemp-args"
@@ -128,22 +129,20 @@ class ClusterInputsTests(unittest.TestCase):
                 command = bin_dir / name
                 command.write_text(script)
                 command.chmod(0o755)
-            try:
-                result = bash(
-                    body,
-                    "Azure/fiberd",
-                    "1" * 40,
-                    "0.4.0",
-                    "fiberd.tar.gz",
-                    "0" * 64,
-                    str(locked / "output"),
-                    MKTEMP_ARGS=str(mktemp_args),
-                    SAFE_TMP=str(safe_tmp),
-                    CHECKSUM="0" * 64,
-                    PATH=f"{bin_dir}:{os.environ['PATH']}",
-                )
-            finally:
-                locked.chmod(0o700)
+            result = bash(
+                body,
+                "Azure/fiberd",
+                "1" * 40,
+                "0.4.0",
+                "fiberd.tar.gz",
+                "0" * 64,
+                str(locked / "output"),
+                FAIL_CD=str(locked),
+                MKTEMP_ARGS=str(mktemp_args),
+                SAFE_TMP=str(safe_tmp),
+                CHECKSUM="0" * 64,
+                PATH=f"{bin_dir}:{os.environ['PATH']}",
+            )
             self.assertNotEqual(result.returncode, 0)
             self.assertFalse(mktemp_args.exists(), "recipe continued after output resolution failed")
 
