@@ -40,6 +40,22 @@ var (
 		Buckets: []float64{.01, .025, .05, .1, .15, .2, .3, .5, .75, 1, 1.5, 2, 2.25, 2.5, 3, 4, 5, 10, 30},
 	}, []string{"namespace", "revision", "code"})
 
+	requestsInFlight = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "lampyr_router_requests_in_flight",
+		Help: "Requests currently waiting to acquire a Fiber or proxying through one, by Revision and stage.",
+	}, []string{"namespace", "revision", "stage"})
+
+	websocketSessions = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "lampyr_router_websocket_sessions",
+		Help: "WebSocket sessions currently proxied through a Fiber, by Revision.",
+	}, []string{"namespace", "revision"})
+
+	websocketSessionSeconds = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "lampyr_router_websocket_session_duration_seconds",
+		Help:    "Completed WebSocket session duration, by Revision and outcome: closed, timeout, or error.",
+		Buckets: []float64{1, 5, 10, 30, 60, 300, 900, 1800, 3600},
+	}, []string{"namespace", "revision", "outcome"})
+
 	shedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "lampyr_router_shed_total",
 		Help: "Requests the Revision's home refused: at fibers.max, too busy restoring to start a Fiber within the request's deadline, or under memory or task-limit (pids) pressure, or still over its clone rate limit at the acquire deadline.",
@@ -52,7 +68,8 @@ var (
 )
 
 func init() {
-	registry.MustRegister(fibersBusy, fiberAcquireSeconds, requestSeconds, shedTotal, cloneRetriesTotal,
+	registry.MustRegister(fibersBusy, fiberAcquireSeconds, requestSeconds, requestsInFlight,
+		websocketSessions, websocketSessionSeconds, shedTotal, cloneRetriesTotal,
 		prometheus.NewGoCollector(), prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}))
 }
 
@@ -68,7 +85,9 @@ func MetricsHandler() http.Handler {
 // can still flush streams and hijack WebSocket upgrades.
 type statusRecorder struct {
 	http.ResponseWriter
-	code int
+	code     int
+	switched bool
+	onSwitch func()
 	// failed is set when the router saw the request fail: no Fiber, a
 	// proxy error, or a response copy that broke after the headers.
 	failed bool
@@ -100,6 +119,10 @@ func (recorder *statusRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	// connection, for one) the proxy's error response is recorded instead.
 	if err == nil && recorder.code == 0 {
 		recorder.code = http.StatusSwitchingProtocols
+		recorder.switched = true
+		if recorder.onSwitch != nil {
+			recorder.onSwitch()
+		}
 	}
 	return connection, buffer, err
 }
@@ -149,6 +172,17 @@ func observeRequest(namespace, revision string, code int, start time.Time) {
 	requestSeconds.WithLabelValues(namespace, revision, statusLabel(code)).Observe(time.Since(start).Seconds())
 }
 
+func websocketOutcome(recorder *statusRecorder, revision context.Context) string {
+	switch {
+	case revision != nil && errors.Is(revision.Err(), context.DeadlineExceeded):
+		return "timeout"
+	case recorder.failed:
+		return "error"
+	default:
+		return "closed"
+	}
+}
+
 // revisionMetrics records a Revision's series only while the route they
 // were taken for still exists. A request still in flight when its Revision
 // is removed would otherwise recreate series that nothing deletes again.
@@ -182,6 +216,9 @@ func forgetRevision(namespace, revision string) {
 	fibersBusy.DeletePartialMatch(labels)
 	fiberAcquireSeconds.DeletePartialMatch(labels)
 	requestSeconds.DeletePartialMatch(labels)
+	requestsInFlight.DeletePartialMatch(labels)
+	websocketSessions.DeletePartialMatch(labels)
+	websocketSessionSeconds.DeletePartialMatch(labels)
 	shedTotal.DeletePartialMatch(labels)
 	cloneRetriesTotal.DeletePartialMatch(labels)
 }
