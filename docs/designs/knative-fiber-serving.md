@@ -161,11 +161,12 @@ Lampyr runs a Revision only from a fiberd template sealed to the cluster's
 fleet key, so the proof first deploys the service with `ly deploy` to build,
 seal and push one, deletes it, and gives the shared Knative Service that
 template's `lampyr.dev/fiberd-template`, which stock Knative ignores.
-fiberd-k8s-controller has no release yet, so the proof, like every cluster
-suite, needs its installation inputs: `LAMPYR_CONTROLLER_MANIFEST`,
+The proof, like every cluster suite, needs its installation inputs:
+`LAMPYR_CONTROLLER_MANIFEST`,
 `LAMPYR_GRANT_IMAGE` and `LAMPYR_HELPER_IMAGE`, and, unless `build/zygotectl`
-and `build/grant-issuer` exist, `LAMPYR_FIBERD_SRC` naming the fiberd checkout
-that builds them. In place of all four, `LAMPYR_CLUSTER_INPUTS` may name the
+and `build/grant-issuer` exist, `just template-tools` downloads their verified
+Fiberd release archive. In place of all three inputs and the tools,
+`LAMPYR_CLUSTER_INPUTS` may name the
 directory `just upstream::cluster-inputs` builds them into, as CI does (see
 [Cluster suite inputs](../contributing.md#cluster-suite-inputs)).
 

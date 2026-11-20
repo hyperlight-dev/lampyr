@@ -16,8 +16,6 @@ readonly -a images=(
     azure-node-setup
     eventgrid-controller
     eventgrid-adapter
-    upstream-fiberd
-    fiberd-k8s-controller
 )
 readonly -a assets=(
     build/dist/lampyr-cli-linux-amd64-preview.tar.gz
@@ -82,8 +80,6 @@ gh release create "$PREVIEW_TAG" \
         "- ${IMAGE_PREFIX}/azure-node-setup:preview-${GITHUB_SHA}" \
         "- ${IMAGE_PREFIX}/eventgrid-controller:preview-${GITHUB_SHA}" \
         "- ${IMAGE_PREFIX}/eventgrid-adapter:preview-${GITHUB_SHA}" \
-        "- ${IMAGE_PREFIX}/upstream-fiberd:preview-${GITHUB_SHA}" \
-        "- ${IMAGE_PREFIX}/fiberd-k8s-controller:preview-${GITHUB_SHA}" \
         "" \
         "The :preview tags are post-release convenience aliases.")" \
     --prerelease

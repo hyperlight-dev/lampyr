@@ -195,8 +195,8 @@ The response is:
 Hyperlight snapshots are CPU-vendor-specific. Create the snapshot on the target
 AKS cluster instead of assuming the workstation CPU matches. A template build
 needs the helper and fiberd's template tools: a released platform carries them,
-and a checkout builds them first with `just template-tools`, from the
-fiberd commit `upstream/pins.env` pins:
+and a checkout downloads their checksum-pinned, attested release archive with
+`just template-tools`:
 
 ```bash
 just template-tools   # from a checkout only

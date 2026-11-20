@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 
-# Shared by the cluster integration suites. fiberd-k8s-controller has no
-# release yet, so its manifest, the stock fiberd image grant Pods run and
-# Lampyr's helper image are installation inputs, as for ly cluster install:
+# Shared by the cluster integration suites. The controller manifest, the
+# upstream fiberd image and Lampyr's helper image are installation inputs,
+# as for ly cluster install:
 #
 #   LAMPYR_CONTROLLER_MANIFEST  the controller's install manifest, a path or
 #                               an https:// URL
@@ -14,14 +14,14 @@
 #                               grant-issuer for ly build and ly deploy;
 #                               unset, they must already be in build/
 #
-# Or, in place of all four, and refused alongside any of them, inputs
-# built rather than published:
+# Or, in place of all four, and refused alongside any of them, a prepared
+# directory that combines verified upstream releases with Lampyr's helper:
 #
 #   LAMPYR_CLUSTER_INPUTS       the directory just upstream::cluster-inputs
 #                               wrote, as CI does
 #
 # Sourcing checks them, so a suite fails before it creates anything.
-# Built images are pulled from the suite's own registry, so a suite calls
+# Prepared images are pulled from the suite's own registry, so a suite calls
 # cluster_input_images with that registry before it installs, adds
 # controller_images to the images its provider loads, and calls
 # push_cluster_inputs once the registry serves and before it deploys.

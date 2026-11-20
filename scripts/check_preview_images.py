@@ -44,13 +44,6 @@ IMAGES = (
         ("build/hluk-helper",),
     ),
     Image(
-        "fiberd-k8s-controller",
-        ".",
-        "upstream/controller.Dockerfile",
-        (),
-        ("build/fiberd-k8s-controller",),
-    ),
-    Image(
         "azure-node-setup",
         "providers/azure/node-setup",
         "providers/azure/node-setup/Dockerfile",

@@ -182,6 +182,10 @@ GrantPolicy lists their repositories. `ly cluster install` checks all three
 before the provider creates anything. A reinstall applies cert-manager only to
 a cluster without it, so Lampyr never upgrades a cert-manager it installed.
 
+Lampyr adds `runtimes.fiberd.io/hyperlight=true` only to namespace `default`.
+The GrantPolicy permits only Hyperlight. It allows no runtime in a namespace
+without a runtime label.
+
 ## Fiberd templates
 
 `ly deploy` pushes every Revision's fiberd template to one repository per

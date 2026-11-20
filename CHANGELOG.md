@@ -4,6 +4,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Prerelease] - Unreleased
 
+### Changed
+
+- Releases use the signed, digest-pinned Azure/fiberd v0.4.0 and Azure/fiberd-k8s-controller v0.1.0 images. Lampyr no longer builds or publishes copies of these images. Platform archives keep the matching controller install manifest and template tools.
+
 ## [0.1.1] - 2026-11-07
 
 ### Fixed

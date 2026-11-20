@@ -16,7 +16,7 @@ tag="${GITHUB_REF#refs/tags/}"
 }
 version="${tag#v}"
 readonly tag version
-readonly -a images=(fiberd fiber-router hluk-helper azure-node-setup eventgrid-controller eventgrid-adapter upstream-fiberd fiberd-k8s-controller)
+readonly -a images=(fiberd fiber-router hluk-helper azure-node-setup eventgrid-controller eventgrid-adapter)
 readonly -a assets=(
     "build/dist/lampyr-cli-linux-amd64-${version}.tar.gz"
     "build/dist/lampyr-cli-linux-amd64-${version}.tar.gz.sha256"

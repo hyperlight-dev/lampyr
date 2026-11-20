@@ -49,8 +49,8 @@ prepare-fiber-router-image:
     GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o build/fiber-router ./cmd/fiber-router
     python3 "{{repo-root}}/scripts/check_preview_images.py" --root "{{repo-root}}" --image fiber-router --require-binaries
 
-# The helper records a template's --version facts; zygotectl and grant-issuer
-# come from a fiberd checkout that builds Hyperlight snapshot artifacts.
+# The helper records a template's --version facts. The default tools come from
+# Fiberd's checksum-pinned, attested release archives.
 
 # Build the helper, zygotectl and grant-issuer that fiberd templates need.
 [positional-arguments]
@@ -58,15 +58,22 @@ fiberd-template-tools fiberd: helper::prepare-image
     CGO_ENABLED=0 go -C "$1" build -trimpath -o "{{repo-root}}/build/zygotectl" ./cmd/zygotectl
     CGO_ENABLED=0 go -C "$1" build -trimpath -o "{{repo-root}}/build/grant-issuer" ./cmd/grant-issuer
 
-# zygotectl and grant-issuer come from the fiberd upstream/pins.env pins.
-
-# Build the helper, zygotectl and grant-issuer into build/ for this checkout's ly.
-template-tools: (upstream::source "fiberd")
-    just --justfile "{{repo-root}}/Justfile" fiberd-template-tools "{{repo-root}}/build/upstream/fiberd"
+# Prepare the helper and released host tools into build/ for this checkout's ly.
+template-tools: helper::prepare-image
+    case "$(uname -sm)" in \
+      "Darwin arm64") target=darwin-arm64 ;; \
+      "Darwin x86_64") target=darwin-amd64 ;; \
+      "Linux aarch64") target=linux-arm64 ;; \
+      "Linux x86_64") target=linux-amd64 ;; \
+      *) echo "unsupported fiberd tool platform: $(uname -sm)" >&2; exit 1 ;; \
+    esac; \
+    just --justfile "{{repo-root}}/upstream/Justfile" template-tools-target "$target"; \
+    for tool in zygotectl grant-issuer; do \
+      install -m 0755 "{{repo-root}}/build/template-tools/$target/$tool" "{{repo-root}}/build/$tool"; \
+    done
 
 # A platform package carries the helper, built from this checkout, and
-# zygotectl and grant-issuer for each of its targets, from the pinned
-# fiberd (scripts/package-platform.py).
+# zygotectl and grant-issuer from Fiberd's matching release archive.
 
 # Build the fiberd template tools every platform package carries.
 platform-template-tools: helper::prepare-image upstream::template-tools
@@ -85,7 +92,7 @@ build-dev-supervisor:
 build-eventgrid: azure::build-eventgrid
 
 # Prepare every Linux/amd64 preview image context without publishing it.
-prepare-preview-images: prepare-fiberd-image prepare-fiber-router-image helper::prepare-image upstream::prepare-fiberd-image upstream::prepare-controller-image azure::prepare-preview-images
+prepare-preview-images: prepare-fiberd-image prepare-fiber-router-image helper::prepare-image azure::prepare-preview-images
     python3 "{{repo-root}}/scripts/check_preview_images.py" --root "{{repo-root}}" --require-binaries
 
 # Package all preview release assets, including the verified installer entrypoint.

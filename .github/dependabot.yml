@@ -75,7 +75,6 @@ updates:
       - /helper
       - /providers/azure/eventgrid
       - /providers/azure/node-setup
-      - /upstream
     schedule:
       interval: monthly
     cooldown:

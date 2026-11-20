@@ -47,10 +47,6 @@ MATRIX = {
     "azure-node-setup": ("azure::prepare-node-setup-image", "providers/azure/node-setup", "providers/azure/node-setup/Dockerfile", "", ""),
     "eventgrid-controller": ("azure::prepare-eventgrid-controller-image", "providers/azure", "providers/azure/eventgrid/ci.Dockerfile", "", "BINARY=eventgrid-controller"),
     "eventgrid-adapter": ("azure::prepare-eventgrid-adapter-image", "providers/azure", "providers/azure/eventgrid/ci.Dockerfile", "", "BINARY=eventgrid-adapter"),
-    # Built from upstream/pins.env's commits: fiberd's own Dockerfile from its
-    # checkout, and the controller's manager in Lampyr's.
-    "upstream-fiberd": ("upstream::prepare-fiberd-image", "build/upstream/fiberd", "build/upstream/fiberd/docker/fiberd/Dockerfile", "fiberd", ""),
-    "fiberd-k8s-controller": ("upstream::prepare-controller-image", ".", "upstream/controller.Dockerfile", "", ""),
 }
 PINS_FILE = ROOT / "upstream/pins.env"
 HOSTED_ARCHIVE_KINDS = (
@@ -386,16 +382,8 @@ class PreviewWorkflowPolicyTests(unittest.TestCase):
         self.assertEqual(
             tuple(build["with"][key] for key in ("context", "file", "target", "build-args")),
             ("${{ matrix.context }}", "${{ matrix.dockerfile }}", "${{ matrix.target }}",
-             "${{ steps.fiberd-version.outputs.build-args || matrix.build_args }}"),
+             "${{ matrix.build_args }}"),
         )
-        # upstream-fiberd alone is built as go.mod's fiberd version, which
-        # fiberd -version prints.
-        version = next(
-            step for step in self.images["steps"] if step.get("id") == "fiberd-version"
-        )
-        self.assertEqual(version["if"], "matrix.image == 'upstream-fiberd'")
-        self.assertIn("just upstream::fiberd-version", version["run"])
-        self.assertEqual(MATRIX["upstream-fiberd"][4], "")
         self.assertEqual(build["with"]["platforms"], "linux/amd64")
         self.assertEqual(
             tuple(build["with"][key] for key in ("push", "provenance", "sbom")),
@@ -888,7 +876,7 @@ class PreviewWorkflowPolicyTests(unittest.TestCase):
         self.assertIn("github-actions", updates)
         self.assertEqual(set(updates["docker"]["directories"]), {
             "/activator", "/fiberd", "/helper", "/providers/azure/eventgrid",
-            "/providers/azure/node-setup", "/upstream",
+            "/providers/azure/node-setup",
         })
 
     def test_upstream_pins_are_full_commits_and_match_go_mod(self):
@@ -900,51 +888,102 @@ class PreviewWorkflowPolicyTests(unittest.TestCase):
         self.assertEqual(set(pins), {
             "FIBERD_REPOSITORY", "FIBERD_COMMIT",
             "CONTROLLER_REPOSITORY", "CONTROLLER_COMMIT",
+            "FIBERD_VERSION", "FIBERD_IMAGE",
+            "CONTROLLER_VERSION", "CONTROLLER_IMAGE",
+            "FIBERD_ARCHIVE_DARWIN_AMD64_SHA256",
+            "FIBERD_ARCHIVE_DARWIN_ARM64_SHA256",
+            "FIBERD_ARCHIVE_LINUX_AMD64_SHA256",
+            "FIBERD_ARCHIVE_LINUX_ARM64_SHA256",
+            "CONTROLLER_MANIFEST_SHA256",
         })
         self.assertEqual(pins["FIBERD_REPOSITORY"], "Azure/fiberd")
         self.assertEqual(pins["CONTROLLER_REPOSITORY"], "Azure/fiberd-k8s-controller")
         for name in ("FIBERD_COMMIT", "CONTROLLER_COMMIT"):
             self.assertRegex(pins[name], r"^[0-9a-f]{40}$")
+        for name in (
+            "FIBERD_ARCHIVE_DARWIN_AMD64_SHA256",
+            "FIBERD_ARCHIVE_DARWIN_ARM64_SHA256",
+            "FIBERD_ARCHIVE_LINUX_AMD64_SHA256",
+            "FIBERD_ARCHIVE_LINUX_ARM64_SHA256",
+            "CONTROLLER_MANIFEST_SHA256",
+        ):
+            self.assertRegex(pins[name], r"^[0-9a-f]{64}$")
         # The router's fiberd client must speak the grant image's protocol.
         go_mod = (ROOT / "go.mod").read_text(encoding="utf-8")
         version = re.search(r"^\s*github\.com/Azure/fiberd (\S+)$", go_mod, re.M)
         self.assertIsNotNone(version)
-        self.assertEqual(version.group(1).rsplit("-", 1)[1], pins["FIBERD_COMMIT"][:12])
-        # upstream-fiberd is built as that version.
-        self.assertIn(
-            """@awk '$1 == "github.com/Azure/fiberd" {print $2; found=1} END {exit !found}' "{{repo-root}}/go.mod""",
-            (ROOT / "upstream/Justfile").read_text(encoding="utf-8"),
-        )
+        self.assertEqual(version.group(1), f"v{pins['FIBERD_VERSION']}")
+        for prefix, repository in (
+            ("FIBERD", "ghcr.io/azure/fiberd"),
+            ("CONTROLLER", "ghcr.io/azure/fiberd-k8s-controller"),
+        ):
+            self.assertRegex(
+                pins[f"{prefix}_IMAGE"],
+                rf"^{re.escape(repository)}@sha256:[0-9a-f]{{64}}$",
+            )
 
-    def test_upstream_images_describe_the_pinned_source(self):
-        metadata = next(step for step in self.images["steps"] if step.get("id") == "meta")
-        self.assertIn(
-            "org.opencontainers.image.description="
-            "${{ steps.upstream.outputs.description || matrix.description }}",
-            metadata["with"]["labels"],
-        )
-        upstream = named(self.images, "Read the upstream source")
-        names = [step.get("name") for step in self.images["steps"]]
-        self.assertLess(names.index("Read the upstream source"), names.index("Extract image metadata"))
+    def test_upstream_host_tools_and_controller_manifest_use_release_assets(self):
+        upstream = (ROOT / "upstream/Justfile").read_text(encoding="utf-8")
+        root = (ROOT / "Justfile").read_text(encoding="utf-8")
+        self.assertNotIn('go -C "{{sources}}/fiberd" build', upstream)
+        self.assertNotIn("kubectl kustomize", upstream)
+        self.assertNotIn("realpath -m", upstream)
+        self.assertNotIn("hashlib.file_digest", upstream)
+        self.assertNotIn("python3 -c", upstream)
+        self.assertNotIn('(upstream::source "fiberd")', root)
+        for value in (
+            "fiberd_${FIBERD_VERSION}_${os}_${arch}.tar.gz",
+            "https://github.com/$repository/releases/download/v$version/$asset",
+            "gh attestation verify",
+            "zygotectl",
+            "grant-issuer",
+            'install.yaml "$CONTROLLER_MANIFEST_SHA256"',
+            "CONTROLLER_MANIFEST_SHA256",
+        ):
+            self.assertIn(value, upstream)
+        packages = named(self.jobs["packages"], "Package release archives")
+        self.assertEqual(packages["env"]["GH_TOKEN"], "${{ github.token }}")
+
+    def test_upstream_image_provenance_matches_source_pins(self):
         pins = dict(
             line.split("=", 1)
-            for line in (ROOT / "upstream/pins.env").read_text(encoding="utf-8").splitlines()
+            for line in PINS_FILE.read_text(encoding="utf-8").splitlines()
             if line and not line.startswith("#")
         )
-        expected = {
-            "upstream-fiberd": f"{pins['FIBERD_REPOSITORY']}@{pins['FIBERD_COMMIT']}",
-            "fiberd-k8s-controller": f"{pins['CONTROLLER_REPOSITORY']}@{pins['CONTROLLER_COMMIT']}",
-        }
-        for image, source in expected.items():
-            with self.subTest(image=image), tempfile.TemporaryDirectory() as work:
-                output = Path(work) / "output"
-                subprocess.run(
-                    ["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", upstream["run"]],
-                    cwd=ROOT, check=True, capture_output=True, text=True,
-                    env={**os.environ, "IMAGE": image, "GITHUB_OUTPUT": str(output)},
+        for fail in ("", "FIBERD", "CONTROLLER"):
+            with self.subTest(fail=fail), tempfile.TemporaryDirectory(dir=ROOT) as work:
+                work = Path(work)
+                gh = work / "gh"
+                gh.write_text(
+                    '#!/bin/sh\nprintf "%s\\n" "$*" >> "$GH_LOG"\n'
+                    'if [ -n "$FAIL_IMAGE" ] && [ "$3" = "oci://$FAIL_IMAGE" ]; '
+                    'then exit 1; fi\n'
                 )
-                description = output.read_text().removeprefix("description=").strip()
-                self.assertIn(source, description)
+                gh.chmod(0o755)
+                output = work / "commands"
+                result = subprocess.run(
+                    ["just", "--justfile", str(ROOT / "upstream/Justfile"), "verify-images"],
+                    cwd=ROOT, capture_output=True, text=True,
+                    env={
+                        **os.environ, "PATH": f"{work}:{os.environ['PATH']}",
+                        "GH_LOG": str(output),
+                        "FAIL_IMAGE": pins[f"{fail}_IMAGE"] if fail else "",
+                    },
+                )
+                self.assertEqual(result.returncode == 0, not fail, result.stderr)
+                expected = []
+                for prefix in ("FIBERD", "CONTROLLER"):
+                    repository = pins[f"{prefix}_REPOSITORY"]
+                    expected.append(
+                        f"attestation verify oci://{pins[f'{prefix}_IMAGE']} "
+                        f"--repo {repository} "
+                        f"--signer-workflow {repository}/.github/workflows/release.yml "
+                        f"--source-digest {pins[f'{prefix}_COMMIT']} "
+                        "--deny-self-hosted-runners"
+                    )
+                    if prefix == fail:
+                        break
+                self.assertEqual(output.read_text().splitlines(), expected)
 
     def test_packages_pin_the_controller_inputs_to_the_published_images(self):
         images = self.images["steps"]
@@ -962,7 +1001,12 @@ class PreviewWorkflowPolicyTests(unittest.TestCase):
         self.assertIs(download["with"]["merge-multiple"], True)
         write = named(self.jobs["packages"], "Write the default controller inputs")["run"]
         self.assertIn("just upstream::controller-inputs", write)
-        images = ("fiberd-k8s-controller", "upstream-fiberd", "hluk-helper")
+        images = ("hluk-helper",)
+        pins = dict(
+            line.split("=", 1)
+            for line in PINS_FILE.read_text(encoding="utf-8").splitlines()
+            if line and not line.startswith("#")
+        )
         for image in images:
             self.assertIn(f"$(image {image})", write)
             self.assertIn(image, MATRIX)
@@ -972,6 +1016,8 @@ class PreviewWorkflowPolicyTests(unittest.TestCase):
         for bad in (None, *images):
             with self.subTest(bad=bad), tempfile.TemporaryDirectory() as work:
                 work = Path(work)
+                (work / "upstream").mkdir()
+                (work / "upstream/pins.env").write_bytes(PINS_FILE.read_bytes())
                 (work / "build/image-digests").mkdir(parents=True)
                 for image in images:
                     (work / "build/image-digests" / image).write_text(
@@ -992,7 +1038,9 @@ class PreviewWorkflowPolicyTests(unittest.TestCase):
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertEqual(log.read_text().splitlines(), [
                         "upstream::controller-inputs",
-                        *(f"ghcr.io/team/{image}@{digest}" for image in images),
+                        pins["CONTROLLER_IMAGE"],
+                        pins["FIBERD_IMAGE"],
+                        f"ghcr.io/team/hluk-helper@{digest}",
                     ])
                 else:
                     self.assertNotEqual(result.returncode, 0)
@@ -1003,6 +1051,53 @@ class PreviewWorkflowPolicyTests(unittest.TestCase):
         self.assertLess(names.index("Write the default controller inputs"),
                         names.index("Package release archives"))
 
+    def test_upstream_images_are_not_published_by_lampyr(self):
+        published = {
+            entry["image"]
+            for entry in self.images["strategy"]["matrix"]["include"]
+        }
+        self.assertTrue(
+            published.isdisjoint({"upstream-fiberd", "fiberd-k8s-controller"}),
+            "Use the signed upstream releases instead of publishing copies",
+        )
+
+    def test_packages_use_upstream_images_without_lampyr_upstream_digest_artifacts(self):
+        write = named(self.jobs["packages"], "Write the default controller inputs")["run"]
+        digest = "sha256:" + "a" * 64
+        grant = "ghcr.io/azure/fiberd@sha256:" + "b" * 64
+        controller = "ghcr.io/azure/fiberd-k8s-controller@sha256:" + "c" * 64
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            work = Path(directory)
+            (work / "build/image-digests").mkdir(parents=True)
+            (work / "build/image-digests/hluk-helper").write_text(digest)
+            (work / "upstream").mkdir()
+            (work / "upstream/pins.env").write_text(
+                PINS_FILE.read_text(encoding="utf-8")
+                + f"\nFIBERD_IMAGE={grant}\nCONTROLLER_IMAGE={controller}\n"
+            )
+            (work / "bin").mkdir()
+            just = work / "bin/just"
+            just.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$JUST_LOG"\n')
+            just.chmod(0o755)
+            log = work / "just.log"
+            result = subprocess.run(
+                ["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", write],
+                cwd=work, capture_output=True, text=True,
+                env={
+                    **os.environ,
+                    "PATH": f"{work / 'bin'}:{os.environ['PATH']}",
+                    "IMAGE_PREFIX": "ghcr.io/team",
+                    "JUST_LOG": str(log),
+                },
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(log.read_text().splitlines(), [
+                "upstream::controller-inputs",
+                controller,
+                grant,
+                f"ghcr.io/team/hluk-helper@{digest}",
+            ])
+
     def test_cluster_suites_install_the_built_controller_inputs(self):
         jobs = self.ci["jobs"]
         build = jobs["cluster-inputs"]
@@ -1010,13 +1105,10 @@ class PreviewWorkflowPolicyTests(unittest.TestCase):
             named(build, "Build the cluster suites' controller inputs")["run"],
             "just upstream::cluster-inputs build/cluster-inputs",
         )
-        # The cache is warmed for the VERSION the inputs build fiberd as.
-        warm = named(build, "Warm the stock fiberd build cache")
-        self.assertEqual(
-            warm["with"]["build-args"], "VERSION=${{ steps.fiberd-version.outputs.version }}"
-        )
-        self.assertIn(
-            "just upstream::fiberd-version", named(build, "Read the fiberd version")["run"]
+        self.assertFalse(
+            any(step.get("uses", "").startswith("docker/build-push-action@")
+                for step in build["steps"]),
+            "Cluster inputs pull upstream images; only the helper is built locally",
         )
         upload = named(build, "Upload the cluster suites' controller inputs")
         self.assertEqual(upload["with"]["name"], "cluster-inputs-${{ github.sha }}")
