@@ -128,6 +128,10 @@ func main() {
 }
 
 func traceRouterRequest(request *http.Request) bool {
+	if request.Header.Get("Knative-Serving-Namespace") != "" ||
+		request.Header.Get("Knative-Serving-Revision") != "" {
+		return true
+	}
 	return request.URL.Path != "/healthz" && request.URL.Path != "/readyz"
 }
 

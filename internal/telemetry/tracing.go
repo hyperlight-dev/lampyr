@@ -47,9 +47,9 @@ func ConfigureTracing(ctx context.Context, service string) (func(context.Context
 func tracingResource(ctx context.Context, service string) (*resource.Resource, error) {
 	return resource.New(
 		ctx,
+		resource.WithAttributes(semconv.ServiceName(service)),
 		resource.WithFromEnv(),
 		resource.WithTelemetrySDK(),
-		resource.WithAttributes(semconv.ServiceName(service)),
 	)
 }
 

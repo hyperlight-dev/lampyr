@@ -218,3 +218,18 @@ func TestRouterTracesResponseCopyAbortAs502(t *testing.T) {
 		t.Fatalf("span status = %v, want error", got)
 	}
 }
+
+func TestAbortLeavesUpgradedSpanForWebSocketFinalizer(t *testing.T) {
+	recorder := recordSpans(t)
+	ctx, span := otel.Tracer("test").Start(
+		t.Context(),
+		"upgraded",
+		trace.WithSpanKind(trace.SpanKindServer),
+	)
+	status := &statusRecorder{code: http.StatusSwitchingProtocols, switched: true}
+	finishAbortServerSpan(span, status, ctx, ctx)
+	if ended := recorder.Ended(); len(ended) != 0 {
+		t.Fatalf("abort finalizer ended an upgraded span before WebSocket finalization: %v", ended)
+	}
+	span.End()
+}

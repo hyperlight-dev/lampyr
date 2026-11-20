@@ -30,6 +30,7 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	otelcodes "go.opentelemetry.io/otel/codes"
+	semconv "go.opentelemetry.io/otel/semconv/v1.37.0"
 	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -42,6 +43,27 @@ import (
 var grantName = regexp.MustCompile(`^[a-z0-9][a-z0-9_.-]*$`)
 
 const tracerName = "github.com/hyperlight-dev/lampyr/internal/fiberdintegration"
+
+func finishServerSpan(span trace.Span, status int, err error) {
+	span.SetAttributes(semconv.HTTPResponseStatusCode(status))
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(otelcodes.Error, err.Error())
+	}
+	span.End()
+}
+
+func finishAbortServerSpan(
+	span trace.Span,
+	recorder *statusRecorder,
+	client context.Context,
+	revision context.Context,
+) {
+	if recorder.switched {
+		return
+	}
+	finishServerSpan(span, requestStatus(recorder, client, revision), http.ErrAbortHandler)
+}
 
 func tokenDigest(token []byte) string {
 	return fmt.Sprintf("sha256:%x", sha256.Sum256(token))
@@ -1107,12 +1129,24 @@ func (router *Router) ServeHTTP(w http.ResponseWriter, request *http.Request) {
 	defer func() {
 		if recorder.switched {
 			ended := time.Now()
+			outcome := websocketOutcome(recorder, revisionCtx)
+			var spanErr error
+			switch outcome {
+			case "timeout":
+				spanErr = context.DeadlineExceeded
+			case "error":
+				spanErr = errors.New("WebSocket proxy failed")
+			}
+			// The protocol switch is written on the hijacked connection, so
+			// otelhttp cannot observe 101. End its span here before it records
+			// the default 200 after the session returns.
+			finishServerSpan(serverSpan, http.StatusSwitchingProtocols, spanErr)
 			metrics.record(func() {
 				websocketSessions.WithLabelValues(namespace, revision.Revision).Dec()
 				websocketSessionSeconds.WithLabelValues(
 					namespace,
 					revision.Revision,
-					websocketOutcome(recorder, revisionCtx),
+					outcome,
 				).Observe(ended.Sub(websocketStarted).Seconds())
 			})
 		}
@@ -1122,6 +1156,7 @@ func (router *Router) ServeHTTP(w http.ResponseWriter, request *http.Request) {
 			if failure == http.ErrAbortHandler {
 				gone = true
 				recorder.fail()
+				finishAbortServerSpan(serverSpan, recorder, clientCtx, revisionCtx)
 			}
 			panic(failure)
 		}
