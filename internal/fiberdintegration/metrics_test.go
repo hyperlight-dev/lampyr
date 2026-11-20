@@ -124,7 +124,7 @@ func TestRouterMetricsTrackReuseSlots(t *testing.T) {
 	router.ServeHTTP(httptest.NewRecorder(), revisionRequest("GET", "/", route))
 	labels := []string{route.Namespace, route.Revision}
 	router.mu.RLock()
-	pool := router.pools[route.Namespace+"--"+route.Revision]
+	pool := router.pools[route.Namespace+"/"+route.Revision]
 	router.mu.RUnlock()
 	pool.mu.Lock()
 	if pool.busy != 0 || len(pool.slots) != 1 {

@@ -803,7 +803,7 @@ func (router *Router) clone(request context.Context, deadline time.Time, whole b
 func (router *Router) observeReusePool(pool *routerPool) {
 	metrics := router.metricsFor(pool.namespace, pool.revision)
 	metrics.record(func() {
-		if router.pools[pool.namespace+"--"+pool.revision] != pool {
+		if router.pools[pool.namespace+"/"+pool.revision] != pool {
 			return
 		}
 		pool.mu.Lock()
