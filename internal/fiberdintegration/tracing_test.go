@@ -5,6 +5,7 @@ package fiberdintegration
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -144,6 +145,48 @@ func TestRouterTracesFiberAcquisitionAndPropagatesContext(t *testing.T) {
 	if attributes["lampyr.fiber.id"].AsString() == "" {
 		t.Error("Fiber acquisition span has no Fiber ID")
 	}
+}
+
+func TestTracingTransportPropagatesUpgradeContext(t *testing.T) {
+	recorder := recordSpans(t)
+	var traceparent string
+	transport := tracedTransport(roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		traceparent = request.Header.Get("traceparent")
+		return &http.Response{
+			Status:     "101 Switching Protocols",
+			StatusCode: http.StatusSwitchingProtocols,
+			Header: http.Header{
+				"Connection": {"Upgrade"},
+				"Upgrade":    {"websocket"},
+			},
+			Body:    &closedUpgradeBody{},
+			Request: request,
+		}, nil
+	}))
+	ctx, parent := otel.Tracer("test").Start(t.Context(), "router")
+	request, err := http.NewRequestWithContext(ctx, "GET", "http://fiber/socket", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Connection", "Upgrade")
+	request.Header.Set("Upgrade", "websocket")
+	response, err := transport.RoundTrip(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := response.Body.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+		t.Fatal(err)
+	}
+	parent.End()
+	if traceparent == "" {
+		t.Fatal("tracing transport did not inject traceparent for an upgrade")
+	}
+	for _, span := range recorder.Ended() {
+		if span.SpanKind() == trace.SpanKindClient {
+			return
+		}
+	}
+	t.Fatal("tracing transport did not record a client span for an upgrade")
 }
 
 func TestRouterTracesWebSocketUpgradeAs101(t *testing.T) {
