@@ -15,6 +15,7 @@ exe-suffix := if os() == "windows" { ".exe" } else { "" }
 # Kind release installed by `just install-kind` in every workflow (CI, release
 # gates, Copilot); providers/kind/templates/kind-config.yaml pins its node image.
 kind-version := "v0.33.0"
+oha-version := "1.17.0"
 
 default:
     @just --list
@@ -205,6 +206,18 @@ install-mm:
     mkdir -p "{{repo-root}}/build/tools"; \
     tar --extract --gzip --file "$dir/mm.tar.gz" --directory "{{repo-root}}/build/tools" mm
 
+# Install the pinned oha load generator used by opt-in scale tests.
+install-oha:
+    if [ -x "{{repo-root}}/build/tools/oha" ] && \
+        [ "$("{{repo-root}}/build/tools/oha" --version)" = "oha {{oha-version}}" ]; then exit 0; fi; \
+    [ "$(uname -sm)" = "Linux x86_64" ] || { echo "install-oha supports linux-amd64 only" >&2; exit 1; }; \
+    mkdir -p "{{repo-root}}/build/tools"; \
+    curl --fail --silent --show-error --location --output "{{repo-root}}/build/tools/oha.tmp" \
+        "https://github.com/hatoo/oha/releases/download/v{{oha-version}}/oha-linux-amd64"; \
+    echo "85c6eb98066b8c8bd513b2dd96fafd8f9863249ea653606bae1ca2e3a75c43d2  {{repo-root}}/build/tools/oha.tmp" | sha256sum --check; \
+    chmod 0755 "{{repo-root}}/build/tools/oha.tmp"; \
+    mv "{{repo-root}}/build/tools/oha.tmp" "{{repo-root}}/build/tools/oha"
+
 prepare-workspace: build-ly
     if [[ ! -f build/workspace/lampyr.workspace.yaml ]]; then build/ly scaffold workspace build/workspace; fi
 
@@ -345,6 +358,23 @@ release-disruption-gate service url:
     python3 scripts/disruption-gate.py \
         --service "{{service}}" \
         --url "{{url}}"
+
+# Build the normal Kubernetes image from the same Go source as the Lampyr example.
+[positional-arguments]
+scale-baseline-image image:
+    docker build --tag "$1" --file scripts/fixtures/scale-workload/Dockerfile .
+
+# Compare Lampyr with a normal Kubernetes Deployment using platform telemetry.
+[positional-arguments]
+scale-test context service lampyr-url baseline-image duration="30s" concurrency="1,4,16,64" output="build/scale-results.json": install-oha
+    python3 scripts/scale-test.py \
+        --context "$1" \
+        --service "$2" \
+        --lampyr-url "$3" \
+        --baseline-image "$4" \
+        --duration "$5" \
+        --concurrency "$6" \
+        --output "$7"
 
 # Run the repository test suites used in CI.
 test: test-unit test-cli examples-check test-preview-release cli::test cli::test-intent helper::test azure::test kind::test k3d::test test-examples-local test-kind-integration test-k3d-integration test-existing-kind-integration test-knative-portability test-walkthrough
