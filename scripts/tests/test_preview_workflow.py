@@ -890,11 +890,24 @@ class PreviewWorkflowPolicyTests(unittest.TestCase):
             "CONTROLLER_REPOSITORY", "CONTROLLER_COMMIT",
             "FIBERD_VERSION", "FIBERD_IMAGE",
             "CONTROLLER_VERSION", "CONTROLLER_IMAGE",
+            "FIBERD_ARCHIVE_DARWIN_AMD64_SHA256",
+            "FIBERD_ARCHIVE_DARWIN_ARM64_SHA256",
+            "FIBERD_ARCHIVE_LINUX_AMD64_SHA256",
+            "FIBERD_ARCHIVE_LINUX_ARM64_SHA256",
+            "CONTROLLER_MANIFEST_SHA256",
         })
         self.assertEqual(pins["FIBERD_REPOSITORY"], "Azure/fiberd")
         self.assertEqual(pins["CONTROLLER_REPOSITORY"], "Azure/fiberd-k8s-controller")
         for name in ("FIBERD_COMMIT", "CONTROLLER_COMMIT"):
             self.assertRegex(pins[name], r"^[0-9a-f]{40}$")
+        for name in (
+            "FIBERD_ARCHIVE_DARWIN_AMD64_SHA256",
+            "FIBERD_ARCHIVE_DARWIN_ARM64_SHA256",
+            "FIBERD_ARCHIVE_LINUX_AMD64_SHA256",
+            "FIBERD_ARCHIVE_LINUX_ARM64_SHA256",
+            "CONTROLLER_MANIFEST_SHA256",
+        ):
+            self.assertRegex(pins[name], r"^[0-9a-f]{64}$")
         # The router's fiberd client must speak the grant image's protocol.
         go_mod = (ROOT / "go.mod").read_text(encoding="utf-8")
         version = re.search(r"^\s*github\.com/Azure/fiberd (\S+)$", go_mod, re.M)
@@ -908,6 +921,27 @@ class PreviewWorkflowPolicyTests(unittest.TestCase):
                 pins[f"{prefix}_IMAGE"],
                 rf"^{re.escape(repository)}@sha256:[0-9a-f]{{64}}$",
             )
+
+    def test_upstream_host_tools_and_controller_manifest_use_release_assets(self):
+        upstream = (ROOT / "upstream/Justfile").read_text(encoding="utf-8")
+        root = (ROOT / "Justfile").read_text(encoding="utf-8")
+        self.assertNotIn('go -C "{{sources}}/fiberd" build', upstream)
+        self.assertNotIn("kubectl kustomize", upstream)
+        self.assertNotIn("realpath -m", upstream)
+        self.assertNotIn("hashlib.file_digest", upstream)
+        self.assertNotIn('(upstream::source "fiberd")', root)
+        for value in (
+            "fiberd_${FIBERD_VERSION}_${os}_${arch}.tar.gz",
+            "https://github.com/$repository/releases/download/v$version/$asset",
+            "gh attestation verify",
+            "zygotectl",
+            "grant-issuer",
+            'install.yaml "$CONTROLLER_MANIFEST_SHA256"',
+            "CONTROLLER_MANIFEST_SHA256",
+        ):
+            self.assertIn(value, upstream)
+        packages = named(self.jobs["packages"], "Package release archives")
+        self.assertEqual(packages["env"]["GH_TOKEN"], "${{ github.token }}")
 
     def test_upstream_image_provenance_matches_source_pins(self):
         pins = dict(

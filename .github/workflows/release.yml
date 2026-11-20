@@ -410,6 +410,7 @@ jobs:
 
       - name: Package release archives
         env:
+          GH_TOKEN: ${{ github.token }}
           SUFFIX: ${{ needs.version.outputs.suffix }}
         run: |
           if [[ "$GITHUB_REF" == refs/tags/* ]]; then

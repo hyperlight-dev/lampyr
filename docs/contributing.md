@@ -133,7 +133,7 @@ before creating anything when one is missing:
 | `LAMPYR_CONTROLLER_MANIFEST` | fiberd-k8s-controller's install manifest, a path or an `https://` URL |
 | `LAMPYR_GRANT_IMAGE` | The fiberd image grant Pods run, pinned by `@sha256:` digest |
 | `LAMPYR_HELPER_IMAGE` | The `lampyr-hluk-helper` image, pinned by `@sha256:` digest |
-| `LAMPYR_FIBERD_SRC` | A fiberd checkout, from which `just fiberd-template-tools` builds `build/zygotectl` and `build/grant-issuer` for `ly build` and `ly deploy`; the recipe also builds the helper, from Lampyr's `helper/`. Optional when they are already in `build/` |
+| `LAMPYR_FIBERD_SRC` | An optional Fiberd checkout for overriding the released `zygotectl` and `grant-issuer` tools. `just fiberd-template-tools` builds them into `build/`; the default `just template-tools` downloads the checksum-pinned, attested Fiberd release archive. |
 
 The cluster's nodes must be able to pull both images. `ly deploy` pushes
 fiberd templates to the installation's local registry, which
@@ -152,8 +152,9 @@ LAMPYR_CLUSTER_INPUTS="$PWD/build/cluster-inputs" just test-existing-kind-integr
 
 The recipe verifies and pulls the upstream image digests in
 `upstream/pins.env`. It builds the helper and its image from this checkout,
-and `zygotectl` and `grant-issuer` from the pinned fiberd source. Its buildx builder must
-export OCI layouts, as a `docker-container` one does. A suite pushes the
+and verifies and extracts `zygotectl`, `grant-issuer`, and the controller
+install manifest from upstream release assets. Its buildx builder must export
+OCI layouts, as a `docker-container` one does. A suite pushes the
 fiberd and helper images to its own registry, keeping their digests, and has
 its provider load the controller image, which the manifest names by a
 `lampyr.local/` tag. CI builds the directory once, in the `cluster-inputs`
@@ -225,7 +226,7 @@ run (`just platform-template-tools`): `build/hluk-helper`, built from this
 checkout for Linux/amd64 like `build/hluk`, since it runs where snapshots
 are made, and
 `build/zygotectl` and `build/grant-issuer`, which run on the user's machine,
-built from the pinned fiberd for each archive's own target into
+extracted from Fiberd's checksum-pinned, attested release archive into
 `build/template-tools/TARGET` (`just upstream::template-tools`). To move
 to new upstream releases, verify their image provenance and Hyperlight support,
 then update `upstream/pins.env` and `go.mod`'s `github.com/Azure/fiberd` together.

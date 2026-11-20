@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Run the cluster inputs recipes' shell logic on fixtures."""
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -32,6 +33,62 @@ def bash(script, *args, cwd=None, **env):
 
 
 class ClusterInputsTests(unittest.TestCase):
+    def test_release_asset_checks_checksum_and_attestation_before_replacement(self):
+        body = recipe("release-asset")
+        payload = b"published release asset"
+        checksum = hashlib.sha256(payload).hexdigest()
+        for name, supplied, fail_attestation, success in (
+            ("valid", checksum, "", True),
+            ("wrong checksum", "0" * 64, "", False),
+            ("failed attestation", checksum, "1", False),
+        ):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                work = Path(directory)
+                source = work / "source"
+                source.write_bytes(payload)
+                output = work / "output"
+                output.write_bytes(b"earlier")
+                commands = work / "commands"
+                bin_dir = work / "bin"
+                bin_dir.mkdir()
+                curl = bin_dir / "curl"
+                curl.write_text(
+                    '#!/bin/bash\nset -euo pipefail\n'
+                    'printf "curl %s\\n" "$*" >> "$COMMANDS"\n'
+                    'while (($#)); do\n'
+                    '  if [[ $1 == --output ]]; then cp "$SOURCE" "$2"; exit 0; fi\n'
+                    '  shift\n'
+                    'done\n'
+                    'exit 90\n'
+                )
+                gh = bin_dir / "gh"
+                gh.write_text(
+                    '#!/bin/bash\nset -euo pipefail\n'
+                    'printf "gh %s\\n" "$*" >> "$COMMANDS"\n'
+                    '[[ -z "$FAIL_ATTESTATION" ]]\n'
+                )
+                curl.chmod(0o755)
+                gh.chmod(0o755)
+                result = bash(
+                    body,
+                    "Azure/fiberd",
+                    "1" * 40,
+                    "0.4.0",
+                    "fiberd.tar.gz",
+                    supplied,
+                    str(output),
+                    SOURCE=str(source),
+                    COMMANDS=str(commands),
+                    FAIL_ATTESTATION=fail_attestation,
+                    PATH=f"{bin_dir}:{os.environ['PATH']}",
+                )
+                self.assertEqual(result.returncode == 0, success, result.stderr)
+                self.assertEqual(output.read_bytes(), payload if success else b"earlier")
+                calls = commands.read_text().splitlines()
+                self.assertTrue(calls[0].startswith("curl "))
+                self.assertEqual(any(call.startswith("gh attestation verify ") for call in calls),
+                                 supplied == checksum)
+
     def test_upstream_images_are_pulled_and_only_the_helper_is_built(self):
         body = recipe("cluster-inputs")
         for fail in ("", "pull"):
@@ -69,9 +126,13 @@ class ClusterInputsTests(unittest.TestCase):
                 just.write_text(
                     '#!/bin/bash\nset -euo pipefail\nshift 2\n'
                     'case $1 in\n'
-                    'fiberd-template-tools)\n'
-                    '  for tool in hluk-helper zygotectl grant-issuer; do\n'
-                    '    printf "#!/bin/sh\\n" > "$ROOT/build/$tool"\n'
+                    'helper::prepare-image)\n'
+                    '  mkdir -p "$ROOT/build"\n'
+                    '  printf "#!/bin/sh\\n" > "$ROOT/build/hluk-helper" ;;\n'
+                    'template-tools-target)\n'
+                    '  mkdir -p "$ROOT/build/template-tools/$2"\n'
+                    '  for tool in zygotectl grant-issuer; do\n'
+                    '    printf "#!/bin/sh\\n" > "$ROOT/build/template-tools/$2/$tool"\n'
                     '  done ;;\n'
                     'providers::install-oras) ;;\n'
                     'controller-manifest) printf "image: %s\\n" "$2" > "$3" ;;\n'
@@ -95,9 +156,10 @@ class ClusterInputsTests(unittest.TestCase):
                 script = body
                 for placeholder, value in {
                     "repo-root": work, "project-root": work / "upstream",
-                    "sources": work / "build/upstream", "pins": pins,
+                    "pins": pins,
                 }.items():
                     script = script.replace("{{" + placeholder + "}}", str(value))
+                    script = script.replace("{{ " + placeholder + " }}", str(value))
                 output = work / "cluster-inputs"
                 output.mkdir()
                 (output / "inputs.json").write_text('{"earlier":true}')
@@ -175,7 +237,7 @@ class ClusterInputsTests(unittest.TestCase):
         # handling runs before the guard as it does in the recipe.
         guard = re.search(r"^ +([^\n]*\"\$1\".*?^ +fi;) \\$", body, re.M | re.S)
         self.assertIsNotNone(guard, "cluster-inputs no longer guards its output")
-        self.assertIn("realpath", guard.group(1), "cluster-inputs no longer resolves its output")
+        self.assertIn(".resolve()", guard.group(1), "cluster-inputs no longer resolves its output")
         script = re.sub(r" \\$", "", guard.group(1), flags=re.M)
         with tempfile.TemporaryDirectory() as work:
             work = Path(work)

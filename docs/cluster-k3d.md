@@ -29,7 +29,7 @@ first. Mirror the preview's images to a registry the k3d nodes can pull
 from (see [Preview images](contributing.md#preview-images)):
 `just preview-mirror-images` writes their `controllerManifest`, `grantImage`
 and `helperImage` to `build/preview-kind.yaml`, whose keys the k3d provider
-takes too. `just template-tools` builds the fiberd template tools that
+takes too. `just template-tools` verifies and extracts the Fiberd release tools that
 `ly build` and `ly deploy` run. Then, from the checkout, create a Workspace
 and enter it before running cluster commands:
 
