@@ -164,20 +164,37 @@ fi
 
 "$repo_root/build/ly" build "$service"
 image="localhost:$registry_port/ci/hello-nodejs:${GITHUB_SHA:-local}"
-"$repo_root/build/ly" deploy \
+check_reported_url() {
+  local deployed=$1 directory=$2 expected=$3 observed
+  printf '%s\n' "$deployed"
+  grep -Fxq "url $expected" <<<"$deployed"
+  for _ in 1 2; do
+    observed=$("$repo_root/build/ly" status --context "$context" "$directory")
+    printf '%s\n' "$observed"
+    grep -Fxq "url $expected" <<<"$observed"
+  done
+}
+
+public_url="https://hello-nodejs.default.localhost"
+if [[ "$https_port" != 443 ]]; then
+  public_url+=":$https_port"
+fi
+deployed=$("$repo_root/build/ly" deploy \
   --context "$context" \
   --image "$image" \
-  "$service"
+  "$service")
+check_reported_url "$deployed" "$service" "$public_url"
 
 revision_uid=$(
   kubectl --context "$context" get revisions.serving.knative.dev \
     --selector serving.knative.dev/service=hello-nodejs -o json |
     jq -er '.items | select(length == 1) | .[0].metadata.uid'
 )
-"$repo_root/build/ly" deploy \
+deployed=$("$repo_root/build/ly" deploy \
   --context "$context" \
   --image "$image" \
-  "$service"
+  "$service")
+check_reported_url "$deployed" "$service" "$public_url"
 if ! kubectl --context "$context" get revisions.serving.knative.dev \
   --selector serving.knative.dev/service=hello-nodejs -o json |
   jq -e --arg uid "$revision_uid" \
@@ -199,10 +216,9 @@ cp -a "$service" "$internal"
 rm -r -- "$internal/.lampyr"
 sed -i 's/^name: hello-nodejs$/name: hello-internal/' "$internal/lampyr.yaml"
 "$repo_root/build/ly" build "$internal"
-"$repo_root/build/ly" deploy --context "$context" \
-  --image "localhost:$registry_port/ci/hello-internal:${GITHUB_SHA:-local}" "$internal"
-internal_status=$("$repo_root/build/ly" status --context "$context" "$internal")
-grep -Fq 'http://hello-internal.default.svc.cluster.local' <<<"$internal_status"
+deployed=$("$repo_root/build/ly" deploy --context "$context" \
+  --image "localhost:$registry_port/ci/hello-internal:${GITHUB_SHA:-local}" "$internal")
+check_reported_url "$deployed" "$internal" 'http://hello-internal.default.svc.cluster.local'
 code=$(curl --silent --show-error --insecure --output "$project/internal-response" \
   --write-out '%{http_code}' \
   "https://hello-internal.default.localhost:$https_port/test")
@@ -217,7 +233,8 @@ kubectl --context "$context" delete pod hostname-exposure-probe --wait=true
 
 printf 'apiVersion: lampyr.dev/v1alpha1\nkind: Workspace\ningress:\n  services: []\n' \
   > "$project/lampyr.workspace.yaml"
-"$repo_root/build/ly" deploy --context "$context" --image "$image" "$service"
+deployed=$("$repo_root/build/ly" deploy --context "$context" --image "$image" "$service")
+check_reported_url "$deployed" "$service" 'http://hello-nodejs.default.svc.cluster.local'
 [[ $(kubectl --context "$context" get ksvc hello-nodejs \
   -o jsonpath='{.status.url}') == http://hello-nodejs.default.svc.cluster.local ]]
 code=$(curl --silent --show-error --insecure --output /dev/null \
@@ -228,7 +245,8 @@ code=$(curl --silent --show-error --insecure --output /dev/null \
 kubectl --context "$context" annotate ksvc hello-nodejs kubectl.kubernetes.io/last-applied-configuration-
 printf 'apiVersion: lampyr.dev/v1alpha1\nkind: Workspace\ningress:\n  services: [hello-nodejs]\n' \
   > "$project/lampyr.workspace.yaml"
-"$repo_root/build/ly" deploy --context "$context" --image "$image" "$service"
+deployed=$("$repo_root/build/ly" deploy --context "$context" --image "$image" "$service")
+check_reported_url "$deployed" "$service" "$public_url"
 curl --fail --silent --show-error --insecure \
   "https://hello-nodejs.default.localhost:$https_port/test" | grep -Fq 'hello from Hyperlight edge'
 [[ $(kubectl --context "$context" get revisions.serving.knative.dev \

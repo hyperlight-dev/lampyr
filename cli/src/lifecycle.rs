@@ -70,12 +70,17 @@ pub fn status(directory: &Path, context: Option<&str>, host: &Host) -> Result<St
     validate_name(&project.name)?;
     let kube = Kube::new(directory, context, host)?;
     let service: Value = kube.get("default", "service.serving.knative.dev", &project.name)?;
+    ensure!(
+        kube::observation_current(&service),
+        "Knative Service status has not observed its current generation"
+    );
     let latest_ready = service
         .pointer("/status/latestReadyRevisionName")
         .and_then(Value::as_str)
         .context("Knative Service has no ready Revision")?
         .to_owned();
     let installed = kube.installation()?;
+    let url = service_status_url(&service, &project.name, "default", &installed)?;
     let traffic = service
         .pointer("/status/traffic")
         .and_then(Value::as_array)
@@ -122,7 +127,7 @@ pub fn status(directory: &Path, context: Option<&str>, host: &Host) -> Result<St
         service: project.name.clone(),
         application_model: project.application_model().to_owned(),
         revision,
-        url: service_status_url(&service, &installed)?,
+        url,
         traffic,
         capacity,
     })
@@ -303,15 +308,15 @@ fn active_revisions(service: &Value) -> Result<BTreeSet<String>> {
     Ok(active)
 }
 
-pub(crate) fn observed_service_url(service: &Value) -> Result<Url> {
-    let name = service
-        .pointer("/metadata/name")
-        .and_then(Value::as_str)
-        .context("Knative Service has no name")?;
-    let namespace = service
-        .pointer("/metadata/namespace")
-        .and_then(Value::as_str)
-        .context("Knative Service has no namespace")?;
+pub(crate) fn observed_service_url(service: &Value, name: &str, namespace: &str) -> Result<Url> {
+    ensure!(
+        service.pointer("/metadata/name").and_then(Value::as_str) == Some(name)
+            && service
+                .pointer("/metadata/namespace")
+                .and_then(Value::as_str)
+                == Some(namespace),
+        "Knative observation does not match Service {namespace}/{name}"
+    );
     let observed = service
         .pointer("/status/url")
         .and_then(Value::as_str)
@@ -330,15 +335,23 @@ pub(crate) fn observed_service_url(service: &Value) -> Result<Url> {
         "Knative Service URL must not contain a path, query or fragment"
     );
     let host = url.host_str().context("Knative Service URL has no host")?;
-    ensure!(
-        host.starts_with(&format!("{name}.{namespace}.")),
-        "Knative Service URL does not match the Service"
-    );
+    // Public hosts can use custom domains. Internal hosts encode the Service identity.
+    if host.ends_with(".svc.cluster.local") {
+        ensure!(
+            host == format!("{name}.{namespace}.svc.cluster.local"),
+            "Knative Service URL does not match Service {namespace}/{name}"
+        );
+    }
     Ok(url)
 }
 
-pub(crate) fn service_status_url(service: &Value, installation: &Installation) -> Result<String> {
-    let mut url = observed_service_url(service)?;
+pub(crate) fn service_status_url(
+    service: &Value,
+    name: &str,
+    namespace: &str,
+    installation: &Installation,
+) -> Result<String> {
+    let mut url = observed_service_url(service, name, namespace)?;
     if kube::cluster_local(service) {
         ensure!(
             url.scheme() == "http"
@@ -356,9 +369,6 @@ pub(crate) fn service_status_url(service: &Value, installation: &Installation) -
             .is_some_and(|host| host.ends_with(".svc.cluster.local")),
         "public Knative Service URL is cluster-local"
     );
-    if installation.domain.ends_with(".invalid") {
-        return Ok(String::new());
-    }
     url.set_scheme("https")
         .map_err(|()| anyhow::anyhow!("Knative Service URL cannot use HTTPS"))?;
     match installation.https_port.as_deref() {
@@ -553,7 +563,7 @@ mod tests {
 
     #[test]
     fn status_url_preserves_observed_host_and_cluster_visibility() {
-        let installation = Installation {
+        let mut installation = Installation {
             data: BTreeMap::new(),
             domain: "localhost".to_owned(),
             https_port: Some("8443".to_owned()),
@@ -563,7 +573,7 @@ mod tests {
             "status":{"url":"http://custom.default.example.com"}
         });
         assert_eq!(
-            service_status_url(&external, &installation).unwrap(),
+            service_status_url(&external, "custom", "default", &installation).unwrap(),
             "https://custom.default.example.com:8443"
         );
         let internal = json!({
@@ -575,7 +585,7 @@ mod tests {
             "status":{"url":"http://demo.default.svc.cluster.local"}
         });
         assert_eq!(
-            service_status_url(&internal, &installation).unwrap(),
+            service_status_url(&internal, "demo", "default", &installation).unwrap(),
             "http://demo.default.svc.cluster.local"
         );
         let unrelated = json!({
@@ -586,12 +596,12 @@ mod tests {
             },
             "status":{"url":"ftp://other.other.svc.cluster.local"}
         });
-        assert!(service_status_url(&unrelated, &installation).is_err());
+        assert!(service_status_url(&unrelated, "demo", "default", &installation).is_err());
         let wrong_service = json!({
-            "metadata":{"name":"demo","namespace":"default"},
+            "metadata":{"name":"other","namespace":"other"},
             "status":{"url":"http://other.other.example.com"}
         });
-        assert!(service_status_url(&wrong_service, &installation).is_err());
+        assert!(service_status_url(&wrong_service, "demo", "default", &installation).is_err());
         for observed in [
             "https://user@demo.default.example.com",
             "http://demo.default.example.com/path",
@@ -601,13 +611,13 @@ mod tests {
                 "metadata":{"name":"demo","namespace":"default"},
                 "status":{"url":observed}
             });
-            assert!(service_status_url(&invalid, &installation).is_err());
+            assert!(service_status_url(&invalid, "demo", "default", &installation).is_err());
         }
         let public_internal = json!({
             "metadata":{"name":"demo","namespace":"default"},
             "status":{"url":"http://demo.default.svc.cluster.local"}
         });
-        assert!(service_status_url(&public_internal, &installation).is_err());
+        assert!(service_status_url(&public_internal, "demo", "default", &installation).is_err());
         let secure_internal = json!({
             "metadata":{
                 "name":"demo",
@@ -616,6 +626,38 @@ mod tests {
             },
             "status":{"url":"https://demo.default.svc.cluster.local"}
         });
-        assert!(service_status_url(&secure_internal, &installation).is_err());
+        assert!(service_status_url(&secure_internal, "demo", "default", &installation).is_err());
+        installation.domain = "unconfigured.invalid".to_owned();
+        assert_eq!(
+            service_status_url(&external, "custom", "default", &installation).unwrap(),
+            "https://custom.default.example.com:8443"
+        );
+        for (observed, port, expected) in [
+            (
+                "http://api.customer.example",
+                Some("8443"),
+                "https://api.customer.example:8443",
+            ),
+            (
+                "https://checkout.example.org",
+                Some("8443"),
+                "https://checkout.example.org:8443",
+            ),
+            (
+                "http://api.customer.example",
+                None,
+                "https://api.customer.example",
+            ),
+        ] {
+            installation.https_port = port.map(str::to_owned);
+            let custom = json!({
+                "metadata":{"name":"custom","namespace":"default"},
+                "status":{"url":observed}
+            });
+            assert_eq!(
+                service_status_url(&custom, "custom", "default", &installation).unwrap(),
+                expected
+            );
+        }
     }
 }

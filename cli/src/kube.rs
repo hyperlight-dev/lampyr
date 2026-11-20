@@ -21,6 +21,12 @@ pub fn cluster_local(service: &Value) -> bool {
     service["metadata"]["labels"][VISIBILITY_LABEL].as_str() == Some("cluster-local")
 }
 
+pub(crate) fn observation_current(service: &Value) -> bool {
+    let generation = service["metadata"]["generation"].as_i64();
+    let observed = service["status"]["observedGeneration"].as_i64();
+    generation.is_some() && observed.is_some_and(|observed| Some(observed) >= generation)
+}
+
 fn normalized_kubeconfig(paths: std::ffi::OsString) -> Result<std::ffi::OsString> {
     let paths = std::env::split_paths(&paths)
         .map(|path| {

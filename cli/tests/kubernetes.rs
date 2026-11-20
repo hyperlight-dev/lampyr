@@ -214,6 +214,138 @@ fn deploy_uses_knative_service_with_snapshot_revision_metadata() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn repeated_status_validates_service_observations_without_changing_weighted_traffic() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+
+    use serde_json::{Value, json};
+
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(
+        directory.path().join("lampyr.yaml"),
+        r#"{
+            "apiVersion":"lampyr.dev/v1alpha1","kind":"Project",
+            "name":"demo","runtime":"nodejs",
+            "application":{"type":"standalone","command":"node /app/app.js"},
+            "resources":{"cpu":"100m","memory":"128Mi"}
+        }"#,
+    )
+    .unwrap();
+    Project::load(directory.path()).unwrap();
+    let kubectl = directory.path().join("kubectl");
+    std::fs::write(
+        &kubectl,
+        r#"#!/bin/sh
+case "$*" in
+    *"get service.serving.knative.dev demo "*) /bin/cat "$SERVICE_OBSERVATION";;
+    *"get configmap lampyr-install "*) printf '{"data":{"domain":"localhost","httpsPort":"8443"}}';;
+    *"get capacitygrants"*) ;;
+    *) printf 'unexpected kubectl call: %s\n' "$*" >&2; exit 1;;
+esac
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&kubectl, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let observation = directory.path().join("service.json");
+    let current = json!({
+        "metadata":{"name":"demo","namespace":"default","generation":3},
+        "status":{
+            "observedGeneration":3,
+            "latestCreatedRevisionName":"demo-00002",
+            "latestReadyRevisionName":"demo-00002",
+            "url":"http://demo.default.example.com",
+            "conditions":[{"type":"Ready","status":"True"}],
+            "traffic":[
+                {"revisionName":"demo-00001","percent":25},
+                {"revisionName":"demo-00002","percent":75}
+            ]
+        }
+    });
+    let mut cases = vec![(
+        "public",
+        current.clone(),
+        Some("https://demo.default.example.com:8443"),
+    )];
+    let mut custom = current.clone();
+    custom["status"]["url"] = json!("http://api.customer.example");
+    cases.push(("custom", custom, Some("https://api.customer.example:8443")));
+    let mut internal = current.clone();
+    internal["metadata"]["labels"][kube::VISIBILITY_LABEL] = json!("cluster-local");
+    internal["status"]["url"] = json!("http://demo.default.svc.cluster.local");
+    cases.push((
+        "internal",
+        internal,
+        Some("http://demo.default.svc.cluster.local"),
+    ));
+    let mut stale = current.clone();
+    stale["status"]["observedGeneration"] = json!(2);
+    cases.push(("stale generation", stale, None));
+    let mut missing_generation = current.clone();
+    missing_generation["status"]
+        .as_object_mut()
+        .unwrap()
+        .remove("observedGeneration");
+    cases.push(("missing observed generation", missing_generation, None));
+    let mut wrong_service = current.clone();
+    wrong_service["metadata"]["name"] = json!("other");
+    wrong_service["status"]["url"] = json!("http://other.default.example.com");
+    cases.push(("wrong service", wrong_service, None));
+    let mut wrong_namespace = current.clone();
+    wrong_namespace["metadata"]["namespace"] = json!("other");
+    wrong_namespace["status"]["url"] = json!("http://demo.other.example.com");
+    cases.push(("wrong namespace", wrong_namespace, None));
+    for (name, url) in [
+        ("missing URL", Value::Null),
+        ("malformed URL", json!("not a URL")),
+        (
+            "unsupported scheme",
+            json!("ftp://demo.default.example.com"),
+        ),
+    ] {
+        let mut invalid = current.clone();
+        invalid["status"]["url"] = url;
+        cases.push((name, invalid, None));
+    }
+
+    let mut failures = Vec::new();
+    for (name, service, expected_url) in cases {
+        std::fs::write(&observation, serde_json::to_vec(&service).unwrap()).unwrap();
+        for attempt in 1..=2 {
+            let output = Command::new(env!("CARGO_BIN_EXE_ly"))
+                .args(["status", "--context", "fixture"])
+                .arg(directory.path())
+                .env("PATH", directory.path())
+                .env("SERVICE_OBSERVATION", &observation)
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let valid = match expected_url {
+                Some(url) => {
+                    output.status.success()
+                        && stdout.contains(url)
+                        && stdout.contains("demo-00001")
+                        && stdout.contains("demo-00002")
+                        && stdout.contains("25%")
+                        && stdout.contains("75%")
+                }
+                None => !output.status.success(),
+            };
+            if !valid {
+                failures.push(format!("{name}, attempt {attempt}: {stdout}{stderr}"));
+            }
+        }
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&std::fs::read(&observation).unwrap())
+                .unwrap(),
+            service
+        );
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
 #[test]
 fn a_readiness_probe_cannot_report_success_after_its_deadline() {
     let host = lampyr_cli::host::Host {

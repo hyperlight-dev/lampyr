@@ -183,7 +183,12 @@ pub fn deploy(options: Options<'_>, host: &Host) -> Result<Deployed> {
         service: project.name.clone(),
         revision,
         image,
-        url: crate::lifecycle::service_status_url(&observed, &installed)?,
+        url: crate::lifecycle::service_status_url(
+            &observed,
+            &project.name,
+            options.namespace,
+            &installed,
+        )?,
         exposed,
     })
 }
@@ -333,15 +338,20 @@ fn wait_for_deployment(
             };
             Ok((deployment_ready(&service, &revision, revision_name)
                 && ready(&route)
-                && visibility_ready(&service, &route, exposed)?)
+                && visibility_ready(&service, &route, service_name, exposed)?)
             .then_some(service))
         },
     )
 }
 
-fn visibility_ready(service: &Value, route: &Value, exposed: bool) -> Result<bool> {
+fn visibility_ready(
+    service: &Value,
+    route: &Value,
+    service_name: &str,
+    exposed: bool,
+) -> Result<bool> {
     for resource in [service, route] {
-        let url = crate::lifecycle::observed_service_url(resource)?;
+        let url = crate::lifecycle::observed_service_url(resource, service_name, "default")?;
         let internal = url
             .host_str()
             .is_some_and(|host| host.ends_with(".svc.cluster.local"));
@@ -357,10 +367,7 @@ fn visibility_ready(service: &Value, route: &Value, exposed: bool) -> Result<boo
 }
 
 fn deployment_ready(service: &Value, revision: &Value, revision_name: &str) -> bool {
-    let generation = service["metadata"]["generation"].as_i64();
-    let observed = service["status"]["observedGeneration"].as_i64();
-    generation.is_some()
-        && observed.is_some_and(|observed| Some(observed) >= generation)
+    kube::observation_current(service)
         && service["status"]["latestCreatedRevisionName"] == revision_name
         && service["status"]["latestReadyRevisionName"] == revision_name
         && ready(service)
@@ -395,20 +402,33 @@ mod tests {
             },
             "status":{"url":"http://demo.default.svc.cluster.local"}
         });
-        assert!(visibility_ready(&public, &public, true).unwrap());
-        assert!(visibility_ready(&internal, &internal, false).unwrap());
-        assert!(!visibility_ready(&public, &internal, true).unwrap());
-        assert!(!visibility_ready(&internal, &public, false).unwrap());
+        assert!(visibility_ready(&public, &public, "demo", true).unwrap());
+        assert!(visibility_ready(&internal, &internal, "demo", false).unwrap());
+        assert!(!visibility_ready(&public, &internal, "demo", true).unwrap());
+        assert!(!visibility_ready(&internal, &public, "demo", false).unwrap());
         let mut stale = internal.clone();
         stale["metadata"]["labels"] = json!({});
-        assert!(!visibility_ready(&stale, &stale, true).unwrap());
+        assert!(!visibility_ready(&stale, &stale, "demo", true).unwrap());
         let mut stale = public.clone();
         stale["metadata"]["labels"] = internal["metadata"]["labels"].clone();
-        assert!(!visibility_ready(&stale, &stale, false).unwrap());
-        assert!(visibility_ready(&json!({}), &public, true).is_err());
+        assert!(!visibility_ready(&stale, &stale, "demo", false).unwrap());
+        assert!(visibility_ready(&json!({}), &public, "demo", true).is_err());
         let mut secure_internal = internal.clone();
         secure_internal["status"]["url"] = json!("https://demo.default.svc.cluster.local");
-        assert!(visibility_ready(&secure_internal, &secure_internal, false).is_err());
+        assert!(visibility_ready(&secure_internal, &secure_internal, "demo", false).is_err());
+        for (field, observed) in [("name", "other"), ("namespace", "other")] {
+            let mut unrelated = public.clone();
+            unrelated["metadata"][field] = json!(observed);
+            unrelated["status"]["url"] = json!(format!(
+                "http://{}.{}.example.com",
+                unrelated["metadata"]["name"].as_str().unwrap(),
+                unrelated["metadata"]["namespace"].as_str().unwrap()
+            ));
+            assert!(visibility_ready(&public, &unrelated, "demo", true).is_err());
+        }
+        let mut custom = public.clone();
+        custom["status"]["url"] = json!("https://api.customer.example");
+        assert!(visibility_ready(&custom, &custom, "demo", true).unwrap());
     }
 
     #[test]
@@ -442,6 +462,20 @@ mod tests {
             &revision,
             "demo-00002"
         ));
+        let mut weighted = service(2, "demo-00002");
+        weighted["spec"]["traffic"] = json!([
+            {"revisionName":"demo-00001","percent":25},
+            {"revisionName":"demo-00002","percent":75}
+        ]);
+        weighted["status"]["traffic"] = weighted["spec"]["traffic"].clone();
+        for _ in 0..2 {
+            assert!(deployment_ready(&weighted, &revision, "demo-00002"));
+        }
+        weighted["status"]["traffic"] = json!([
+            {"revisionName":"demo-00001","percent":100},
+            {"revisionName":"demo-00002","percent":0}
+        ]);
+        assert!(deployment_ready(&weighted, &revision, "demo-00002"));
     }
 
     #[test]
