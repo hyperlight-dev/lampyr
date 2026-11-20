@@ -84,10 +84,13 @@ type routerSlot struct {
 }
 
 type routerPool struct {
-	mu     sync.Mutex
-	slots  []*routerSlot
-	idle   time.Duration
-	closed bool
+	mu                  sync.Mutex
+	namespace, revision string
+	slots               []*routerSlot
+	busy                int
+	idle                time.Duration
+	limit               int
+	closed              bool
 }
 
 type Router struct {
@@ -379,6 +382,11 @@ func (router *Router) applyRevisions(revisions map[string]RevisionRoute) {
 	for key, pool := range router.pools {
 		if !retain[key] {
 			delete(router.pools, key)
+			if router.generations[pool.namespace+"/"+pool.revision] != 0 {
+				reuseSlots.WithLabelValues(pool.namespace, pool.revision, "busy").Set(0)
+				reuseSlots.WithLabelValues(pool.namespace, pool.revision, "idle").Set(0)
+				reuseSlotLimit.WithLabelValues(pool.namespace, pool.revision).Set(0)
+			}
 			removed = append(removed, pool)
 			continue
 		}
@@ -433,6 +441,7 @@ func (router *Router) endPool(pool *routerPool, closePool bool, now time.Time) {
 	}
 	pool.slots = retained
 	pool.mu.Unlock()
+	router.observeReusePool(pool)
 	for _, slot := range released {
 		router.endSlotLater(slot.client, slot.fiber.ID)
 	}
@@ -508,11 +517,15 @@ func (router *Router) release(client FiberClient, id string) {
 }
 
 func (router *Router) Close() error {
-	router.mu.Lock()
+	router.mu.RLock()
+	pools := make([]*routerPool, 0, len(router.pools))
 	for _, pool := range router.pools {
+		pools = append(pools, pool)
+	}
+	router.mu.RUnlock()
+	for _, pool := range pools {
 		router.endPool(pool, true, time.Now())
 	}
-	router.mu.Unlock()
 	router.releaseMu.Lock()
 	router.closing = true
 	router.releaseMu.Unlock()
@@ -689,7 +702,7 @@ func (router *Router) clone(request context.Context, deadline time.Time, whole b
 	router.mu.Lock()
 	pool := router.pools[poolKey]
 	if pool == nil {
-		pool = &routerPool{idle: idle}
+		pool = &routerPool{namespace: namespace, revision: revision, idle: idle}
 		router.pools[poolKey] = pool
 	}
 	router.mu.Unlock()
@@ -699,6 +712,7 @@ func (router *Router) clone(request context.Context, deadline time.Time, whole b
 		drop(grant.Client)
 		return consumer.Fiber{}, nil, fmt.Errorf("revision is draining")
 	}
+	pool.limit = grant.MaxFibers
 	var selected *routerSlot
 	for _, slot := range pool.slots {
 		if !slot.busy {
@@ -716,6 +730,7 @@ func (router *Router) clone(request context.Context, deadline time.Time, whole b
 		pool.slots = append(pool.slots, selected)
 	}
 	selected.busy = true
+	pool.busy++
 	// A slot's session lives on the home it was first cloned on, and the
 	// slot holds that home's connection for as long as it keeps the
 	// session. Once that home is no longer the one served, its fiber is
@@ -734,6 +749,7 @@ func (router *Router) clone(request context.Context, deadline time.Time, whole b
 		selected.client = grant.Client
 	}
 	pool.mu.Unlock()
+	router.observeReusePool(pool)
 	if held {
 		drop(grant.Client)
 	}
@@ -743,7 +759,10 @@ func (router *Router) clone(request context.Context, deadline time.Time, whole b
 	router.endSlotLater(stale.client, stale.fiber.ID)
 	finish := func(gone bool) {
 		pool.mu.Lock()
-		selected.busy = false
+		if selected.busy {
+			selected.busy = false
+			pool.busy--
+		}
 		selected.lastUse = time.Now()
 		destroy := gone || pool.closed
 		if destroy {
@@ -756,6 +775,7 @@ func (router *Router) clone(request context.Context, deadline time.Time, whole b
 		}
 		client, id := selected.client, selected.fiber.ID
 		pool.mu.Unlock()
+		router.observeReusePool(pool)
 		if destroy {
 			router.endSlot(client, id)
 		}
@@ -778,6 +798,20 @@ func (router *Router) clone(request context.Context, deadline time.Time, whole b
 	selected.fiber = fiber
 	pool.mu.Unlock()
 	return fiber, finish, nil
+}
+
+func (router *Router) observeReusePool(pool *routerPool) {
+	metrics := router.metricsFor(pool.namespace, pool.revision)
+	metrics.record(func() {
+		if router.pools[pool.namespace+"/"+pool.revision] != pool {
+			return
+		}
+		pool.mu.Lock()
+		defer pool.mu.Unlock()
+		reuseSlots.WithLabelValues(pool.namespace, pool.revision, "busy").Set(float64(pool.busy))
+		reuseSlots.WithLabelValues(pool.namespace, pool.revision, "idle").Set(float64(len(pool.slots) - pool.busy))
+		reuseSlotLimit.WithLabelValues(pool.namespace, pool.revision).Set(float64(pool.limit))
+	})
 }
 
 // resolveHeld resolves a home and holds its connection. A refresh can
