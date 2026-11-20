@@ -4,6 +4,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Prerelease] - Unreleased
 
+### Added
+
+- AKS installations can opt in to trusted ingress with a customer-owned Azure DNS zone. Lampyr provisions a stable public IP, wildcard records, zone-scoped Workload Identity, and a cert-manager ACME Certificate. The self-signed certificate remains the default. An existing TLS Secret is also supported.
+
 ### Changed
 
 - Releases use the signed, digest-pinned Azure/fiberd v0.4.0 and Azure/fiberd-k8s-controller v0.1.0 images. Lampyr no longer builds or publishes copies of these images. Platform archives keep the matching controller install manifest and template tools.

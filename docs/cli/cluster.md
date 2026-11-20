@@ -142,6 +142,12 @@ fiberdImage: ghcr.io/hyperlight-dev/lampyr/fiberd:preview@sha256:FIBERD_DIGEST
 routerImage: ghcr.io/hyperlight-dev/lampyr/fiber-router:preview@sha256:ROUTER_DIGEST
 nodeSetupImage: ghcr.io/hyperlight-dev/lampyr/azure-node-setup:preview@sha256:NODE_SETUP_DIGEST
 domain: services.example.com
+ingress:
+  azureDnsZoneResourceId: /subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/customer-dns/providers/Microsoft.Network/dnszones/example.com
+  tls:
+    mode: acme
+    email: platform@example.com
+    issuer: letsencrypt-prod
 eventGridControllerImage: ghcr.io/hyperlight-dev/lampyr/eventgrid-controller:preview@sha256:CONTROLLER_DIGEST
 eventGridAdapterImage: ghcr.io/hyperlight-dev/lampyr/eventgrid-adapter:preview@sha256:ADAPTER_DIGEST
 eventSources:
@@ -168,6 +174,14 @@ non-AAD AKS configuration returns embedded client-certificate credentials,
 which `ly` validates and merges directly into the standard kubeconfig. On
 Unix hosts, Lampyr protects both the installation directory and its Azure CLI
 cache with owner-only (`0700`) permissions before every use.
+
+Azure ingress remains self-signed unless `ingress.tls.mode` is `acme` or
+`existingSecret`. ACME requires a user-owned public Azure DNS zone. Lampyr
+uses Azure Workload Identity and grants DNS Zone Contributor only on that
+zone. `existingSecret` accepts `secretName` and `secretNamespace`. Add
+`azureDnsZoneResourceId` to that mode when Lampyr should manage the stable
+public IP and wildcard records. The Secret must be outside Lampyr-owned
+namespaces.
 
 ## fiberd-k8s-controller
 

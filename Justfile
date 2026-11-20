@@ -288,6 +288,10 @@ test-kind-integration: setup-hluk build-fiberd build-control-plane build-ly kind
 test-azure-eventgrid-integration: build-ly azure::build azure::build-eventgrid
     "{{repo-root}}/scripts/test-azure-eventgrid-integration.sh"
 
+# Create disposable AKS ingress resources in an existing public Azure DNS zone.
+test-azure-ingress-integration: build-ly azure::build
+    "{{repo-root}}/scripts/test-azure-ingress-integration.sh"
+
 # Exercise the full Kind integration using build artifacts supplied by CI.
 test-kind-integration-prebuilt: kind::build
     LAMPYR_TEST_ROOTFS="{{repo-root}}/providers/kind/build/rootfs/rootfs.cpio" just cli::test-runtime
