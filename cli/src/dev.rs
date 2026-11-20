@@ -3,6 +3,7 @@
 
 use std::collections::BTreeSet;
 use std::path::Path;
+use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
 use serde_json::json;
@@ -14,6 +15,7 @@ pub fn run(
     root: Option<&Path>,
     port: i32,
     metrics: bool,
+    observability: bool,
     host: &Host,
 ) -> Result<()> {
     ensure!(
@@ -80,7 +82,7 @@ pub fn run(
         .capture(host.command(&helper)?.arg("--protocol-version"))
         .context("local supervisor is outdated; install or rebuild matching ly and ly-dev")?;
     ensure!(
-        protocol == "3",
+        protocol == "4",
         "local supervisor is outdated; install or rebuild matching ly and ly-dev"
     );
     let build = directory.join(".lampyr/dev");
@@ -128,12 +130,18 @@ pub fn run(
         serde_json::to_vec(&json!({
             "binary": binary,
             "listen": format!("127.0.0.1:{port}"),
-            "schemaVersion": 3,
+            "schemaVersion": 4,
             "exposedServices": exposed,
             "metrics": metrics,
+            "observability": observability,
             "services": services,
         }))?,
     )?;
     println!("native dev: CPU quotas, signed Grants and durable event delivery are not emulated");
-    host.interactive(host.command(helper)?.arg(&plan))
+    if observability {
+        // Allow request draining, bounded trace flushing, then backend removal.
+        host.interactive_with_grace(host.command(helper)?.arg(&plan), Duration::from_secs(30))
+    } else {
+        host.interactive(host.command(helper)?.arg(&plan))
+    }
 }

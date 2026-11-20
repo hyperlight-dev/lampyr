@@ -170,6 +170,9 @@ enum Command {
         /// Print one line per completed request and a summary on exit.
         #[arg(long)]
         metrics: bool,
+        /// Start local Prometheus and Jaeger with links on the local service index.
+        #[arg(long)]
+        observability: bool,
     },
     /// Build the service snapshot and local OCI image.
     Build {
@@ -473,8 +476,9 @@ fn run(cli: Cli) -> Result<()> {
             directory,
             port,
             metrics,
+            observability,
         } => {
-            lampyr_cli::dev::run(&directory, None, port, metrics, &host)?;
+            lampyr_cli::dev::run(&directory, None, port, metrics, observability, &host)?;
         }
         Command::Build {
             directory,

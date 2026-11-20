@@ -40,6 +40,7 @@ upgrade process.
 |---|---:|---|
 | `--port` | `8080` | Local HTTP port. |
 | `--metrics` | `false` | Print one line per completed request and an aggregate summary when dev exits. |
+| `--observability` | `false` | Start local Prometheus and Jaeger. Show links on the local service index. |
 
 Metrics include service, method, path, status, total duration, Fiber clone
 duration, Fiber ID, and whether the Fiber was created or attached for reuse:
@@ -48,6 +49,32 @@ duration, Fiber ID, and whether the Fiber was created or attached for reuse:
 metric service=worker-api method=GET path="/invoke" status=200 duration_ms=128 clone_ms=117 fiber_id="worker-api-2" fiber=CREATE
 metrics summary requests=3 errors=0 create=2 attach=1 avg_duration_ms=54 avg_clone_ms=39
 ```
+
+## Local observability
+
+```bash
+ly dev demos/local-worker-workspace --observability
+```
+
+Open `http://localhost:8080/`. The service index includes an **Observability**
+section with links to Prometheus and Jaeger. Send requests to an exposed
+service. In Prometheus, query `lampyr_router_request_duration_seconds_count`.
+In Jaeger, select `lampyr-local`, then **Find Traces**. Telemetry includes
+internal services reached through bindings.
+
+This option needs Docker, not Kubernetes. The first run downloads pinned
+Prometheus and Jaeger images. Their browser endpoints use free loopback ports,
+so multiple dev sessions can run with different `--port` values.
+Prometheus scrapes a separate host listener with a random session token.
+Docker uses `host.docker.internal` to reach it, with `host-gateway` on Linux.
+The host firewall must allow this container-to-host connection.
+Application routes, including `/metrics`, do not change.
+
+Data is temporary. On exit, the supervisor flushes traces, removes its two
+containers, and deletes their configuration. Prometheus retains up to one hour
+of metrics in memory-backed storage; Jaeger retains up to 10,000 traces.
+Use `--metrics` as well if you want request text in the terminal.
+Without `--observability`, no telemetry containers or scrape listener start.
 
 ## Workspace development
 

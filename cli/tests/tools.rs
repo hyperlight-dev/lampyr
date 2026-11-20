@@ -113,6 +113,46 @@ fn interactive_cancellation_allows_graceful_sigterm_cleanup() {
 
 #[cfg(unix)]
 #[test]
+fn observability_cancellation_allows_drain_then_backend_cleanup() {
+    let directory = tempfile::tempdir().unwrap();
+    let started = directory.path().join("started");
+    let stopped = directory.path().join("stopped");
+    let mut command = std::process::Command::new("/bin/sh");
+    command
+        .env("STARTED", &started)
+        .env("STOPPED", &stopped)
+        .args([
+            "-c",
+            "trap 'sleep 8; printf stopped > \"$STOPPED\"; exit 0' TERM; printf started > \"$STARTED\"; while :; do :; done",
+        ]);
+    let cancellation = Cancellation::default();
+    let cancel = cancellation.clone();
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !started.exists() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            cancel.cancel();
+        });
+        assert!(
+            tools::execute(
+                &mut command,
+                tools::Output::InteractiveWithGrace(Duration::from_secs(30)),
+                1024,
+                None,
+                &cancellation,
+            )
+            .is_err()
+        );
+    });
+    assert_eq!(
+        std::fs::read_to_string(stopped).expect("backend cleanup did not finish"),
+        "stopped"
+    );
+}
+
+#[test]
 fn interactive_cancellation_kills_descendants_after_grace_period() {
     let directory = tempfile::tempdir().unwrap();
     let started = directory.path().join("started");
