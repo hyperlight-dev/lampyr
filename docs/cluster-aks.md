@@ -221,14 +221,25 @@ This changes only the streaming transport used by this command. The message
 Deploy the service image through the external registry:
 
 ```bash
-ly deploy \
-  --context aks-lampyr \
-  --image "$REGISTRY/lampyr-app:v1" \
-  services/app
+DEPLOYED=$(
+  ly deploy \
+    --context aks-lampyr \
+    --image "$REGISTRY/lampyr-app:v1" \
+    services/app
+)
+printf '%s\n' "$DEPLOYED"
+SERVICE_URL=$(
+  printf '%s\n' "$DEPLOYED" |
+    awk '$1 == "url" && $2 ~ /^https?:\/\// {print $2}'
+)
+SERVICE_HOST=${SERVICE_URL#*://}
+SERVICE_HOST=${SERVICE_HOST%%/*}
+test -n "$SERVICE_HOST"
 ```
 
 `ly deploy` publishes the local image if needed, resolves it to an immutable
 digest, creates the Lampyr Service resources, and prints its HTTPS URL.
+`SERVICE_HOST` is the hostname from that URL.
 
 ## Test it on AKS
 
@@ -247,7 +258,7 @@ name from the Service URL that `ly deploy` printed as the `Host` header:
 
 ```bash
 curl --fail --insecure \
-  -H 'Host: HOST_FROM_SERVICE_URL' \
+  -H "Host: $SERVICE_HOST" \
   "https://$INGRESS_IP/test"
 ```
 
@@ -257,8 +268,17 @@ The response is:
 {"message":"hello from Hyperlight edge","path":"/test"}
 ```
 
-To use a real domain later, set `domain` in `azure.yaml` and create a wildcard
-DNS record for `*.default.<domain>` pointing to the ingress address.
+To use a real domain later, set `domain` in `azure.yaml`, then apply the updated
+platform configuration:
+
+```bash
+ly cluster install --provider azure \
+  --provider-config azure.yaml \
+  --approve-provider-manifests
+```
+
+After installation is ready, create a wildcard DNS record for
+`*.default.<domain>` pointing to the ingress address.
 
 The generated development certificate is self-signed, so this example uses
 `--insecure`. Replace it with production certificate management before serving
