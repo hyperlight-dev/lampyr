@@ -80,7 +80,7 @@ struct ObservabilityArgs {
 
 #[derive(Subcommand)]
 enum ObservabilityCommand {
-    /// Install or update the optional Prometheus and Jaeger add-on.
+    /// Install or update the optional Prometheus, Perses, and Jaeger add-on.
     Install(ObservabilityArgs),
     /// Show the add-on's workloads and services.
     Status(ObservabilityArgs),
@@ -133,7 +133,7 @@ enum Command {
         #[command(subcommand)]
         command: ClusterCommand,
     },
-    /// Manage the optional metrics and traces add-on.
+    /// Manage the optional metrics, traces, and dashboard add-on.
     Observability {
         #[command(subcommand)]
         command: ObservabilityCommand,
