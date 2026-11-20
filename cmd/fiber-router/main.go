@@ -111,9 +111,7 @@ func main() {
 	handler := otelhttp.NewHandler(
 		router.Handler(),
 		"lampyr.router.request",
-		otelhttp.WithFilter(func(request *http.Request) bool {
-			return request.URL.Path != "/healthz" && request.URL.Path != "/readyz"
-		}),
+		otelhttp.WithFilter(traceRouterRequest),
 	)
 	server := &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second, Protocols: protocols}
 	listener, err := net.Listen("tcp", *listen)
@@ -127,6 +125,10 @@ func main() {
 		log.Println(err)
 		os.Exit(1)
 	}
+}
+
+func traceRouterRequest(request *http.Request) bool {
+	return request.URL.Path != "/healthz" && request.URL.Path != "/readyz"
 }
 
 // drainTimeout is how long a shutdown lets requests, streams and WebSockets

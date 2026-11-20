@@ -63,6 +63,32 @@ func TestWriteProbeResponseRejectsInvalidInput(t *testing.T) {
 	}
 }
 
+func TestTraceRouterRequestExcludesOnlyRouterProbes(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		path     string
+		selected bool
+		want     bool
+	}{
+		{"health probe", "/healthz", false, false},
+		{"readiness probe", "/readyz", false, false},
+		{"selected health path", "/healthz", true, true},
+		{"selected readiness path", "/readyz", true, true},
+		{"application path", "/", false, true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			request := httptest.NewRequest("GET", test.path, nil)
+			if test.selected {
+				request.Header.Set("Knative-Serving-Namespace", "default")
+				request.Header.Set("Knative-Serving-Revision", "demo-00001")
+			}
+			if got := traceRouterRequest(request); got != test.want {
+				t.Fatalf("traceRouterRequest() = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
 // order records what a shutdown did, in order.
 type order struct {
 	mu     sync.Mutex

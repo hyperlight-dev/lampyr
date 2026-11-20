@@ -27,12 +27,7 @@ func ConfigureTracing(ctx context.Context, service string) (func(context.Context
 	if err != nil {
 		return nil, err
 	}
-	res, err := resource.New(
-		ctx,
-		resource.WithFromEnv(),
-		resource.WithTelemetrySDK(),
-		resource.WithAttributes(semconv.ServiceName(service)),
-	)
+	res, err := tracingResource(ctx, service)
 	if err != nil {
 		_ = exporter.Shutdown(ctx)
 		return nil, err
@@ -47,6 +42,15 @@ func ConfigureTracing(ctx context.Context, service string) (func(context.Context
 		propagation.Baggage{},
 	))
 	return provider.Shutdown, nil
+}
+
+func tracingResource(ctx context.Context, service string) (*resource.Resource, error) {
+	return resource.New(
+		ctx,
+		resource.WithFromEnv(),
+		resource.WithTelemetrySDK(),
+		resource.WithAttributes(semconv.ServiceName(service)),
+	)
 }
 
 func tracingEnabled() bool {
