@@ -136,9 +136,16 @@ type observedUpgradeConnection struct {
 	failed *atomic.Bool
 }
 
+func upgradeCopyFailed(err error) bool {
+	return err != nil &&
+		!errors.Is(err, io.EOF) &&
+		!errors.Is(err, io.ErrClosedPipe) &&
+		!errors.Is(err, net.ErrClosed)
+}
+
 func (connection *observedUpgradeConnection) Read(data []byte) (int, error) {
 	count, err := connection.ReadWriteCloser.Read(data)
-	if err != nil && !errors.Is(err, io.EOF) {
+	if upgradeCopyFailed(err) {
 		connection.failed.Store(true)
 	}
 	return count, err
@@ -146,7 +153,7 @@ func (connection *observedUpgradeConnection) Read(data []byte) (int, error) {
 
 func (connection *observedUpgradeConnection) Write(data []byte) (int, error) {
 	count, err := connection.ReadWriteCloser.Write(data)
-	if err != nil {
+	if upgradeCopyFailed(err) {
 		connection.failed.Store(true)
 	}
 	return count, err
@@ -159,7 +166,7 @@ type observedUpgradeConnectionWithCloseWrite struct {
 
 func (connection *observedUpgradeConnectionWithCloseWrite) CloseWrite() error {
 	err := connection.closeWriter.CloseWrite()
-	if err != nil {
+	if upgradeCopyFailed(err) {
 		connection.failed.Store(true)
 	}
 	return err

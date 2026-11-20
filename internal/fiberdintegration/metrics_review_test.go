@@ -41,6 +41,13 @@ func (*failedUpgradeBody) Read([]byte) (int, error) {
 func (*failedUpgradeBody) Write(data []byte) (int, error) { return len(data), nil }
 func (*failedUpgradeBody) Close() error                   { return nil }
 
+type closedUpgradeBody struct{}
+
+func (*closedUpgradeBody) Read([]byte) (int, error)  { return 0, net.ErrClosed }
+func (*closedUpgradeBody) Write([]byte) (int, error) { return 0, io.ErrClosedPipe }
+func (*closedUpgradeBody) Close() error              { return nil }
+func (*closedUpgradeBody) CloseWrite() error         { return net.ErrClosed }
+
 type delayedFiberClient struct {
 	client       *testFiberClient
 	cloneDelay   time.Duration
@@ -146,6 +153,17 @@ func TestRouterMetricsClassifyUpgradedBackendCopyFailure(t *testing.T) {
 	}
 	if body := scrape(); !strings.Contains(body, prefix+"1") {
 		t.Fatalf("upgraded copy failure was not recorded as an error:\n%s", lines(body, route.Revision))
+	}
+}
+
+func TestRouterMetricsIgnoreProxyUpgradeCloseErrors(t *testing.T) {
+	recorder := &statusRecorder{ResponseWriter: httptest.NewRecorder()}
+	connection := recorder.observeUpgrade(&closedUpgradeBody{})
+	connection.Read(nil)
+	connection.Write(nil)
+	connection.(interface{ CloseWrite() error }).CloseWrite()
+	if recorder.failed.Load() {
+		t.Fatal("proxy teardown was classified as an upgraded backend failure")
 	}
 }
 
