@@ -262,38 +262,51 @@ func (router *Router) Reload() error {
 		return err
 	}
 	revisions := map[string]RevisionRoute{}
-	retain := map[string]bool{}
-	routed := map[string]bool{}
-	idle := map[string]time.Duration{}
+	sources := map[string]string{}
 	for _, entry := range entries {
 		if !strings.HasSuffix(entry.Name(), ".json") {
 			continue
 		}
 		data, err := os.ReadFile(router.routesDir + "/" + entry.Name())
 		if err != nil {
-			return err
+			log.Printf("read route metadata %s: %v", entry.Name(), err)
+			continue
 		}
 		var metadata struct {
 			Kind string `json:"kind"`
 		}
 		if err := json.Unmarshal(data, &metadata); err != nil {
-			return fmt.Errorf("decode route metadata %s: %w", entry.Name(), err)
+			log.Printf("decode route metadata %s: %v", entry.Name(), err)
+			continue
 		}
 		if metadata.Kind != "revision" {
-			return fmt.Errorf("route metadata %s is not a Revision", entry.Name())
+			log.Printf("route metadata %s is not a Revision", entry.Name())
+			continue
 		}
 		var revision RevisionRoute
 		if err := json.Unmarshal(data, &revision); err != nil {
-			return fmt.Errorf("decode Revision route %s: %w", entry.Name(), err)
+			log.Printf("decode Revision route %s: %v", entry.Name(), err)
+			continue
 		}
 		if err := revision.Validate(); err != nil {
-			return fmt.Errorf("Revision route %s: %w", entry.Name(), err)
+			log.Printf("Revision route %s: %v", entry.Name(), err)
+			continue
 		}
 		key := revision.Namespace + "/" + revision.Revision
-		if _, exists := revisions[key]; exists {
-			return fmt.Errorf("duplicate Revision route %q", key)
+		if source, exists := sources[key]; exists {
+			log.Printf("duplicate Revision route %q in %s and %s; skipping all files for this Revision", key, source, entry.Name())
+			delete(revisions, key)
+			continue
 		}
+		// Keep the first source even after a duplicate removes the route,
+		// so a third copy cannot make an ambiguous Revision valid again.
+		sources[key] = entry.Name()
 		revisions[key] = revision
+	}
+	retain := map[string]bool{}
+	routed := map[string]bool{}
+	idle := map[string]time.Duration{}
+	for key, revision := range revisions {
 		poolKey := revision.Namespace + "--" + revision.Revision
 		if revision.Routed {
 			retain[poolKey] = true

@@ -186,6 +186,12 @@ The custom Go reconciler:
 Revision readiness requires a verified artifact, admitted CapacityGrant, ready
 Home, ready backend Service, and published router metadata.
 
+The router logs and skips each metadata file that it cannot read, decode, or
+validate. If multiple valid files identify the same namespace and Revision,
+the router logs the conflict and excludes that Revision until only one file
+remains. Other valid Revisions continue to load. Excluded and removed Revisions
+release their Fiber pools. Readiness confirms the loaded metadata version.
+
 ## Scaling translation
 
 Lampyr does not install KPA.
