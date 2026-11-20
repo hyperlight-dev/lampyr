@@ -123,6 +123,14 @@ func TestRouterMetricsTrackReuseSlots(t *testing.T) {
 	})
 	router.ServeHTTP(httptest.NewRecorder(), revisionRequest("GET", "/", route))
 	labels := []string{route.Namespace, route.Revision}
+	router.mu.RLock()
+	pool := router.pools[route.Namespace+"--"+route.Revision]
+	router.mu.RUnlock()
+	pool.mu.Lock()
+	if pool.busy != 0 || len(pool.slots) != 1 {
+		t.Fatalf("retained pool = %d busy of %d slots, want 0 of 1", pool.busy, len(pool.slots))
+	}
+	pool.mu.Unlock()
 	if got := testutil.ToFloat64(reuseSlots.WithLabelValues(append(labels, "idle")...)); got != 1 {
 		t.Fatalf("idle reuse slots after request = %v, want 1", got)
 	}
@@ -142,15 +150,22 @@ func TestRouterMetricsTrackReuseSlots(t *testing.T) {
 	if got := testutil.ToFloat64(reuseSlots.WithLabelValues(append(labels, "idle")...)); got != 0 {
 		t.Fatalf("idle reuse slots while busy = %v", got)
 	}
+	pool.mu.Lock()
+	if pool.busy != 1 {
+		t.Fatalf("retained pool busy slots = %d, want 1", pool.busy)
+	}
+	pool.mu.Unlock()
 	close(finish)
 	<-done
+	pool.mu.Lock()
+	if pool.busy != 0 {
+		t.Fatalf("retained pool busy slots after completion = %d", pool.busy)
+	}
+	pool.mu.Unlock()
 	if got := testutil.ToFloat64(reuseSlots.WithLabelValues(append(labels, "idle")...)); got != 1 {
 		t.Fatalf("idle reuse slots after completion = %v, want 1", got)
 	}
 
-	router.mu.RLock()
-	pool := router.pools[route.Namespace+"--"+route.Revision]
-	router.mu.RUnlock()
 	router.endPool(pool, false, time.Now().Add(time.Minute))
 	if got := testutil.ToFloat64(reuseSlots.WithLabelValues(append(labels, "idle")...)); got != 0 {
 		t.Fatalf("idle reuse slots after timeout = %v", got)

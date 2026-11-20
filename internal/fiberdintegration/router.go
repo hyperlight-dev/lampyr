@@ -87,6 +87,7 @@ type routerPool struct {
 	mu                  sync.Mutex
 	namespace, revision string
 	slots               []*routerSlot
+	busy                int
 	idle                time.Duration
 	limit               int
 	closed              bool
@@ -729,6 +730,7 @@ func (router *Router) clone(request context.Context, deadline time.Time, whole b
 		pool.slots = append(pool.slots, selected)
 	}
 	selected.busy = true
+	pool.busy++
 	// A slot's session lives on the home it was first cloned on, and the
 	// slot holds that home's connection for as long as it keeps the
 	// session. Once that home is no longer the one served, its fiber is
@@ -757,7 +759,10 @@ func (router *Router) clone(request context.Context, deadline time.Time, whole b
 	router.endSlotLater(stale.client, stale.fiber.ID)
 	finish := func(gone bool) {
 		pool.mu.Lock()
-		selected.busy = false
+		if selected.busy {
+			selected.busy = false
+			pool.busy--
+		}
 		selected.lastUse = time.Now()
 		destroy := gone || pool.closed
 		if destroy {
@@ -803,16 +808,8 @@ func (router *Router) observeReusePool(pool *routerPool) {
 		}
 		pool.mu.Lock()
 		defer pool.mu.Unlock()
-		busy, idle := 0, 0
-		for _, slot := range pool.slots {
-			if slot.busy {
-				busy++
-			} else {
-				idle++
-			}
-		}
-		reuseSlots.WithLabelValues(pool.namespace, pool.revision, "busy").Set(float64(busy))
-		reuseSlots.WithLabelValues(pool.namespace, pool.revision, "idle").Set(float64(idle))
+		reuseSlots.WithLabelValues(pool.namespace, pool.revision, "busy").Set(float64(pool.busy))
+		reuseSlots.WithLabelValues(pool.namespace, pool.revision, "idle").Set(float64(len(pool.slots) - pool.busy))
 		reuseSlotLimit.WithLabelValues(pool.namespace, pool.revision).Set(float64(pool.limit))
 	})
 }
