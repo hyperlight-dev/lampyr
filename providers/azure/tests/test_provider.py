@@ -11,6 +11,7 @@ from unittest.mock import Mock, patch
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "eventgrid"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ingress"))
 sys.modules["hyperlight"] = types.SimpleNamespace(call=Mock())
 spec = importlib.util.spec_from_file_location("azure_provider", Path(__file__).resolve().parents[1] / "provider.py")
 provider = importlib.util.module_from_spec(spec)
@@ -21,6 +22,10 @@ PRINCIPAL = "11111111-1111-1111-1111-111111111111"
 
 
 class ProviderTests(unittest.TestCase):
+    def test_provider_program_fits_the_runtime_limit(self):
+        source = Path(__file__).resolve().parents[1] / "provider.py"
+        self.assertLessEqual(source.stat().st_size, 64 * 1024)
+
     def test_compilation_reports_progress_before_and_after_the_command(self):
         events = []
         with patch.object(provider, "progress", side_effect=lambda message: events.append(message)), \
@@ -43,6 +48,7 @@ class ProviderTests(unittest.TestCase):
         self.parameters = {
             "installationId": OWNER, "tenantId": "tenant", "subscriptionId": "subscription",
             "clusterName": "test", "resourceGroupName": "shared", "eventingResourceGroup": "dedicated",
+            "ingressResourceGroup": "ingress",
             "eventingEnabled": False, "nodeCount": 1,
         }
         self.auth = {
@@ -84,6 +90,171 @@ class ProviderTests(unittest.TestCase):
         self.assertIn("only httpsPort 443", result["message"])
         apply.assert_not_called()
 
+    def test_ingress_tls_configuration_is_opt_in_and_zone_scoped(self):
+        zone = (
+            f"/subscriptions/{PRINCIPAL}/resourceGroups/customer-dns/"
+            "providers/Microsoft.Network/dnsZones/example.com"
+        )
+        valid = copy.deepcopy(self.request)
+        valid["config"].update({
+            "domain": "apps.example.com",
+            "ingress": {
+                "azureDnsZoneResourceId": zone,
+                "tls": {
+                    "mode": "acme",
+                    "email": "platform@example.com",
+                    "issuer": "letsencrypt-prod",
+                },
+            },
+        })
+        with patch.object(provider, "apply", return_value={}) as apply:
+            self.assertEqual(provider.invoke(valid)["status"], "ok")
+        apply.assert_called_once()
+        bindings = provider.INGRESS.bindings(valid["config"])
+        self.assertEqual(bindings["ingressDnsRecord"], "apps")
+        self.assertTrue(bindings["ingressAcmeEnabled"])
+
+        invalid = [
+            {"ingress": {"tls": {"mode": "acme", "email": "bad"}}},
+            {
+                "domain": "apps.other.example",
+                "ingress": {
+                    "azureDnsZoneResourceId": zone,
+                    "tls": {"mode": "acme", "email": "platform@example.com"},
+                },
+            },
+            {
+                "domain": "apps.example.com",
+                "ingress": {
+                    "azureDnsZoneResourceId": zone,
+                    "tls": {"mode": "selfSigned"},
+                },
+            },
+            {
+                "ingress": {
+                    "tls": {
+                        "mode": "existingSecret",
+                        "secretName": "corporate-ingress",
+                        "secretNamespace": "kourier-system",
+                    },
+                },
+            },
+        ]
+        for update in invalid:
+            request = copy.deepcopy(self.request)
+            request["config"].update(update)
+            with self.subTest(update=update), patch.object(provider, "apply") as apply:
+                self.assertEqual(provider.invoke(request)["code"], "invalid-config")
+                apply.assert_not_called()
+
+    def test_existing_secret_tls_does_not_require_azure_dns(self):
+        self.request["config"]["ingress"] = {
+            "tls": {
+                "mode": "existingSecret",
+                "secretName": "corporate-ingress",
+                "secretNamespace": "security",
+            },
+        }
+        with patch.object(provider, "apply", return_value={}) as apply:
+            self.assertEqual(provider.invoke(self.request)["status"], "ok")
+        apply.assert_called_once()
+        self.assertFalse(provider.INGRESS.bindings(self.request["config"])["ingressDnsEnabled"])
+
+    def test_ingress_zone_cannot_share_a_dedicated_deletion_group(self):
+        self.parameters["subscriptionId"] = PRINCIPAL
+        for group in ("dedicated", "ingress"):
+            request = copy.deepcopy(self.request)
+            request["config"].update({
+                "domain": "apps.example.com",
+                "ingress": {
+                    "azureDnsZoneResourceId": (
+                        f"/subscriptions/{PRINCIPAL}/resourceGroups/{group}/"
+                        "providers/Microsoft.Network/dnsZones/example.com"
+                    ),
+                    "tls": {
+                        "mode": "acme",
+                        "email": "platform@example.com",
+                    },
+                },
+            })
+            with self.subTest(group=group):
+                with self.assertRaises(provider.ProviderError) as error:
+                    provider.INGRESS.validate_scope(request["config"], self.parameters)
+                self.assertEqual(error.exception.code, "invalid-config")
+                self.assertIn("dedicated resource group", str(error.exception))
+
+    def test_existing_cluster_identity_enablement_is_preserved(self):
+        current = {
+            "oidcIssuerProfile": {
+                "enabled": True,
+                "issuerUrl": "https://issuer.example/",
+            },
+            "securityProfile": {"workloadIdentity": {"enabled": True}},
+        }
+        args = provider.INGRESS.parameter_args(
+            self.request["config"], self.saved, self.parameters, current,
+        )
+        self.assertIn("clusterOidcIssuerEnabled=true", args)
+        self.assertIn("clusterWorkloadIdentityEnabled=true", args)
+
+    def test_ingress_bicep_reads_the_issuer_only_for_workload_identity(self):
+        source = (
+            Path(__file__).resolve().parents[1] / "templates" / "main.bicep"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            "oidcIssuer: ingressWorkloadIdentityEnabled ? "
+            "cluster.properties.oidcIssuerProfile.issuerURL! : ''",
+            source,
+        )
+
+    def test_foreign_wildcard_records_fail_before_azure_deployment(self):
+        zone = (
+            f"/subscriptions/{PRINCIPAL}/resourceGroups/customer-dns/"
+            "providers/Microsoft.Network/dnsZones/example.com"
+        )
+        self.request["config"].update({
+            "domain": "apps.example.com",
+            "ingress": {
+                "azureDnsZoneResourceId": zone,
+                "tls": {"mode": "existingSecret", "secretNamespace": "security"},
+            },
+        })
+        with patch.object(provider, "az", return_value={"metadata": {"owner": "customer"}}) as azure:
+            with self.assertRaises(provider.ProviderError) as error:
+                provider.INGRESS.ensure_records_available(
+                    self.request["config"], OWNER, provider.az,
+                )
+        self.assertEqual(error.exception.code, "not-owned")
+        self.assertEqual(azure.call_count, 1)
+
+    def test_dns_records_are_claimed_with_azure_preconditions(self):
+        zone = (
+            f"/subscriptions/{PRINCIPAL}/resourceGroups/customer-dns/"
+            "providers/Microsoft.Network/dnsZones/example.com"
+        )
+        inventory = {
+            "publicIpAddress": "203.0.113.10",
+            "dnsZoneId": zone,
+            "dnsRecordSetIds": [zone + "/A/*.apps", zone + "/A/*.default.apps"],
+        }
+
+        def azure(*args, **kwargs):
+            if args[:5] == ("network", "dns", "record-set", "a", "show"):
+                return None
+            if args[0] == "rest":
+                body = json.loads(args[args.index("--body") + 1])
+                return body
+            raise AssertionError(args)
+
+        with patch.object(provider, "az", side_effect=azure) as az:
+            provider.INGRESS.reconcile_records(
+                self.request, inventory, provider.az, provider.ProviderError,
+            )
+        writes = [call.args for call in az.call_args_list if call.args[0] == "rest"]
+        self.assertEqual(len(writes), 2)
+        self.assertTrue(all("If-None-Match=*" in call for call in writes))
+        self.assertTrue(all("%2A" in call[call.index("--url") + 1] for call in writes))
+
     def test_ordered_event_grid_image_setting_is_rejected(self):
         self.request["config"]["eventGridImages"] = [
             "registry/controller@sha256:" + "a" * 64,
@@ -112,6 +283,13 @@ class ProviderTests(unittest.TestCase):
                     "storageAccount": "images",
                     "container": "uploads",
                     "eventTypes": ["Microsoft.Storage.BlobCreated"],
+                },
+            },
+            "ingress": {
+                "tls": {
+                    "mode": "existingSecret",
+                    "secretName": "corporate-ingress",
+                    "secretNamespace": "security",
                 },
             },
             "teardown": False,
@@ -670,6 +848,244 @@ class ProviderTests(unittest.TestCase):
         )
         self.assertEqual(self.saved["managedRoleAssignments"], [])
 
+    def test_ingress_cleanup_deletes_only_recorded_owned_resources_not_the_zone(self):
+        zone = (
+            f"/subscriptions/{PRINCIPAL}/resourceGroups/customer-dns/"
+            "providers/Microsoft.Network/dnsZones/example.com"
+        )
+        public_ip = provider.resource_id(
+            self.parameters,
+            "providers", "Microsoft.Network", "publicIPAddresses", "lampyr-ingress",
+            group="ingress",
+        )
+        identity = provider.resource_id(
+            self.parameters,
+            "providers", "Microsoft.ManagedIdentity", "userAssignedIdentities", "lampyr-ingress-dns",
+            group="ingress",
+        )
+        ingress_group = provider.resource_id(self.parameters, group="ingress")
+        suffix = "/providers/Microsoft.Authorization/roleAssignments/" + PRINCIPAL
+        records = [zone + "/A/*.apps", zone + "/A/*.default.apps"]
+        self.saved["retiringIngress"] = [{
+            "resourceGroup": "ingress",
+            "resourceGroupId": ingress_group,
+            "publicIpId": public_ip,
+            "publicIpRoleAssignmentId": ingress_group + suffix,
+            "clusterPrincipalId": PRINCIPAL,
+            "dnsZoneId": zone,
+            "dnsRecordSetIds": records,
+            "dnsRoleAssignmentId": zone + suffix,
+            "dnsIdentityId": identity,
+            "dnsIdentityPrincipalId": PRINCIPAL,
+        }]
+
+        def azure(*args, **kwargs):
+            if args[:2] == ("resource", "show"):
+                return {
+                    "etag": "owned-version",
+                    "properties": {"metadata": {provider.OWNER_TAG: OWNER}},
+                }
+            if args[:2] == ("identity", "list"):
+                return []
+            if args[:3] == ("role", "assignment", "list"):
+                dns = args[4] == zone
+                role = zone + suffix if dns else ingress_group + suffix
+                return [{
+                    "id": role,
+                    "scope": zone if dns else ingress_group,
+                    "principalId": PRINCIPAL,
+                    "roleDefinitionId": (
+                        "/subscriptions/subscription/providers/Microsoft.Authorization/"
+                        "roleDefinitions/"
+                        + ("befefa01-2a29-4197-83a8-272ff33ce314"
+                           if dns else "4d97b98b-1d4f-4787-a291-c67834d212e7")
+                    ),
+                }]
+            return None
+
+        owned_group = {
+            "tags": {provider.OWNER_TAG: OWNER},
+            "properties": {"provisioningState": "Succeeded"},
+        }
+        with patch.object(provider, "az", side_effect=azure) as az, \
+             patch.object(provider, "group", side_effect=[owned_group, None]):
+            provider.INGRESS.delete(
+                self.parameters, self.request, self.saved,
+                provider.az, provider.resource_id, provider.group, provider.owned,
+                provider.wait_deleted, provider.ProviderError,
+            )
+        deleted = [
+            call.args[call.args.index("--url") + 1]
+            for call in az.call_args_list
+            if call.args[:3] == ("rest", "--method", "delete")
+        ]
+        self.assertEqual(len(deleted), 2)
+        self.assertTrue(all("%2A" in url for url in deleted))
+        self.assertTrue(all(zone not in url or "/A/" in url for url in deleted))
+        self.assertTrue(any(call.args[:2] == ("group", "delete") for call in az.call_args_list))
+        self.assertEqual(self.saved["managedIngress"], [])
+        self.assertEqual(self.saved["retiringIngress"], [])
+
+    def test_ingress_transition_retires_the_old_zone_role_and_records(self):
+        old_zone = (
+            f"/subscriptions/{PRINCIPAL}/resourceGroups/old-dns/"
+            "providers/Microsoft.Network/dnsZones/old.example.com"
+        )
+        new_zone = (
+            f"/subscriptions/{PRINCIPAL}/resourceGroups/new-dns/"
+            "providers/Microsoft.Network/dnsZones/new.example.com"
+        )
+        role_suffix = "/providers/Microsoft.Authorization/roleAssignments/"
+        old_role = old_zone + role_suffix + PRINCIPAL
+        new_role = new_zone + role_suffix + "22222222-2222-2222-2222-222222222222"
+        old = {
+            "resourceGroup": "ingress",
+            "resourceGroupId": provider.resource_id(self.parameters, group="ingress"),
+            "publicIpId": provider.resource_id(
+                self.parameters,
+                "providers", "Microsoft.Network", "publicIPAddresses", "lampyr-ingress",
+                group="ingress",
+            ),
+            "publicIpRoleAssignmentId": provider.resource_id(
+                self.parameters,
+                "providers", "Microsoft.Authorization", "roleAssignments", PRINCIPAL,
+                group="ingress",
+            ),
+            "clusterPrincipalId": PRINCIPAL,
+            "dnsZoneId": old_zone,
+            "dnsRecordSetIds": [old_zone + "/A/*.apps"],
+            "dnsRoleAssignmentId": old_role,
+            "dnsIdentityId": provider.resource_id(
+                self.parameters,
+                "providers", "Microsoft.ManagedIdentity", "userAssignedIdentities",
+                "lampyr-ingress-dns", group="ingress",
+            ),
+            "dnsIdentityClientId": PRINCIPAL,
+            "dnsIdentityPrincipalId": PRINCIPAL,
+        }
+        current = dict(
+            old,
+            dnsZoneId=new_zone,
+            dnsRecordSetIds=[new_zone + "/A/*.apps"],
+            dnsRoleAssignmentId=new_role,
+        )
+        self.saved["retiringIngress"] = [old]
+        self.saved["managedIngress"] = [current]
+
+        def azure(*args, **kwargs):
+            if args[:2] == ("resource", "show"):
+                return {
+                    "etag": "owned-version",
+                    "properties": {"metadata": {provider.OWNER_TAG: OWNER}},
+                }
+            if args[:3] == ("role", "assignment", "list"):
+                return [{
+                    "id": old_role,
+                    "scope": old_zone,
+                    "principalId": PRINCIPAL,
+                    "roleDefinitionId": (
+                        "/subscriptions/subscription/providers/Microsoft.Authorization/"
+                        "roleDefinitions/befefa01-2a29-4197-83a8-272ff33ce314"
+                    ),
+                }]
+            return None
+
+        with patch.object(provider, "settings", return_value=(self.parameters, self.saved)), \
+             patch.object(provider, "az", side_effect=azure) as az, \
+             patch.object(provider, "save") as save:
+            self.assertEqual(provider.finalize(self.request), {"finalized": True})
+        save.assert_called_once_with(self.saved)
+        deleted_roles = [
+            call.args[-1]
+            for call in az.call_args_list
+            if call.args[:3] == ("role", "assignment", "delete")
+        ]
+        self.assertEqual(deleted_roles, [old_role])
+        deleted_records = [
+            call.args[call.args.index("--url") + 1]
+            for call in az.call_args_list
+            if call.args[:3] == ("rest", "--method", "delete")
+        ]
+        self.assertEqual(len(deleted_records), 1)
+        self.assertIn("old.example.com", deleted_records[0])
+        self.assertEqual(self.saved["managedIngress"], [current])
+        self.assertEqual(self.saved["retiringIngress"], [])
+
+    def test_ingress_cleanup_rejects_a_saved_zone_in_its_deletion_group(self):
+        self.parameters["subscriptionId"] = PRINCIPAL
+        zone = (
+            f"/subscriptions/{PRINCIPAL}/resourceGroups/ingress/"
+            "providers/Microsoft.Network/dnsZones/example.com"
+        )
+        ingress_group = provider.resource_id(self.parameters, group="ingress")
+        self.saved["managedIngressClaims"] = [{
+            "resourceGroup": "ingress",
+            "resourceGroupId": ingress_group,
+            "dnsZoneId": zone,
+            "dnsRecordSetIds": [zone + "/A/*.apps"],
+        }]
+        with patch.object(provider, "az") as azure:
+            with self.assertRaises(provider.ProviderError) as error:
+                provider.INGRESS.delete(
+                    self.parameters, self.request, self.saved,
+                    provider.az, provider.resource_id, provider.group, provider.owned,
+                    provider.wait_deleted, provider.ProviderError,
+                )
+        self.assertEqual(error.exception.code, "invalid-state")
+        azure.assert_not_called()
+
+    def test_partial_ingress_claim_cleans_owned_zone_resources_and_group(self):
+        zone = (
+            f"/subscriptions/{PRINCIPAL}/resourceGroups/customer-dns/"
+            "providers/Microsoft.Network/dnsZones/example.com"
+        )
+        ingress_group = provider.resource_id(self.parameters, group="ingress")
+        records = [zone + "/A/*.apps", zone + "/A/*.default.apps"]
+        self.saved["managedIngressClaims"] = [{
+            "resourceGroup": "ingress",
+            "resourceGroupId": ingress_group,
+            "dnsZoneId": zone,
+            "dnsRecordSetIds": records,
+        }]
+        role = zone + "/providers/Microsoft.Authorization/roleAssignments/" + PRINCIPAL
+
+        def azure(*args, **kwargs):
+            if args[:2] == ("resource", "show"):
+                return {
+                    "etag": "owned-version",
+                    "properties": {"metadata": {provider.OWNER_TAG: OWNER}},
+                }
+            if args[:2] == ("identity", "list"):
+                return [{"principalId": PRINCIPAL, "tags": {provider.OWNER_TAG: OWNER}}]
+            if args[:3] == ("role", "assignment", "list"):
+                return [{
+                    "id": role,
+                    "scope": zone,
+                    "principalId": PRINCIPAL,
+                    "roleDefinitionId": (
+                        "/subscriptions/subscription/providers/Microsoft.Authorization/"
+                        "roleDefinitions/befefa01-2a29-4197-83a8-272ff33ce314"
+                    ),
+                }]
+            return None
+
+        owned_group = {
+            "tags": {provider.OWNER_TAG: OWNER},
+            "properties": {"provisioningState": "Succeeded"},
+        }
+        with patch.object(provider, "az", side_effect=azure) as az, \
+             patch.object(provider, "group", side_effect=[owned_group, None]):
+            provider.INGRESS.delete(
+                self.parameters, self.request, self.saved,
+                provider.az, provider.resource_id, provider.group, provider.owned,
+                provider.wait_deleted, provider.ProviderError,
+            )
+        self.assertTrue(any(
+            call.args[:3] == ("role", "assignment", "delete") and role in call.args
+            for call in az.call_args_list
+        ))
+        self.assertEqual(self.saved["managedIngressClaims"], [])
+
     def test_full_delete_waits_for_aks_before_deleting_eventing_group(self):
         self.request["config"]["deleteCluster"] = True
         owned_cluster = {
@@ -769,6 +1185,15 @@ class ProviderTests(unittest.TestCase):
             parameters, _ = provider.settings(self.request, teardown=True)
             self.assertEqual(parameters["resourceGroupName"], "shared")
             source.assert_not_called()
+
+    def test_teardown_defaults_the_ingress_group_for_legacy_state(self):
+        del self.saved["parameters"]["ingressResourceGroup"]
+        with patch.object(provider, "state", return_value=self.saved), \
+             patch.object(provider, "authenticate", return_value=self.auth):
+            parameters, saved = provider.settings(self.request, teardown=True)
+        expected = f"test-ingress-{OWNER[:10]}"
+        self.assertEqual(parameters["ingressResourceGroup"], expected)
+        self.assertEqual(saved["parameters"]["ingressResourceGroup"], expected)
 
     def test_latest_version_understands_minor_groups_and_rejects_preview_patches(self):
         versions = {"values": [

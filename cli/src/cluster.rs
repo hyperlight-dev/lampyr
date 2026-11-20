@@ -562,12 +562,47 @@ fn without_platform_inputs(config: &Value) -> Result<Value> {
     Ok(provider_config)
 }
 
+fn provider_config(config: &Value, provider: &str) -> Result<Value> {
+    let mut provider_config = without_platform_inputs(config)?;
+    if provider == "azure"
+        && let Some(ingress) = config.get("ingress")
+    {
+        provider_config["ingress"] = ingress.clone();
+    }
+    Ok(provider_config)
+}
+
+fn merge_platform_settings(
+    mut settings: serde_json::Map<String, Value>,
+    config: &Value,
+) -> serde_json::Map<String, Value> {
+    for field in ["domain", "fiberdImage", "routerImage"] {
+        settings.insert(field.into(), config[field].clone());
+    }
+    for field in PLATFORM_INPUTS {
+        if field == "ingress" && settings.contains_key(field) {
+            continue;
+        }
+        if let Some(value) = config.get(field) {
+            settings.insert(field.into(), value.clone());
+        }
+    }
+    settings.entry("httpsPort").or_insert(json!(443));
+    settings
+}
+
+fn persisted_platform_settings(config: &Value, defaulted: &[String], eventing: bool) -> Value {
+    let mut settings = without_fields(config, defaulted);
+    settings["eventing"] = eventing.into();
+    settings
+}
+
 /// What the provider is given for an operation other than install: the
 /// configuration without the platform-only inputs, which an uninstall may be
 /// given in the same --provider-config as the install and the provider
 /// would refuse, and marked as a teardown for an uninstall.
-fn teardown_config(config: &Value, operation: Operation) -> Result<Value> {
-    let mut provider_config = without_platform_inputs(config)?;
+fn teardown_config(config: &Value, provider: &str, operation: Operation) -> Result<Value> {
+    let mut provider_config = provider_config(config, provider)?;
     if operation == Operation::Uninstall {
         provider_config["teardown"] = true.into();
     }
@@ -670,7 +705,7 @@ fn lifecycle(
         let (config, defaulted) = install_config(config, &previous, &controller_defaults(root)?)?;
         require_template_registry(&installation.record.provider, &config)?;
         let eventing = config["eventing"] == true || previous["eventing"] == true;
-        let provider_config = without_platform_inputs(&config)?;
+        let provider_config = provider_config(&config, &installation.record.provider)?;
         installation.invoke(Operation::Init, provider_config.clone(), host)?;
         let infrastructure_existed =
             installation.invoke(Operation::Inspect, provider_config.clone(), host)?["exists"]
@@ -697,17 +732,7 @@ fn lifecycle(
                 .unwrap_or(json!({})),
         )
         .context("decode provider-emitted runtime manifests")?;
-        let mut settings = plan.options.clone();
-        for field in ["domain", "fiberdImage", "routerImage"] {
-            settings.insert(field.into(), config[field].clone());
-        }
-        for field in PLATFORM_INPUTS {
-            if let Some(value) = config.get(field) {
-                settings.insert(field.into(), value.clone());
-            }
-        }
-        settings.entry("httpsPort").or_insert(json!(443));
-        let settings = Value::Object(settings);
+        let settings = Value::Object(merge_platform_settings(plan.options.clone(), &config));
         crate::platform_host::validate_settings(&settings)?;
         plan.validate()?;
         validate_provider_manifest_capability_for_plan(&plan, provider_manifests)?;
@@ -756,16 +781,18 @@ fn lifecycle(
         }
         apply_manifests(&kube, &plan.after)?;
         crate::bootstrap::health(&kube)?;
-        let mut settings = without_fields(&config, &defaulted);
-        settings["eventing"] = eventing.into();
+        let settings = persisted_platform_settings(&config, &defaulted, eventing);
         installation
             .host_state
             .write_state("platform-settings", &settings)?;
+        if installation.supports_operation(Operation::Finalize)? {
+            installation.invoke(Operation::Finalize, provider_config, host)?;
+        }
         return Ok(json!({"name":name,"installed":true,"ready":true,
             "provider":installation.record.provider,"context":kube.context,
             "domain":settings["domain"],"eventing":eventing}));
     }
-    let teardown_config = teardown_config(config, operation)?;
+    let teardown_config = teardown_config(config, &installation.record.provider, operation)?;
     let observed = installation.invoke(Operation::Inspect, teardown_config.clone(), host)?;
     let cleanup = (|| -> Result<()> {
         if observed["exists"] == true {
@@ -1452,6 +1479,66 @@ mod tests {
     }
 
     #[test]
+    fn only_the_azure_provider_receives_ingress_infrastructure_settings() {
+        let config = json!({
+            "controllerManifest":"/controller.yaml",
+            "ingress":{
+                "azureDnsZoneResourceId":"/subscriptions/one/resourceGroups/dns/providers/Microsoft.Network/dnsZones/example.com",
+                "tls":{"mode":"acme","email":"platform@example.com"}
+            }
+        });
+        assert!(
+            provider_config(&config, "kind")
+                .unwrap()
+                .get("ingress")
+                .is_none()
+        );
+        assert_eq!(
+            provider_config(&config, "azure").unwrap()["ingress"],
+            config["ingress"]
+        );
+    }
+
+    #[test]
+    fn provider_resolved_ingress_is_not_replaced_by_raw_azure_input() {
+        let config = json!({
+            "domain":"apps.example.com",
+            "fiberdImage":"registry/fiberd:v1",
+            "routerImage":"registry/router:v1",
+            "ingress":{
+                "azureDnsZoneResourceId":"/subscriptions/one/resourceGroups/dns/providers/Microsoft.Network/dnsZones/example.com",
+                "tls":{"mode":"acme","email":"platform@example.com"}
+            }
+        });
+        let resolved = json!({
+            "ingress":{
+                "service":{
+                    "publicIpAddress":"203.0.113.10",
+                    "publicIpName":"lampyr-ingress",
+                    "resourceGroup":"lampyr-ingress"
+                },
+                "tls":{
+                    "mode":"acme",
+                    "email":"platform@example.com",
+                    "issuer":"letsencrypt-prod",
+                    "azureDns":{
+                        "subscriptionId":"11111111-1111-1111-1111-111111111111",
+                        "resourceGroupName":"dns",
+                        "hostedZoneName":"example.com",
+                        "managedIdentityClientId":"22222222-2222-2222-2222-222222222222"
+                    }
+                }
+            }
+        });
+        let merged = merge_platform_settings(resolved.as_object().unwrap().clone(), &config);
+        assert_eq!(merged["ingress"], resolved["ingress"]);
+        assert!(merged["ingress"].get("azureDnsZoneResourceId").is_none());
+        let persisted = persisted_platform_settings(&config, &[], false);
+        assert_eq!(persisted["ingress"], config["ingress"]);
+        assert!(persisted["ingress"].get("service").is_none());
+    }
+
+    #[test]
     fn an_uninstall_given_the_install_s_config_passes_no_controller_input_on() {
         let given = json!({
             "name": "lampyr",
@@ -1463,11 +1550,11 @@ mod tests {
             "ingress": {"tls":{"mode":"existingSecret","secretName":"tls","secretNamespace":"security"}},
         });
         assert_eq!(
-            teardown_config(&given, Operation::Uninstall).unwrap(),
+            teardown_config(&given, "kind", Operation::Uninstall).unwrap(),
             json!({"name": "lampyr", "deleteCluster": true, "teardown": true})
         );
         assert_eq!(
-            teardown_config(&given, Operation::Health).unwrap(),
+            teardown_config(&given, "kind", Operation::Health).unwrap(),
             json!({"name": "lampyr", "deleteCluster": true})
         );
     }

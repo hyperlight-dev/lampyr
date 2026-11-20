@@ -60,7 +60,7 @@ snapshot cold-os="linux" cold-architecture="x86_64":
 
 # Check Azure provider Python and Event Grid Go code.
 lint:
-    python3 -m py_compile "{{project-root}}/provider.py" "{{project-root}}/eventgrid/lampyr_eventgrid.py"
+    python3 -m py_compile "{{project-root}}/provider.py" "{{project-root}}/eventgrid/lampyr_eventgrid.py" "{{project-root}}/ingress/lampyr_ingress.py"
     go vet "{{repo-root}}/providers/azure/eventgrid/..."
 
 # Check provider state and ownership decisions without Azure credentials.

@@ -25,6 +25,7 @@ pub enum Operation {
     Describe,
     Init,
     Apply,
+    Finalize,
     Inspect,
     Connect,
     Delete,

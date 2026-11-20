@@ -422,6 +422,14 @@ impl Installation {
         let mut provider = self.provider(operation, host)?;
         self.invoke_with(&mut provider, operation, config, host)
     }
+
+    pub fn supports_operation(&self, operation: Operation) -> Result<bool> {
+        Ok(self
+            .load_artifact()?
+            .manifest
+            .operations
+            .contains_key(&operation))
+    }
 }
 
 fn usable_resolver_config(configuration: &str) -> Option<String> {

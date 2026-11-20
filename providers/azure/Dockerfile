@@ -40,6 +40,7 @@ FROM bicep-${TARGETARCH} AS bicep
 FROM ghcr.io/hyperlight-dev/hyperlight-unikraft/python-shell@sha256:e2f65a42a7db22ed8721e29b1146f2e60a4da8ad0e7bc43f0038a922e81373c0 AS rootfs
 COPY --from=dependencies /site/ /usr/local/lib/python3.12/site-packages/
 COPY eventgrid/lampyr_eventgrid.py /usr/local/lib/python3.12/site-packages/lampyr_eventgrid.py
+COPY ingress/lampyr_ingress.py /usr/local/lib/python3.12/site-packages/lampyr_ingress.py
 COPY eventgrid/eventgrid-source.yaml /templates/eventgrid-source.yaml
 COPY --from=launcher /runtime/ /
 COPY --from=bicep /runtime/ /
