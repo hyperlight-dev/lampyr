@@ -58,6 +58,16 @@ var (
 		Buckets: []float64{1, 5, 10, 30, 60, 300, 900, 1800, 3600},
 	}, []string{"namespace", "revision", "outcome"})
 
+	reuseSlots = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "lampyr_router_reuse_slots",
+		Help: "Retained reuse slots, by Revision and state: busy or idle. A busy slot may still be acquiring its Fiber.",
+	}, []string{"namespace", "revision", "state"})
+
+	reuseSlotLimit = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "lampyr_router_reuse_slot_limit",
+		Help: "Maximum retained reuse slots permitted by the Revision's currently selected CapacityGrant home.",
+	}, []string{"namespace", "revision"})
+
 	shedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "lampyr_router_shed_total",
 		Help: "Requests the Revision's home refused: at fibers.max, too busy restoring to start a Fiber within the request's deadline, or under memory or task-limit (pids) pressure, or still over its clone rate limit at the acquire deadline.",
@@ -71,7 +81,8 @@ var (
 
 func init() {
 	registry.MustRegister(fibersBusy, fiberAcquireSeconds, requestSeconds, requestsInFlight,
-		websocketSessions, websocketSessionSeconds, shedTotal, cloneRetriesTotal,
+		websocketSessions, websocketSessionSeconds, reuseSlots, reuseSlotLimit,
+		shedTotal, cloneRetriesTotal,
 		prometheus.NewGoCollector(), prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}))
 }
 
@@ -278,6 +289,8 @@ func forgetRevision(namespace, revision string) {
 	requestsInFlight.DeletePartialMatch(labels)
 	websocketSessions.DeletePartialMatch(labels)
 	websocketSessionSeconds.DeletePartialMatch(labels)
+	reuseSlots.DeletePartialMatch(labels)
+	reuseSlotLimit.DeletePartialMatch(labels)
 	shedTotal.DeletePartialMatch(labels)
 	cloneRetriesTotal.DeletePartialMatch(labels)
 }

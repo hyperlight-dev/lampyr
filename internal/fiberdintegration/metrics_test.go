@@ -108,6 +108,108 @@ func TestRouterMetricsTrackRequestAcquisition(t *testing.T) {
 	}
 }
 
+func TestRouterMetricsTrackReuseSlots(t *testing.T) {
+	router, client, route, _ := namedRouter(t, "reuse-slots-1001", "30s", project.ExecutionReuse)
+	entered := make(chan struct{})
+	finish := make(chan struct{})
+	calls := 0
+	client.handler = http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		if calls == 2 {
+			close(entered)
+			<-finish
+		}
+		fmt.Fprint(w, "done")
+	})
+	router.ServeHTTP(httptest.NewRecorder(), revisionRequest("GET", "/", route))
+	labels := []string{route.Namespace, route.Revision}
+	if got := testutil.ToFloat64(reuseSlots.WithLabelValues(append(labels, "idle")...)); got != 1 {
+		t.Fatalf("idle reuse slots after request = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(reuseSlotLimit.WithLabelValues(labels...)); got != 2 {
+		t.Fatalf("reuse slot limit = %v, want 2", got)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		router.ServeHTTP(httptest.NewRecorder(), revisionRequest("GET", "/", route))
+		close(done)
+	}()
+	<-entered
+	if got := testutil.ToFloat64(reuseSlots.WithLabelValues(append(labels, "busy")...)); got != 1 {
+		t.Fatalf("busy reuse slots = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(reuseSlots.WithLabelValues(append(labels, "idle")...)); got != 0 {
+		t.Fatalf("idle reuse slots while busy = %v", got)
+	}
+	close(finish)
+	<-done
+	if got := testutil.ToFloat64(reuseSlots.WithLabelValues(append(labels, "idle")...)); got != 1 {
+		t.Fatalf("idle reuse slots after completion = %v, want 1", got)
+	}
+
+	router.mu.RLock()
+	pool := router.pools[route.Namespace+"--"+route.Revision]
+	router.mu.RUnlock()
+	router.endPool(pool, false, time.Now().Add(time.Minute))
+	if got := testutil.ToFloat64(reuseSlots.WithLabelValues(append(labels, "idle")...)); got != 0 {
+		t.Fatalf("idle reuse slots after timeout = %v", got)
+	}
+}
+
+func TestRetiredReusePoolCannotOverwriteReplacementMetrics(t *testing.T) {
+	router, client, route, file := namedRouter(t, "reuse-replaced-1001", "30s", project.ExecutionReuse)
+	oldEntered := make(chan struct{})
+	oldFinish := make(chan struct{})
+	calls := 0
+	client.handler = http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		if calls == 1 {
+			close(oldEntered)
+			<-oldFinish
+		}
+		fmt.Fprint(w, "done")
+	})
+	oldDone := make(chan struct{})
+	go func() {
+		router.ServeHTTP(httptest.NewRecorder(), revisionRequest("GET", "/", route))
+		close(oldDone)
+	}()
+	<-oldEntered
+
+	route.Routed = false
+	data, _ := json.Marshal(route)
+	if err := os.WriteFile(file, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := router.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	labels := []string{route.Namespace, route.Revision}
+	if got := testutil.ToFloat64(reuseSlots.WithLabelValues(append(labels, "busy")...)); got != 0 {
+		t.Fatalf("busy slots after route retired = %v", got)
+	}
+
+	route.Routed = true
+	data, _ = json.Marshal(route)
+	if err := os.WriteFile(file, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := router.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	router.ServeHTTP(httptest.NewRecorder(), revisionRequest("GET", "/", route))
+	if got := testutil.ToFloat64(reuseSlots.WithLabelValues(append(labels, "idle")...)); got != 1 {
+		t.Fatalf("replacement pool idle slots = %v, want 1", got)
+	}
+
+	close(oldFinish)
+	<-oldDone
+	if got := testutil.ToFloat64(reuseSlots.WithLabelValues(append(labels, "idle")...)); got != 1 {
+		t.Fatalf("retired pool overwrote replacement idle slots: %v", got)
+	}
+}
+
 func TestRouterMetricsIgnoreUnknownRevisions(t *testing.T) {
 	router, _, route := routerFixture(t, project.ExecutionFresh)
 	route.Revision = "unrouted-9999"
