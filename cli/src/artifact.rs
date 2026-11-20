@@ -407,7 +407,11 @@ impl Artifact {
                         None
                     }
                     Some(registry) => {
-                        match registry.pull_selected(&format!("sha256:{}", index.sha256), host) {
+                        match registry.pull_for_provider(
+                            &format!("sha256:{}", index.sha256),
+                            host,
+                            &manifest,
+                        ) {
                             Ok(Some(layout)) if layout.digest.is_none() => {
                                 warn_no_snapshot_variant(&manifest.id, host);
                                 None
@@ -443,8 +447,13 @@ impl Artifact {
                     }
                 },
                 _ => {
-                    let selected =
-                        variants::select_layout(&directory, index, host, &artifact_path)?;
+                    let selected = variants::select_layout(
+                        &directory,
+                        index,
+                        host,
+                        &artifact_path,
+                        &manifest,
+                    )?;
                     if selected.is_none() {
                         warn_no_snapshot_variant(&manifest.id, host);
                     }

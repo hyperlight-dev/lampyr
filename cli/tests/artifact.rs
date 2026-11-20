@@ -177,6 +177,22 @@ fn variant(root: &tempfile::TempDir, compatibility: &HostCompatibility) -> OciDe
             compatibility.cpu_vendor.clone().unwrap(),
         ),
     ]);
+    let provider: Manifest =
+        serde_json::from_slice(&std::fs::read(root.path().join("manifest.json")).unwrap()).unwrap();
+    for (field, hash) in [
+        ("rootfs", provider.rootfs.sha256),
+        ("program", provider.program.sha256),
+        (
+            "kernel",
+            provider.kernel.map(|file| file.sha256).unwrap_or_else(|| {
+                lampyr_cli::assets::embedded_kernel_sha256(&compatibility.architecture).unwrap()
+            }),
+        ),
+    ] {
+        descriptor
+            .annotations
+            .insert(format!("dev.lampyr.provider.{field}.sha256"), hash);
+    }
     descriptor
 }
 
@@ -231,6 +247,59 @@ fn indexed_snapshots_select_the_exact_compatible_variant_without_copying() {
         assert_eq!(
             std::fs::read(loaded.verified_boot_files().unwrap().rootfs).unwrap(),
             b"test rootfs"
+        );
+    }
+}
+
+#[test]
+fn selected_snapshot_requires_all_cold_asset_digests_to_match() {
+    for (field, missing) in [
+        ("rootfs", false),
+        ("program", false),
+        ("kernel", false),
+        ("rootfs", true),
+        ("program", true),
+        ("kernel", true),
+        ("all", true),
+    ] {
+        let (root, mut manifest) = artifact();
+        let kernel = digest("kernel", b"test kernel");
+        std::fs::write(root.path().join("kernel"), b"test kernel").unwrap();
+        manifest.kernel = Some(kernel.clone());
+        let mut selected = variant(&root, &host());
+        for (asset, sha256) in [
+            ("rootfs", &manifest.rootfs.sha256),
+            ("program", &manifest.program.sha256),
+            ("kernel", &kernel.sha256),
+        ] {
+            selected.annotations.insert(
+                format!("dev.lampyr.provider.{asset}.sha256"),
+                sha256.clone(),
+            );
+        }
+        save_index(&root, &mut manifest, vec![selected.clone()]);
+        let matched =
+            Artifact::load_for_host_with_registry(root.path(), "test", &host(), None).unwrap();
+        assert!(matched.snapshot.is_some());
+        if missing {
+            for asset in ["rootfs", "program", "kernel"] {
+                if field == "all" || field == asset {
+                    selected
+                        .annotations
+                        .remove(&format!("dev.lampyr.provider.{asset}.sha256"));
+                }
+            }
+        } else {
+            selected.annotations.insert(
+                format!("dev.lampyr.provider.{field}.sha256"),
+                "0".repeat(64),
+            );
+        }
+        save_index(&root, &mut manifest, vec![selected]);
+        let result = Artifact::load_for_host_with_registry(root.path(), "test", &host(), None);
+        assert!(
+            result.is_err(),
+            "selected snapshot with invalid {field} binding (missing: {missing}) was accepted"
         );
     }
 }
@@ -322,15 +391,15 @@ fn variant_selection_is_order_independent_and_requires_all_compatibility_fields(
             unsupported,
         ],
     };
-    assert!(index.select(&host()).unwrap().is_none());
+    assert!(index.select(&host(), None).unwrap().is_none());
     index.manifests.extend([first, second.clone()]);
     assert_eq!(
-        index.select(&host()).unwrap().unwrap().digest,
+        index.select(&host(), None).unwrap().unwrap().digest,
         second.digest
     );
     index.manifests.reverse();
     assert_eq!(
-        index.select(&host()).unwrap().unwrap().digest,
+        index.select(&host(), None).unwrap().unwrap().digest,
         second.digest
     );
 }
@@ -646,20 +715,35 @@ fn hyperlight_native_writer_round_trips_through_provider_variant_loading() {
     std::fs::write(root.path().join("rootfs.cpio"), &cpio).unwrap();
     manifest.rootfs = digest("rootfs.cpio", &cpio);
     let layout = root.path().join("snapshot");
-    let mut sandbox =
-        hyperlight_unikraft::SandboxBuilder::from_initrd(root.path().join("rootfs.cpio"))
-            .scratch_mb(128)
-            .boot()
-            .unwrap();
-    sandbox.snapshot_to(&layout).unwrap_or_else(|error| {
-        panic!(
-            "save native snapshot: {error}; guest output: {}",
-            sandbox.drain_output()
-        )
-    });
-    drop(sandbox);
+    let captured = std::process::Command::new(env!("CARGO_BIN_EXE_provider-snapshot"))
+        .arg("--rootfs")
+        .arg(root.path().join("rootfs.cpio"))
+        .arg("--program")
+        .arg(root.path().join("provider.py"))
+        .args(["--memory-mib", "128", "--output"])
+        .arg(&layout)
+        .output()
+        .unwrap();
+    assert!(
+        captured.status.success(),
+        "capture provider snapshot: {}",
+        String::from_utf8_lossy(&captured.stderr)
+    );
     let mut index: SnapshotIndex =
         serde_json::from_slice(&std::fs::read(layout.join("index.json")).unwrap()).unwrap();
+    for (field, hash) in [
+        ("rootfs", manifest.rootfs.sha256.clone()),
+        ("program", manifest.program.sha256.clone()),
+        (
+            "kernel",
+            lampyr_cli::assets::embedded_kernel_sha256(std::env::consts::ARCH).unwrap(),
+        ),
+    ] {
+        assert_eq!(
+            index.manifests[0].annotations[&format!("dev.lampyr.provider.{field}.sha256")],
+            hash
+        );
+    }
     let mut incompatible = index.manifests[0].clone();
     incompatible.annotations.insert(
         "dev.hyperlight.snapshot.cpu.vendor".into(),

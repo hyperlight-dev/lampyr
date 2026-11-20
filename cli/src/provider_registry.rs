@@ -25,7 +25,9 @@ use sha2::{Digest, Sha256};
 use url::Url;
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::artifact::{HostCompatibility, OciDescriptor, SnapshotIndex, SnapshotManifest};
+use crate::artifact::{
+    HostCompatibility, Manifest, OciDescriptor, SnapshotIndex, SnapshotManifest,
+};
 use crate::runtime::{Cancellation, PAYLOAD_LIMIT};
 
 const INDEX: &str = "application/vnd.oci.image.index.v1+json";
@@ -171,13 +173,36 @@ impl SnapshotRegistry {
         digest: &str,
         host: &HostCompatibility,
     ) -> Result<Option<PulledLayout>> {
+        self.pull_checked(digest, host, None)
+    }
+
+    pub(crate) fn pull_for_provider(
+        &self,
+        digest: &str,
+        host: &HostCompatibility,
+        provider: &Manifest,
+    ) -> Result<Option<PulledLayout>> {
+        self.pull_checked(digest, host, Some(provider))
+    }
+
+    fn pull_checked(
+        &self,
+        digest: &str,
+        host: &HostCompatibility,
+        provider: Option<&Manifest>,
+    ) -> Result<Option<PulledLayout>> {
         ensure!(!self.cancellation.is_cancelled(), "snapshot pull cancelled");
-        let result = self.pull_inner(digest, host);
+        let result = self.pull_inner(digest, host, provider);
         ensure!(!self.cancellation.is_cancelled(), "snapshot pull cancelled");
         result
     }
 
-    fn pull_inner(&self, digest: &str, host: &HostCompatibility) -> Result<Option<PulledLayout>> {
+    fn pull_inner(
+        &self,
+        digest: &str,
+        host: &HostCompatibility,
+        provider: Option<&Manifest>,
+    ) -> Result<Option<PulledLayout>> {
         let index_descriptor = OciDescriptor {
             media_type: INDEX.into(),
             digest: digest.into(),
@@ -265,7 +290,7 @@ impl SnapshotRegistry {
         };
         let parsed: SnapshotIndex =
             serde_json::from_slice(&index).context("decode registry snapshot index")?;
-        let selected = parsed.select(host)?;
+        let selected = parsed.select(host, provider)?;
         if let Some(descriptor) = selected {
             let bytes = read_limited(
                 self.blob(

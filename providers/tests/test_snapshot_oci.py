@@ -47,6 +47,10 @@ class SnapshotTests(unittest.TestCase):
         manifest = {
             "id": "test", "version": "1.2.3", "protocolVersion": 1,
             "runtimeVersion": oci.RUNTIME_VERSION, "memoryMiB": 256, "operations": {"describe": []},
+            "coldCompatibility": {
+                "os": {"hvf": "macos", "whp": "windows"}.get(hypervisor, "linux"),
+                "architecture": {"amd64": "x86_64", "arm64": "aarch64"}[architecture],
+            },
         }
         for field, filename in (("rootfs", "rootfs.cpio"), ("program", "provider.py"), ("kernel", "kernel")):
             path = directory / filename
@@ -74,6 +78,8 @@ class SnapshotTests(unittest.TestCase):
         image["annotations"] = {
             oci.ARCH: native_arch, oci.HYPERVISOR: hypervisor, oci.CPU_VENDOR: vendor,
             oci.REF_NAME: f"{oci.RUNTIME_VERSION}-test-snapshot-key",
+            **{f"dev.lampyr.provider.{field}.sha256": manifest[field]["sha256"]
+               for field in ("rootfs", "program", "kernel")},
         }
         (snapshot / "index.json").write_bytes(oci.json_bytes({
             "schemaVersion": 2, "mediaType": oci.INDEX, "manifests": [image],
@@ -96,6 +102,122 @@ class SnapshotTests(unittest.TestCase):
 
     def assemble(self, variants=None):
         return oci.assemble(self.intel, [self.intel, self.amd, self.arm] if variants is None else variants, self.output)
+
+    def record_snapshot_inputs(self, directory):
+        manifest = oci.read_json(directory / "manifest.json")
+        index_path = directory / manifest["snapshotIndex"]["path"]
+        index = oci.read_json(index_path)
+        for item in index["manifests"]:
+            for field in ("rootfs", "program", "kernel"):
+                asset = manifest.get(field)
+                item["annotations"][f"dev.lampyr.provider.{field}.sha256"] = (
+                    asset["sha256"] if asset is not None
+                    else oci.embedded_kernel_hash(item["annotations"][oci.ARCH])
+                )
+        index_path.write_bytes(oci.json_bytes(index))
+        manifest["snapshotIndex"]["sha256"] = oci.file_hash(index_path)
+        (directory / "manifest.json").write_text(json.dumps(manifest))
+
+    def test_layout_and_platform_packaging_reject_stale_snapshot_inputs(self):
+        for field in ("rootfs", "program", "kernel"):
+            with self.subTest(field=field):
+                root = self.root / f"stale-{field}"
+                directory = root / "providers/test/build/rootfs"
+                directory.parent.mkdir(parents=True)
+                shutil.copytree(self.intel, directory)
+                self.record_snapshot_inputs(directory)
+                manifest = oci.read_json(directory / "manifest.json")
+                path = directory / manifest[field]["path"]
+                path.write_bytes(b"changed cold asset")
+                manifest[field] = package.file_digest(path)
+                (directory / "manifest.json").write_text(json.dumps(manifest))
+                for name, check in (
+                    ("layout", lambda: oci.layout_files(directory)),
+                    ("platform package", lambda: platform_package["provider_files"](root, "test")),
+                ):
+                    with self.subTest(check=name):
+                        with self.assertRaisesRegex(ValueError, "snapshot.*(digest|asset|input)"):
+                            check()
+
+    def test_assembly_rejects_snapshot_captured_from_different_same_platform_assets(self):
+        for field in ("rootfs", "kernel"):
+            with self.subTest(field=field):
+                candidate = self.root / f"different-{field}"
+                shutil.copytree(self.intel, candidate)
+                manifest = oci.read_json(candidate / "manifest.json")
+                path = candidate / manifest[field]["path"]
+                path.write_bytes(b"different capture input")
+                manifest[field] = package.file_digest(path)
+                (candidate / "manifest.json").write_text(json.dumps(manifest))
+                self.record_snapshot_inputs(candidate)
+                with self.assertRaisesRegex(ValueError, "snapshot.*(digest|asset|input)"):
+                    oci.assemble(self.intel, [candidate], self.root / f"assembled-{field}")
+
+    def test_layout_and_platform_packaging_reject_missing_snapshot_inputs(self):
+        for missing in ("rootfs", "program", "kernel", "all"):
+            with self.subTest(missing=missing):
+                root = self.root / f"missing-{missing}"
+                directory = root / "providers/test/build/rootfs"
+                directory.parent.mkdir(parents=True)
+                shutil.copytree(self.intel, directory)
+                self.record_snapshot_inputs(directory)
+                manifest = oci.read_json(directory / "manifest.json")
+                index_path = directory / manifest["snapshotIndex"]["path"]
+                index = oci.read_json(index_path)
+                for item in index["manifests"]:
+                    for field in ("rootfs", "program", "kernel"):
+                        if missing in (field, "all"):
+                            item["annotations"].pop(f"dev.lampyr.provider.{field}.sha256")
+                index_path.write_bytes(oci.json_bytes(index))
+                manifest["snapshotIndex"]["sha256"] = oci.file_hash(index_path)
+                (directory / "manifest.json").write_text(json.dumps(manifest))
+                for name, check in (
+                    ("layout", lambda: oci.layout_files(directory)),
+                    ("platform package", lambda: platform_package["provider_files"](root, "test")),
+                ):
+                    with self.subTest(check=name):
+                        with self.assertRaisesRegex(ValueError, "snapshot.*(digest|asset|input)"):
+                            check()
+
+    def test_distinct_platform_assets_still_assemble_and_bind(self):
+        for directory, operating_system, architecture in (
+            (self.intel, "linux", "x86_64"),
+            (self.arm, "macos", "aarch64"),
+        ):
+            manifest = oci.read_json(directory / "manifest.json")
+            manifest["coldCompatibility"] = {"os": operating_system, "architecture": architecture}
+            for field in ("rootfs", "kernel"):
+                path = directory / manifest[field]["path"]
+                path.write_bytes(f"{architecture} {field}".encode())
+                manifest[field] = package.file_digest(path)
+            (directory / "manifest.json").write_text(json.dumps(manifest))
+            self.record_snapshot_inputs(directory)
+        oci.assemble(self.intel, [self.intel, self.arm], self.output)
+        bound = self.root / "bound-distinct-arm"
+        oci.bind(self.arm, self.output, "ghcr.io/example/snapshots", bound)
+        for directory in (self.output, bound):
+            manifest, _ = oci.layout_files(directory)
+            self.assertEqual(len(oci.read_json(directory / "index.json")["manifests"]), 2)
+            architecture = manifest["coldCompatibility"]["architecture"]
+            self.assertEqual((directory / "rootfs.cpio").read_bytes(),
+                             f"{architecture} rootfs".encode())
+
+    def test_embedded_kernel_binding_is_checked_without_a_custom_kernel(self):
+        manifest_path = self.intel / "manifest.json"
+        manifest = oci.read_json(manifest_path)
+        manifest["kernel"] = None
+        manifest_path.write_text(json.dumps(manifest))
+        self.record_snapshot_inputs(self.intel)
+        oci.layout_files(self.intel)
+        manifest = oci.read_json(manifest_path)
+        index_path = self.intel / manifest["snapshotIndex"]["path"]
+        index = oci.read_json(index_path)
+        index["manifests"][0]["annotations"]["dev.lampyr.provider.kernel.sha256"] = "0" * 64
+        index_path.write_bytes(oci.json_bytes(index))
+        manifest["snapshotIndex"]["sha256"] = oci.file_hash(index_path)
+        manifest_path.write_text(json.dumps(manifest))
+        with self.assertRaisesRegex(ValueError, "snapshot kernel digest"):
+            oci.layout_files(self.intel)
 
     def test_multi_platform_index_is_reproducible_and_digest_pinned(self):
         digest = self.assemble()
@@ -295,6 +417,7 @@ class SnapshotTests(unittest.TestCase):
 
     def test_rejects_mismatched_logical_identity_but_allows_platform_cold_assets(self):
         original = (self.amd / "manifest.json").read_bytes()
+        original_index = (self.amd / "snapshot/index.json").read_bytes()
         for field in ("version", "runtimeVersion", "memoryMiB", "program", "operations"):
             with self.subTest(field=field):
                 manifest = json.loads(original)
@@ -306,6 +429,8 @@ class SnapshotTests(unittest.TestCase):
                 else:
                     manifest[field] = 128 if field == "memoryMiB" else ({} if field == "operations" else "other")
                 (self.amd / "manifest.json").write_text(json.dumps(manifest))
+                if field == "program":
+                    self.record_snapshot_inputs(self.amd)
                 error = {"runtimeVersion": "incompatible provider runtime",
                          "operations": "invalid provider operations"}.get(field, "differ")
                 with self.assertRaisesRegex(ValueError, error):
@@ -315,11 +440,14 @@ class SnapshotTests(unittest.TestCase):
                 if field == "program":
                     path.write_bytes(previous)
                 (self.amd / "manifest.json").write_bytes(original)
+                (self.amd / "snapshot/index.json").write_bytes(original_index)
 
+        original = (self.arm / "manifest.json").read_bytes()
+        original_index = (self.arm / "snapshot/index.json").read_bytes()
         for field in ("rootfs", "kernel"):
             with self.subTest(field=field):
                 manifest = json.loads(original)
-                path = self.amd / manifest[field]["path"]
+                path = self.arm / manifest[field]["path"]
                 previous = path.read_bytes()
                 path.write_bytes(b"other")
                 manifest[field] = package.file_digest(path)
@@ -327,12 +455,14 @@ class SnapshotTests(unittest.TestCase):
                     "os": "macos",
                     "architecture": "aarch64",
                 }
-                (self.amd / "manifest.json").write_text(json.dumps(manifest))
+                (self.arm / "manifest.json").write_text(json.dumps(manifest))
+                self.record_snapshot_inputs(self.arm)
                 self.assemble()
                 self.assertTrue(self.output.is_dir())
                 shutil.rmtree(self.output)
                 path.write_bytes(previous)
-                (self.amd / "manifest.json").write_bytes(original)
+                (self.arm / "manifest.json").write_bytes(original)
+                (self.arm / "snapshot/index.json").write_bytes(original_index)
 
     def test_rejects_corruption_duplicate_compatibility_and_limits(self):
         with self.assertRaisesRegex(ValueError, "duplicate"):
@@ -1062,25 +1192,26 @@ class SnapshotTests(unittest.TestCase):
                                                "unsupported snapshot OCI manifest")
 
     def test_aggregate_variant_limit_precedes_next_blob_copy(self):
-        index_path = self.intel / "snapshot/index.json"
-        index = oci.read_json(index_path)
-        native = index["manifests"][0]
-        variants = []
-        for i in range(128):
-            item = dict(native)
-            item["annotations"] = dict(native["annotations"])
-            item["annotations"][oci.REF_NAME] = f"{oci.RUNTIME_VERSION}-{i}-test-key"
-            variants.append(item)
-        index["manifests"] = variants
-        index_path.write_bytes(oci.json_bytes(index))
-        manifest = oci.read_json(self.intel / "manifest.json")
-        manifest["snapshotIndex"]["sha256"] = oci.file_hash(index_path)
-        (self.intel / "manifest.json").write_text(json.dumps(manifest))
+        for directory, count in ((self.intel, 64), (self.amd, 65)):
+            index_path = directory / "snapshot/index.json"
+            index = oci.read_json(index_path)
+            native = index["manifests"][0]
+            variants = []
+            for i in range(count):
+                item = dict(native)
+                item["annotations"] = dict(native["annotations"])
+                item["annotations"][oci.REF_NAME] = f"{oci.RUNTIME_VERSION}-{i}-test-key"
+                variants.append(item)
+            index["manifests"] = variants
+            index_path.write_bytes(oci.json_bytes(index))
+            manifest = oci.read_json(directory / "manifest.json")
+            manifest["snapshotIndex"]["sha256"] = oci.file_hash(index_path)
+            (directory / "manifest.json").write_text(json.dumps(manifest))
         with mock.patch.object(oci, "copy_blob", wraps=oci.copy_blob) as copy:
             with self.assertRaisesRegex(ValueError, "128"):
                 self.assemble([self.intel, self.amd])
             # Each variant's manifest, config, two memory layers and transport.
-            self.assertEqual(copy.call_count, 128 * 5)
+            self.assertEqual(copy.call_count, 64 * 5)
             self.assertTrue(all(call.args[1].is_relative_to(self.intel)
                                 for call in copy.call_args_list))
         self.assertFalse(self.output.exists())
@@ -1279,7 +1410,7 @@ class SnapshotTests(unittest.TestCase):
         index = oci.read_json(index_path)
         native = index["manifests"][0]
         index["manifests"] = []
-        for i in range(128):
+        for i in range(64):
             item = dict(native)
             item["annotations"] = dict(native["annotations"])
             item["annotations"][oci.REF_NAME] = f"{oci.RUNTIME_VERSION}-{i}-test-key"
@@ -1502,6 +1633,10 @@ class SnapshotTests(unittest.TestCase):
             copyfile = package.shutil.copyfile
 
             def capture(*args, **kwargs):
+                command = args[0]
+                self.assertEqual(command[command.index("--program") + 1], str(output / "provider.py"))
+                self.assertEqual(command[command.index("--kernel") + 1], str(output / "kernel"))
+                self.assertEqual((output / "kernel").read_bytes(), (self.intel / "kernel").read_bytes())
                 self.assertFalse((output / "snapshot").is_symlink())
                 # Stands in for the snapshot tool, so copy with the real
                 # copyfile, not the patched one that checks package.py's copies.
@@ -1548,6 +1683,38 @@ class SnapshotTests(unittest.TestCase):
                 self.assertIn("--locked", run.call_args.args[0])
                 self.assertIn("snapshotIndex", result)
                 oci.layout_files(output)
+
+    def test_package_variant_rejects_stale_or_unbound_capture_helpers(self):
+        project = self.root / "project"
+        output = project / "build/rootfs"
+        shutil.copytree(self.intel, output)
+        shutil.copyfile(self.intel / "provider.py", project / "provider.py")
+        (project / "artifact.json").write_text((self.intel / "manifest.json").read_text())
+
+        def capture(*_args, **_kwargs):
+            shutil.copytree(self.intel / "snapshot", output / "snapshot")
+            index_path = output / "snapshot/index.json"
+            index = oci.read_json(index_path)
+            for item in index["manifests"]:
+                if binding == "missing":
+                    for field in ("rootfs", "program", "kernel"):
+                        item["annotations"].pop(f"dev.lampyr.provider.{field}.sha256")
+                else:
+                    item["annotations"]["dev.lampyr.provider.rootfs.sha256"] = "0" * 64
+            index_path.write_bytes(oci.json_bytes(index))
+
+        for binding in ("missing", "different", "different platform"):
+            arguments = [
+                "package.py", str(project), "rootfs", "--snapshot-mode", "variant",
+                "--kernel", str(self.intel / "kernel"),
+            ]
+            if binding == "different platform":
+                arguments += ["--cold-os", "macos", "--cold-architecture", "aarch64"]
+            with self.subTest(binding=binding), mock.patch.object(sys, "argv", arguments), \
+                    mock.patch.object(package, "native_snapshot_available", return_value=True), \
+                    mock.patch.object(package.subprocess, "run", side_effect=capture):
+                with self.assertRaisesRegex(ValueError, "snapshot rootfs digest"):
+                    package.main()
 
     def test_provider_permission_scan_reports_walk_errors(self):
         output = self.root / "artifact"
