@@ -237,7 +237,7 @@ def bootstrap_manifest_files(root):
     files = {BOOTSTRAP_SOURCES: source}
     for manifest in document["manifests"]:
         if (not isinstance(manifest, dict)
-                or set(manifest) != {"path", "version", "url", "sha256"}
+                or set(manifest) != {"path", "version", "url", "license", "sha256"}
                 or not isinstance(manifest["path"], str)
                 or manifest["path"] not in BOOTSTRAP_MANIFESTS
                 or manifest["path"] in files
@@ -245,6 +245,7 @@ def bootstrap_manifest_files(root):
                 or not manifest["version"]
                 or not isinstance(manifest["url"], str)
                 or not manifest["url"].startswith("https://")
+                or manifest["license"] != "Apache-2.0"
                 or not isinstance(manifest["sha256"], str)
                 or not re.fullmatch(r"[0-9a-f]{64}", manifest["sha256"])):
             raise ValueError(f"{BOOTSTRAP_SOURCES} has an invalid manifest entry")

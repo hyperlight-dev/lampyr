@@ -13,18 +13,22 @@ MANIFESTS = {
     "serving-crds.yaml": (
         "knative-v1.23.0",
         "https://github.com/knative/serving/releases/download/knative-v1.23.0/serving-crds.yaml",
+        "Apache-2.0",
     ),
     "serving-core.yaml": (
         "knative-v1.23.0",
         "https://github.com/knative/serving/releases/download/knative-v1.23.0/serving-core.yaml",
+        "Apache-2.0",
     ),
     "kourier.yaml": (
         "knative-v1.23.0",
         "https://github.com/knative/net-kourier/releases/download/knative-v1.23.0/kourier.yaml",
+        "Apache-2.0",
     ),
     "cert-manager.yaml": (
         "v1.21.3",
         "https://github.com/cert-manager/cert-manager/releases/download/v1.21.3/cert-manager.yaml",
+        "Apache-2.0",
     ),
 }
 
@@ -67,8 +71,11 @@ class BootstrapManifestPackagingTests(unittest.TestCase):
                     self.assertEqual(bundle.extractfile(name).read(), (root / name).read_bytes())
                 sources = json.load(bundle.extractfile("k8s/upstream/sources.json"))
                 for source in sources["manifests"]:
-                    version, url = MANIFESTS[Path(source["path"]).name]
-                    self.assertEqual((source["version"], source["url"]), (version, url))
+                    version, url, license_id = MANIFESTS[Path(source["path"]).name]
+                    self.assertEqual(
+                        (source["version"], source["url"], source["license"]),
+                        (version, url, license_id),
+                    )
                 self.assertIn(
                     b"name: services.serving.knative.dev",
                     bundle.extractfile("k8s/upstream/serving-crds.yaml").read(),
@@ -98,10 +105,16 @@ class BootstrapManifestPackagingTests(unittest.TestCase):
             prepare_platform(root)
             path = root / "k8s/upstream/sources.json"
             original = json.loads(path.read_bytes())
+            licensed = [
+                {**entry, "license": "Apache-2.0"}
+                for entry in original["manifests"]
+            ]
             for entries in (
-                original["manifests"][:-1],
-                original["manifests"] + [original["manifests"][0]],
-                [{**original["manifests"][0], "path": "../serving-crds.yaml"}],
+                licensed[:-1],
+                licensed + [licensed[0]],
+                [{**licensed[0], "path": "../serving-crds.yaml"}],
+                [{key: value for key, value in licensed[0].items() if key != "license"}],
+                [{**licensed[0], "license": "MIT"}],
             ):
                 with self.subTest(entries=entries):
                     path.write_text(json.dumps({**original, "manifests": entries}))
