@@ -22,6 +22,7 @@ pub mod image;
 pub mod installation;
 pub mod kube;
 pub mod lifecycle;
+pub mod observability;
 #[cfg(unix)]
 pub(crate) mod permissions;
 pub mod platform;

@@ -72,6 +72,22 @@ enum ClusterCommand {
     Uninstall(ClusterArgs),
 }
 
+#[derive(clap::Args)]
+struct ObservabilityArgs {
+    #[arg(long)]
+    context: Option<String>,
+}
+
+#[derive(Subcommand)]
+enum ObservabilityCommand {
+    /// Install or update the optional Prometheus and Jaeger add-on.
+    Install(ObservabilityArgs),
+    /// Show the add-on's workloads and services.
+    Status(ObservabilityArgs),
+    /// Remove the add-on and stop trace export.
+    Uninstall(ObservabilityArgs),
+}
+
 #[derive(Subcommand)]
 enum ScaffoldCommand {
     /// Create a Workspace containing services and infrastructure source.
@@ -116,6 +132,11 @@ enum Command {
     Cluster {
         #[command(subcommand)]
         command: ClusterCommand,
+    },
+    /// Manage the optional metrics and traces add-on.
+    Observability {
+        #[command(subcommand)]
+        command: ObservabilityCommand,
     },
     /// Publish an event to a Lampyr Service.
     Event {
@@ -307,6 +328,20 @@ fn run(cli: Cli) -> Result<()> {
             println!("forgot the dedicated {provider} authentication cache for {name}");
         }
         Command::Cluster { command } => run_cluster(command, &host)?,
+        Command::Observability { command } => {
+            let (action, args) = match command {
+                ObservabilityCommand::Install(args) => {
+                    (lampyr_cli::observability::Action::Install, args)
+                }
+                ObservabilityCommand::Status(args) => {
+                    (lampyr_cli::observability::Action::Status, args)
+                }
+                ObservabilityCommand::Uninstall(args) => {
+                    (lampyr_cli::observability::Action::Uninstall, args)
+                }
+            };
+            lampyr_cli::observability::run(action, args.context.as_deref(), &host)?;
+        }
         Command::Event {
             command: EventCommand::Source { command },
         } => run_event_source(command, &host)?,
