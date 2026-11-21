@@ -567,6 +567,65 @@ class ScaleTestTests(unittest.TestCase):
             ):
                 self.assertIsNone(scale.resource_samples("context", queries, 450))
 
+    def test_resource_inventory_selects_the_revision_and_unique_baseline(self):
+        names = {
+            "app=fiber-router": "router-1",
+            "lampyr.dev/home=true,serving.knative.dev/revision=demo-00001": "home-1",
+            "app=baseline-owned": "baseline-owned-one",
+        }
+
+        def pods(*arguments):
+            namespace = arguments[arguments.index("--namespace") + 1]
+            selector = arguments[arguments.index("--selector") + 1]
+            return json.dumps({"items": [{
+                "metadata": {"namespace": namespace, "name": names[selector]},
+            }]})
+
+        with mock.patch.object(scale, "command", side_effect=pods):
+            lampyr = scale.resource_inventory(
+                "context", "team-a", "demo-00001", "baseline-owned", "lampyr"
+            )
+            baseline = scale.resource_inventory(
+                "context", "team-a", "demo-00001", "baseline-owned", "kubernetes"
+            )
+        self.assertEqual(lampyr, {
+            "lampyrRouter": {("lampyr-system", "router-1")},
+            "lampyrHome": {("team-a", "home-1")},
+        })
+        self.assertEqual(baseline, {
+            "lampyrRouter": {("lampyr-system", "router-1")},
+            "baseline": {("team-a", "baseline-owned-one")},
+        })
+
+    def test_resource_coverage_accepts_complete_target_inventories(self):
+        routers = {(("pod", "router-1"),): 420}
+        for target, prefix, pod in (
+            ("lampyr", "lampyrHome", "home-1"),
+            ("kubernetes", "baseline", "baseline-owned-one"),
+        ):
+            queries = scale.resource_sample_queries(
+                "team-a", "demo-00001", "baseline-owned", target
+            )
+            inventory = {
+                "lampyrRouter": {("lampyr-system", "router-1")},
+                prefix: {("team-a", pod)},
+            }
+            samples = {}
+            for source in queries:
+                namespace, name = (
+                    ("lampyr-system", "router-1") if source.startswith("lampyrRouter")
+                    else ("team-a", pod)
+                )
+                labels = {"scale_input": source, "namespace": namespace, "pod": name}
+                samples[tuple(sorted(labels.items()))] = 420
+            with self.subTest(target=target):
+                self.assertTrue(scale.resource_coverage(
+                    samples, queries, inventory, routers
+                ))
+                self.assertFalse(scale.resource_coverage(
+                    None, queries, inventory, routers
+                ))
+
     def test_resource_samples_require_cpu_and_memory_for_each_container(self):
         queries = {
             "routersCpu": "cpu_timestamp",
