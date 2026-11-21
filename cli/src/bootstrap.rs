@@ -2971,6 +2971,39 @@ metadata: {name: lampyr-grant-homes, namespace: default}
     }
 
     #[test]
+    fn existing_tls_secret_does_not_promote_its_presented_chain_to_a_root() {
+        let certified = rcgen::generate_simple_self_signed(vec![
+            "*.apps.example.com".into(),
+            "*.default.apps.example.com".into(),
+        ])
+        .unwrap();
+        let secret = |ca: Option<&str>| {
+            let mut data = json!({
+                "tls.crt":STANDARD.encode(certified.cert.pem()),
+                "tls.key":STANDARD.encode(certified.signing_key.serialize_pem())
+            });
+            if let Some(ca) = ca {
+                data["ca.crt"] = STANDARD.encode(ca).into();
+            }
+            json!({"data":data})
+        };
+        let error = validate_tls_secret(&secret(None), "apps.example.com")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("untrusted"), "{error}");
+        validate_tls_secret(&secret(Some(&certified.cert.pem())), "apps.example.com").unwrap();
+    }
+
+    #[test]
+    fn credential_reconciliation_persists_retiring_configuration() {
+        let production = include_str!("bootstrap.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        assert!(production.contains("ingressRetiringCredential"));
+    }
+
+    #[test]
     fn self_signed_secret_reuse_requires_the_self_signed_mode() {
         let secret = |mode: Option<&str>, expired: bool| {
             let mut annotations = json!({

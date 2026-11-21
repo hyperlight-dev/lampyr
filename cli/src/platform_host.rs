@@ -1687,24 +1687,30 @@ pub(crate) mod tests {
 
     #[test]
     fn provider_metadata_cannot_replace_core_manifest_inventory() {
-        let settings = json!({
-            "domain":"apps.example.com",
-            "httpsPort":443,
-            "fiberdImage":"registry/fiberd:v1",
-            "routerImage":"registry/router:v1",
-            "controllerManifest":manifest(),
-            "grantImage":grant_image(),
-            "helperImage":helper_image(),
-            "metadata":{
-                crate::bootstrap::CORE_INVENTORY_KEY:"attacker-controlled"
-            },
-        });
-        assert!(
-            validate_settings(&settings)
-                .unwrap_err()
-                .to_string()
-                .contains(crate::bootstrap::CORE_INVENTORY_KEY)
-        );
+        for reserved in [
+            crate::bootstrap::CORE_INVENTORY_KEY,
+            "ingressTlsMode",
+            "ingressTlsSecretNamespace",
+            "ingressTlsSecretName",
+            "ingressTlsIssuer",
+            "ingressDnsAddress",
+            "ingressCredential",
+            "ingressServiceAnnotations",
+        ] {
+            let settings = json!({
+                "domain":"apps.example.com",
+                "httpsPort":443,
+                "fiberdImage":"registry/fiberd:v1",
+                "routerImage":"registry/router:v1",
+                "controllerManifest":manifest(),
+                "grantImage":grant_image(),
+                "helperImage":helper_image(),
+                "zygoteRegistries":["ghcr.io/team/templates"],
+                "metadata":{reserved:"attacker-controlled"},
+            });
+            let error = validate_settings(&settings).unwrap_err().to_string();
+            assert!(error.contains(reserved), "{reserved}: {error}");
+        }
     }
 
     #[test]

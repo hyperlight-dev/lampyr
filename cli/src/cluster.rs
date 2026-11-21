@@ -1641,6 +1641,48 @@ mod tests {
     }
 
     #[test]
+    fn embedded_platform_credential_requires_manifest_capability_and_approval() {
+        let mut plan = RuntimePlan::default();
+        plan.options.insert(
+            "ingress".into(),
+            json!({"tls":{"mode":"acme","credential":{
+                "serviceAccountPatch":{"metadata":{"annotations":{"provider.example/id":"identity"}}},
+                "serviceAccountCleanupPatch":{"metadata":{"annotations":{"provider.example/id":null}}},
+                "deploymentPatch":{"spec":{"template":{"metadata":{"annotations":{"provider.example/id":"identity"}}}}},
+                "deploymentCleanupPatch":{"spec":{"template":{"metadata":{"annotations":{"provider.example/id":null}}}}},
+                "controllerArgs":["--provider-ambient=true"],
+                "controllerArgPrefixes":["--provider-ambient"],
+                "boundary":{"apiVersion":"v1","kind":"List","items":[{
+                    "apiVersion":"admissionregistration.k8s.io/v1",
+                    "kind":"ValidatingAdmissionPolicy",
+                    "metadata":{"name":"provider-boundary"}
+                }]},
+                "boundaryMessage":"provider boundary"
+            }}}),
+        );
+        assert!(
+            validate_provider_manifest_capability_for_plan(&plan, false)
+                .unwrap_err()
+                .to_string()
+                .contains("provider-manifests capability")
+        );
+        let directory = tempfile::tempdir().unwrap();
+        assert!(
+            approve_install_manifests_at(
+                directory.path(),
+                &plan,
+                ManifestApproval {
+                    approved: false,
+                    interactive: false,
+                },
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("--approve-provider-manifests")
+        );
+    }
+
+    #[test]
     fn selected_context_must_match_local_installation_and_cluster_identity() {
         let selection = Selection {
             provider: Some("azure".into()),
