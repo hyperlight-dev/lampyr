@@ -17,7 +17,7 @@ class ManifestTests(unittest.TestCase):
     def setUp(self):
         fixtures.ProviderTests.setUp(self)
         self.outputs = dict(provider.deployment_scope(self.parameters, self.request),
-                            sourceDigest="f" * 64, eventing={})
+                            sourceDigest="f" * 64, eventing={}, ingress={})
         group = provider.resource_id(self.parameters, group="dedicated")
         self.inventory = {
             "resourceGroup": "dedicated", "resourceGroupId": group,
@@ -140,6 +140,105 @@ class ManifestTests(unittest.TestCase):
                 plan["options"]["homePodMetadata"],
                 {"labels": {"azure.workload.identity/use": "true"}},
             )
+
+    def test_acme_runtime_uses_zone_scoped_workload_identity_and_stable_ingress(self):
+        zone = (
+            f"/subscriptions/{PRINCIPAL}/resourceGroups/customer-dns/"
+            "providers/Microsoft.Network/dnsZones/example.com"
+        )
+        self.request["config"].update({
+            "domain": "apps.example.com",
+            "ingress": {
+                "azureDnsZoneResourceId": zone,
+                "tls": {
+                    "mode": "acme",
+                    "email": "platform@example.com",
+                    "issuer": "letsencrypt-prod",
+                },
+            },
+        })
+        public_ip = provider.resource_id(
+            self.parameters,
+            "providers", "Microsoft.Network", "publicIPAddresses", "lampyr-ingress",
+            group="ingress",
+        )
+        identity = provider.resource_id(
+            self.parameters,
+            "providers", "Microsoft.ManagedIdentity", "userAssignedIdentities", "lampyr-ingress-dns",
+            group="ingress",
+        )
+        ingress_group = provider.resource_id(self.parameters, group="ingress")
+        role_suffix = "/providers/Microsoft.Authorization/roleAssignments/" + PRINCIPAL
+        self.outputs["ingress"] = {
+            "publicIpAddress": "203.0.113.10",
+            "resourceGroup": "ingress",
+            "resourceGroupId": ingress_group,
+            "publicIpId": public_ip,
+            "publicIpName": "lampyr-ingress",
+            "publicIpRoleAssignmentId": ingress_group + role_suffix,
+            "clusterPrincipalId": PRINCIPAL,
+            "dnsZoneId": zone,
+            "dnsRecordSetIds": [zone + "/A/*.apps", zone + "/A/*.default.apps"],
+            "dnsRoleAssignmentId": zone + role_suffix,
+            "dnsIdentityId": identity,
+            "dnsIdentityClientId": PRINCIPAL,
+            "dnsIdentityPrincipalId": PRINCIPAL,
+        }
+        root = Path(__file__).resolve().parents[3]
+        with tempfile.TemporaryDirectory() as directory:
+            templates = Path(directory)
+            source = root / "providers/azure/templates/aks-kvm-setup.yaml"
+            (templates / source.name).write_bytes(source.read_bytes())
+            with patch.object(provider, "TEMPLATES", templates):
+                plan = provider.runtime_manifests(
+                    self.request,
+                    self.parameters,
+                    self.outputs,
+                    {"nodeSetupImage": NODE_SETUP_IMAGE},
+                )
+        ingress = plan["options"]["ingress"]
+        self.assertEqual(ingress["service"]["publicIpAddress"], "203.0.113.10")
+        self.assertEqual(
+            ingress["service"]["annotations"][
+                "service.beta.kubernetes.io/azure-pip-name"
+            ],
+            "lampyr-ingress",
+        )
+        self.assertEqual(ingress["tls"]["mode"], "acme")
+        self.assertEqual(
+            ingress["tls"]["solver"]["dns01"]["azureDNS"]["managedIdentity"],
+            {"clientID": PRINCIPAL},
+        )
+        self.assertEqual(
+            ingress["tls"]["credential"]["controllerArgs"],
+            ["--issuer-ambient-credentials=true"],
+        )
+        self.assertEqual(
+            ingress["tls"]["credential"]["boundary"]["items"][0]["metadata"][
+                "annotations"
+            ]["lampyr.dev/credential-boundary"],
+            "true",
+        )
+        self.assertNotIn("clientSecret", json.dumps(ingress))
+
+    def test_empty_tls_settings_materialize_the_self_signed_mode(self):
+        self.request["config"]["ingress"] = {"tls": {}}
+        root = Path(__file__).resolve().parents[3]
+        with tempfile.TemporaryDirectory() as directory:
+            templates = Path(directory)
+            source = root / "providers/azure/templates/aks-kvm-setup.yaml"
+            (templates / source.name).write_bytes(source.read_bytes())
+            with patch.object(provider, "TEMPLATES", templates):
+                plan = provider.runtime_manifests(
+                    self.request,
+                    self.parameters,
+                    self.outputs,
+                    {"nodeSetupImage": NODE_SETUP_IMAGE},
+                )
+        self.assertEqual(
+            plan["options"]["ingress"]["tls"],
+            {"mode": "selfSigned"},
+        )
 
     def test_node_setup_entrypoint_only_prepares_kvm(self):
         root = Path(__file__).resolve().parents[3]

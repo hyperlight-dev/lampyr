@@ -33,6 +33,7 @@
     "describe": [],
     "init": ["workspace-read", "workspace-scaffold", "state", "network", "auth-cache"],
     "apply": ["workspace-read", "state", "network", "auth-cache", "provider-manifests"],
+    "finalize": ["workspace-read", "state", "network", "auth-cache"],
     "inspect": ["workspace-read", "state", "network", "auth-cache"],
     "connect": ["workspace-read", "state", "network", "auth-cache"],
     "delete": ["workspace-read", "state", "network", "auth-cache"],

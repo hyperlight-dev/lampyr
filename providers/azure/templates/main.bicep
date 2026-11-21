@@ -13,7 +13,17 @@ param nodeVmSize string
 param nodeCount int
 param eventingEnabled bool
 param eventingResourceGroup string
+param ingressResourceGroup string
 param lampyrSourceDigest string
+param ingressDnsEnabled bool = false
+param ingressAcmeEnabled bool = false
+param ingressWorkloadIdentityEnabled bool = false
+param clusterOidcIssuerEnabled bool = false
+param clusterWorkloadIdentityEnabled bool = false
+param ingressDnsSubscriptionId string = ''
+param ingressDnsResourceGroup string = ''
+param ingressDnsZone string = ''
+param ingressDnsRecord string = ''
 
 var tags = {
   'lampyr-installation-id': installationId
@@ -48,13 +58,36 @@ resource cluster 'Microsoft.ContainerService/managedClusters@2025-07-01' = {
       networkPolicy: 'cilium'
     }
     oidcIssuerProfile: {
-      enabled: eventingEnabled
+      enabled: eventingEnabled || ingressWorkloadIdentityEnabled || clusterOidcIssuerEnabled
     }
     securityProfile: {
       workloadIdentity: {
-        enabled: eventingEnabled
+        enabled: eventingEnabled || ingressWorkloadIdentityEnabled || clusterWorkloadIdentityEnabled
       }
     }
+  }
+}
+
+module ingressInfrastructure 'modules/ingress.bicep' = if (ingressDnsEnabled || ingressWorkloadIdentityEnabled) {
+  name: 'lampyr-ingress-${take(installationId, 12)}'
+  scope: resourceGroup(ingressResourceGroup)
+  params: {
+    installationId: installationId
+    location: location
+    clusterPrincipalId: cluster.identity.principalId!
+    oidcIssuer: ingressWorkloadIdentityEnabled ? cluster.properties.oidcIssuerProfile.issuerURL! : ''
+    workloadIdentityEnabled: ingressWorkloadIdentityEnabled
+  }
+}
+
+module ingressDns 'modules/ingress-dns.bicep' = if (ingressDnsEnabled) {
+  name: 'lampyr-ingress-dns-${take(installationId, 12)}'
+  scope: resourceGroup(ingressDnsSubscriptionId, ingressDnsResourceGroup)
+  params: {
+    installationId: installationId
+    zoneName: ingressDnsZone
+    recordName: ingressDnsRecord
+    principalId: ingressAcmeEnabled ? ingressInfrastructure!.outputs.dnsIdentityPrincipalId : ''
   }
 }
 
@@ -86,6 +119,21 @@ output lampyr object = {
   clusterId: cluster.id
   clusterName: cluster.name
   resourceGroup: resourceGroupName
+  ingress: ingressDnsEnabled ? {
+    resourceGroup: ingressResourceGroup
+    resourceGroupId: ingressInfrastructure!.outputs.resourceGroupId
+    publicIpAddress: ingressInfrastructure!.outputs.publicIpAddress
+    publicIpId: ingressInfrastructure!.outputs.publicIpId
+    publicIpName: ingressInfrastructure!.outputs.publicIpName
+    publicIpRoleAssignmentId: ingressInfrastructure!.outputs.publicIpRoleAssignmentId
+    clusterPrincipalId: cluster.identity.principalId!
+    dnsZoneId: ingressDns!.outputs.zoneId
+    dnsRecordSetIds: ingressDns!.outputs.recordSetIds
+    dnsRoleAssignmentId: ingressDns!.outputs.roleAssignmentId
+    dnsIdentityId: ingressAcmeEnabled ? ingressInfrastructure!.outputs.dnsIdentityId : ''
+    dnsIdentityClientId: ingressAcmeEnabled ? ingressInfrastructure!.outputs.dnsIdentityClientId : ''
+    dnsIdentityPrincipalId: ingressAcmeEnabled ? ingressInfrastructure!.outputs.dnsIdentityPrincipalId : ''
+  } : {}
   eventing: eventingEnabled ? union(eventing!.outputs.platform, {
     resourceGroup: eventingResourceGroup
     publisherResourceGroup: resourceGroup().name

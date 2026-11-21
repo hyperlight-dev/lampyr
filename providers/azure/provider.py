@@ -13,6 +13,7 @@ import time
 
 import hyperlight
 from lampyr_eventgrid import EventGrid
+from lampyr_ingress import Ingress
 OWNER_TAG = "lampyr-installation-id"
 ARM = "https://management.azure.com"
 WORKSPACE = Path("/workspace")
@@ -36,6 +37,8 @@ def progress(message):
     hyperlight.call("progress.message", message)
 
 
+INGRESS = Ingress(fail, OWNER_TAG, ARM)
+
 
 
 def guid(value):
@@ -55,7 +58,7 @@ def validate_config(request):
         "subscriptionId", "tenantId", "resourceGroupName", "eventingResourceGroup",
         "location", "nodeVmSize", "nodeCount", "kubernetesVersion",
         "authenticationMode", "eventGridControllerImage", "eventGridAdapterImage",
-        "eventSources", "teardown",
+        "eventSources", "ingress", "teardown",
     }
     unknown = config.keys() - allowed
     if unknown:
@@ -94,6 +97,7 @@ def validate_config(request):
         or config["context"].startswith("-") or any(ord(char) < 32 for char in config["context"])
     ):
         fail("invalid-config", "Invalid Kubernetes context")
+    INGRESS.config(config)
     validate_event_sources(config.get("eventSources", {}))
 
 
@@ -401,13 +405,17 @@ def authenticate(request, expected=None, allow_login=True):
 def load_parameters(workspace=None):
     document = json.loads(((workspace or WORKSPACE) / PARAMETERS).read_text(encoding="utf-8"))
     parameters = {name: value["value"] for name, value in document["parameters"].items()}
+    parameters.setdefault(
+        "ingressResourceGroup",
+        f"{parameters['clusterName']}-ingress-{parameters['installationId'][:10]}",
+    )
     if "lampyrSourceDigest" in parameters:
         fail("invalid-source", "lampyrSourceDigest is reserved for binding a deployment to its current source")
     return parameters
 
 
 def validate_parameters(parameters):
-    for name in ("resourceGroupName", "eventingResourceGroup"):
+    for name in ("resourceGroupName", "eventingResourceGroup", "ingressResourceGroup"):
         value = parameters[name]
         if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_().-]{1,90}", value) or value.endswith("."):
             fail("invalid-source", f"{name} is not an Azure resource group name")
@@ -415,19 +423,31 @@ def validate_parameters(parameters):
         fail("invalid-source", "eventingEnabled must be a boolean")
     if type(parameters["nodeCount"]) is not int or not 1 <= parameters["nodeCount"] <= 100:
         fail("invalid-source", "nodeCount must be an integer from 1 to 100")
-    if parameters["eventingResourceGroup"].lower() == parameters["resourceGroupName"].lower():
-        fail("invalid-source", "Eventing must use a separate, dedicated resource group")
+    dedicated = {
+        parameters["eventingResourceGroup"].lower(),
+        parameters["ingressResourceGroup"].lower(),
+    }
+    if parameters["resourceGroupName"].lower() in dedicated or len(dedicated) != 2:
+        fail("invalid-source", "Eventing and ingress must use separate, dedicated resource groups")
 
 
 def settings(request, workspace=None, teardown=False):
     saved = state()
     if not saved or saved["installationId"] != request["installationId"]:
         fail("not-owned", "This workspace has no matching Azure installation state")
+    saved["parameters"].setdefault(
+        "ingressResourceGroup",
+        f"{saved['parameters']['clusterName']}-ingress-{saved['parameters']['installationId'][:10]}",
+    )
     parameters = dict(saved["parameters"]) if teardown else load_parameters(workspace)
     validate_parameters(parameters)
+    INGRESS.validate_scope(request["config"], parameters)
     if request["config"]["name"] != parameters["clusterName"]:
         fail("identity-mismatch", "The request targets a different cluster name")
-    for name in ("installationId", "subscriptionId", "tenantId", "clusterName", "resourceGroupName"):
+    for name in (
+        "installationId", "subscriptionId", "tenantId", "clusterName",
+        "resourceGroupName", "ingressResourceGroup",
+    ):
         same = (
             parameters[name].lower() == saved["parameters"][name].lower()
             if name in ("subscriptionId", "tenantId")
@@ -587,6 +607,7 @@ def initialize(request):
         "nodeVmSize": config.get("nodeVmSize", "Standard_D4s_v5"),
         "nodeCount": config.get("nodeCount", 1), "eventingEnabled": config.get("eventing", False),
         "eventingResourceGroup": config.get("eventingResourceGroup", f"{name}-eventing-{request['installationId'][:10]}"),
+        "ingressResourceGroup": f"{name}-ingress-{request['installationId'][:10]}",
     }
     validate_parameters(parameters)
     files = {
@@ -612,7 +633,7 @@ def ensure_group(parameters, name, request, scratch, dedicated, workspace=None):
     existing = group(parameters, name)
     if existing:
         if dedicated:
-            owned(existing, request, f"Eventing resource group {name}")
+            owned(existing, request, f"dedicated resource group {name}")
         if existing.get("properties", {}).get("provisioningState") == "Deleting":
             fail("deleting", f"Azure resource group {name} is still deleting; retry after deletion completes")
         if not dedicated and existing.get("tags", {}).get(OWNER_TAG) != request["installationId"]:
@@ -702,6 +723,9 @@ def validate_outputs(parameters, request, result, digest):
         if eventing.get("resourceGroup") != parameters["eventingResourceGroup"]:
             fail("invalid-output", "Azure Eventing output has a different deletion scope")
         owned(group(parameters, parameters["eventingResourceGroup"]) or {}, request, "Eventing resource group")
+    INGRESS.inventory(
+        parameters, request, result, resource_id, group, owned, current,
+    )
     return result
 
 
@@ -709,25 +733,41 @@ def apply(request):
     with tempfile.TemporaryDirectory(prefix=".lampyr-azure-", dir=".") as temporary:
         scratch = Path(temporary)
         source = scratch / "source"
-        digest = source_digest(source)
+        digest = INGRESS.deployment_digest(source_digest(source), request)
         return apply_source(request, source, scratch, digest)
 
 
 def apply_source(request, source, scratch, digest):
     parameters, saved = settings(request, source)
+    supports_ingress = INGRESS.source_supports(source)
+    if INGRESS.bindings(request["config"])["ingressDnsEnabled"] and not supports_ingress:
+        fail(
+            "infrastructure-upgrade-required",
+            "The customer-owned Azure infrastructure source predates managed ingress; "
+            "create a new installation or update its Bicep source before enabling Azure DNS",
+        )
     if saved.get("outputs", {}).get("eventing") and not parameters["eventingEnabled"]:
         fail("eventing-removal-required",
              "Disabling Eventing requires full owned infrastructure deletion with --delete-cluster "
              "(destructive: deletes AKS), then re-provisioning with Eventing disabled. "
              "Uninstalling while retaining the cluster does not clear the saved Eventing outputs.")
     images = runtime_images(request, parameters["eventingEnabled"])
-    wait_cluster(parameters, request)
+    current_cluster = wait_cluster(parameters, request)
     if parameters["eventingEnabled"]:
         existing = group(parameters, parameters["eventingResourceGroup"])
         if existing:
             owned(existing, request, "Eventing resource group")
             if existing.get("properties", {}).get("provisioningState") == "Deleting":
                 fail("deleting", "The dedicated Eventing resource group is still deleting")
+    if INGRESS.bindings(request["config"])["ingressDnsEnabled"]:
+        existing = group(parameters, parameters["ingressResourceGroup"])
+        if existing:
+            owned(existing, request, "Ingress resource group")
+            if existing.get("properties", {}).get("provisioningState") == "Deleting":
+                fail("deleting", "The dedicated ingress resource group is still deleting")
+        INGRESS.ensure_records_available(
+            request["config"], request["installationId"], az,
+        )
     current = deployment(parameters, saved)
     state = current["properties"]["provisioningState"] if current else None
     resumable = (
@@ -738,10 +778,19 @@ def apply_source(request, source, scratch, digest):
     if current and state in PENDING and not resumable:
         fail("operation-conflict", "A previous Azure deployment is still running; inspect it before applying changed source")
     if not resumable:
+        claim = INGRESS.claim(parameters, request, resource_id)
+        if claim is not None:
+            claims = saved.setdefault("managedIngressClaims", [])
+            if claim not in claims:
+                claims.append(claim)
+            saved.update(phase="planning", sourceDigest=digest)
+            save(saved)
         compile_template("main.bicep", scratch / "main.json", source)
         ensure_group(parameters, parameters["resourceGroupName"], request, scratch, False, source)
         if parameters["eventingEnabled"]:
             ensure_group(parameters, parameters["eventingResourceGroup"], request, scratch, True, source)
+        if INGRESS.bindings(request["config"])["ingressDnsEnabled"]:
+            ensure_group(parameters, parameters["ingressResourceGroup"], request, scratch, True, source)
         saved.update(phase="starting", sourceDigest=digest)
         save(saved)
         progress(f"Submitting Azure deployment {saved['deployment']}...")
@@ -751,7 +800,14 @@ def apply_source(request, source, scratch, digest):
                     "deployment", "group", "create", "--subscription", parameters["subscriptionId"],
                     "--resource-group", parameters["resourceGroupName"], "--name", saved["deployment"],
                     "--mode", "Incremental", "--template-file", str(scratch / "main.json"),
-                    "--parameters", "@" + str(source / PARAMETERS), f"lampyrSourceDigest={digest}", "--no-wait",
+                    "--parameters", "@" + str(source / PARAMETERS), f"lampyrSourceDigest={digest}",
+                    *(
+                        INGRESS.parameter_args(
+                            request["config"], saved, parameters, current_cluster,
+                        )
+                        if supports_ingress else []
+                    ),
+                    "--no-wait",
                 )
                 break
             except ProviderError as error:
@@ -766,12 +822,25 @@ def apply_source(request, source, scratch, digest):
         saved["phase"] = "deploying"
         save(saved)
     result = validate_outputs(parameters, request, wait_deployment(parameters, saved, digest), digest)
+    if result.get("ingress"):
+        INGRESS.reconcile_records(request, result["ingress"], az, ProviderError)
+    ingress = result.get("ingress", {})
+    INGRESS.record_transition(saved, ingress)
     saved.update(phase="ready", parameters=parameters, outputs=result)
     save(saved)
     hyperlight.call("state.write", {"key": "runtime", "value": runtime_manifests(
         request, parameters, result, images,
     )})
     return result
+
+
+def finalize(request):
+    parameters, saved = settings(request)
+    if INGRESS.finalize(
+        parameters, request, saved, az, resource_id, group, owned, ProviderError,
+    ):
+        save(saved)
+    return {"finalized": True}
 
 
 def inspect(request):
@@ -913,6 +982,19 @@ def delete(request):
             3600,
             lambda resource: resource.get("provisioningState"),
         )
+    saved["phase"] = "deleting-ingress"
+    save(saved)
+    INGRESS.delete(
+        parameters,
+        request,
+        saved,
+        az,
+        resource_id,
+        group,
+        owned,
+        wait_deleted,
+        ProviderError,
+    )
     for assignment in sorted(assignments):
         az("role", "assignment", "delete", "--subscription", parameters["subscriptionId"], "--ids", assignment)
     if existing:
@@ -1058,6 +1140,29 @@ def runtime_manifests(request, parameters, outputs, images):
         metadata["eventing.azure.resources"] = json.dumps(inventory, separators=(",", ":"))
         bindings = dict(inventory, subscriptionId=parameters["subscriptionId"])
         after = EventGrid(TEMPLATES, fail).manifests(images, bindings)["items"]
+    _, tls, zone = INGRESS.config(request["config"])
+    ingress_output = INGRESS.inventory(
+        parameters, request, outputs, resource_id, group, owned,
+    )
+    ingress_options = {"tls": dict(tls)}
+    if ingress_output:
+        ingress_options["service"] = {
+            "publicIpAddress": ingress_output["publicIpAddress"],
+            "annotations": {
+                "service.beta.kubernetes.io/azure-pip-name":
+                    ingress_output["publicIpName"],
+                "service.beta.kubernetes.io/azure-load-balancer-resource-group":
+                    ingress_output["resourceGroup"],
+            },
+        }
+        metadata["ingress.azure.resources"] = json.dumps(
+            ingress_output, separators=(",", ":"),
+        )
+    if tls.get("mode", "selfSigned") == "acme":
+        ingress_options["tls"]["issuer"] = tls.get("issuer", "letsencrypt-prod")
+        ingress_options["tls"].update(
+            INGRESS.runtime_credential(request, zone, ingress_output)
+        )
     return {
         "options": {
             "httpsPort": 443, "metadata": metadata,
@@ -1066,6 +1171,7 @@ def runtime_manifests(request, parameters, outputs, images):
             # context, as on every other provider: privileged, and so
             # unconfined.
             "homePodMetadata": {"labels": {"azure.workload.identity/use": "true"}},
+            "ingress": ingress_options,
         },
         # Loading the KVM modules leaves nothing for a kept cluster to
         # undo, so removal needs no cleanup DaemonSet.
@@ -1286,7 +1392,7 @@ def invoke(request):
         else:
             validate_config(request)
             result = {
-                "init": initialize, "apply": apply, "inspect": inspect,
+                "init": initialize, "apply": apply, "finalize": finalize, "inspect": inspect,
                 "connect": connect, "delete": delete,
             }[operation](request)
         return {"protocolVersion": 1, "status": "ok", "result": result}
