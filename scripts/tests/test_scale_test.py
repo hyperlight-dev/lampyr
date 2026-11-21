@@ -1,4 +1,5 @@
 import contextlib
+import hashlib
 import importlib.util
 import json
 import os
@@ -381,6 +382,8 @@ class ScaleTestTests(unittest.TestCase):
         for arguments, message in (
             (("--baseline-replicas", "2"), "one replica"),
             (("--duration", "1s"), "at least 30"),
+            (("--output", "results.md"), "JSON and Markdown"),
+            (("--output", "results.MD"), "JSON and Markdown"),
         ):
             with self.subTest(arguments=arguments), mock.patch.object(
                 scale.sys, "argv", self.main_arguments(*arguments)
@@ -423,7 +426,8 @@ class ScaleTestTests(unittest.TestCase):
             )
             self.assertEqual(version[0], str(executable))
 
-    def test_scenario_waits_for_every_router_post_load_scrape(self):
+    @contextlib.contextmanager
+    def scenario_environment(self, routers, resources):
         clock = scale.datetime.datetime.fromtimestamp(400, scale.datetime.timezone.utc)
         baseline = {
             "name": "baseline-owned",
@@ -448,11 +452,12 @@ class ScaleTestTests(unittest.TestCase):
         ), mock.patch.object(
             scale, "run_oha", return_value=client
         ), mock.patch.object(
-            scale, "prometheus_query", return_value=1
+            scale, "prometheus_query",
+            side_effect=lambda context, query, evaluation_time=None: 0 if "resets(" in query else 1,
         ), mock.patch.object(
-            scale, "router_scrapes", create=True,
-            side_effect=[{"router-1": 399, "router-2": 399}]
-            + [{"router-1": 420, "router-2": 399}] * 6,
+            scale, "router_scrapes", side_effect=routers,
+        ), mock.patch.object(
+            scale, "resource_samples", create=True, side_effect=resources,
         ), mock.patch.object(
             scale.datetime, "datetime", wraps=scale.datetime.datetime
         ) as datetime, mock.patch.object(
@@ -465,9 +470,120 @@ class ScaleTestTests(unittest.TestCase):
             scale, "write_report"
         ), mock.patch.object(scale, "print", create=True):
             datetime.now.return_value = clock
+            yield write
+
+    def test_scenario_waits_for_every_router_post_load_scrape(self):
+        routers = [{"router-1": 400, "router-2": 400}]
+        routers += [{"router-1": 420, "router-2": 399}] * 6
+        resources = [{"cadvisor": 400, "kube-state": 400}]
+        resources += [{"cadvisor": 420, "kube-state": 420}] * 6
+        with self.scenario_environment(routers, resources) as write:
             with self.assertRaisesRegex(RuntimeError, "fresh.*router"):
                 scale.main()
             write.assert_not_called()
+
+    def test_scenario_rejects_stale_resource_samples(self):
+        for source in ("cadvisor", "kube-state"):
+            before = {"cadvisor": 400, "kube-state": 400}
+            after = {"cadvisor": 420, "kube-state": 420}
+            after[source] = 399
+            routers = [{"router-1": 400}] + [{"router-1": 420}] * 20
+            resources = [before] + [after] * 20
+            with self.subTest(source=source), self.scenario_environment(
+                routers, resources
+            ) as write:
+                with self.assertRaisesRegex(RuntimeError, "fresh.*resource"):
+                    scale.main()
+                write.assert_not_called()
+
+    def test_installer_uses_unique_downloads_for_concurrent_invocations(self):
+        justfile = (PATH.parents[1] / "Justfile").read_text()
+        recipe = justfile.split("\ninstall-oha:\n", 1)[1].split("\n\n", 1)[0]
+        checksums = scale.re.findall(r"[0-9a-f]{64}", recipe)
+        self.assertEqual(len(checksums), 1)
+        payload = b"#!/bin/sh\necho 'oha 1.17.0'\n"
+        digest = hashlib.sha256(payload).hexdigest()
+        recipe = recipe.replace(checksums[0], digest)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            bin_path = root / "bin"
+            bin_path.mkdir()
+            (root / "payload").write_bytes(payload)
+            (root / "Justfile").write_text(
+                'set shell := ["bash", "-euo", "pipefail", "-c"]\n'
+                'repo-root := justfile_directory()\noha-version := "1.17.0"\n'
+                f"install-oha:\n{recipe}\n"
+            )
+            scripts = {
+                "uname": "#!/bin/sh\necho 'Linux x86_64'\n",
+                "sha256sum": (
+                    "#!/usr/bin/env python3\n"
+                    "import hashlib, pathlib, sys\n"
+                    "expected, filename = sys.stdin.read().strip().split('  ', 1)\n"
+                    "try:\n"
+                    "    actual = hashlib.sha256(pathlib.Path(filename).read_bytes()).hexdigest()\n"
+                    "except OSError:\n"
+                    "    print('checksum input missing', file=sys.stderr)\n"
+                    "    sys.exit(1)\n"
+                    "sys.exit(0 if actual == expected else 1)\n"
+                ),
+                "curl": (
+                    "#!/bin/bash\nset -euo pipefail\n"
+                    "while (($#)); do\n"
+                    "  if [[ $1 == --output ]]; then output=$2; shift 2; else shift; fi\n"
+                    "done\n"
+                    'cp "$TEST_ROOT/payload" "$output"\n'
+                    "wait_for() {\n"
+                    '  for ((i=0; i<500; i++)); do [[ -e $1 ]] && return 0; sleep 0.01; done\n'
+                    "  return 1\n"
+                    "}\n"
+                    'if [[ $TEST_INSTALLER_ID == first ]]; then\n'
+                    '  touch "$TEST_ROOT/first"\n'
+                    '  wait_for "$TEST_ROOT/second"\n'
+                    "else\n"
+                    '  touch "$TEST_ROOT/second"\n'
+                    '  wait_for "$TEST_ROOT/build/tools/oha"\n'
+                    "fi\n"
+                ),
+            }
+            for name, content in scripts.items():
+                executable = bin_path / name
+                executable.write_text(content)
+                executable.chmod(0o755)
+            environment = {
+                **os.environ,
+                "PATH": f"{bin_path}{os.pathsep}{os.environ['PATH']}",
+                "TEST_ROOT": str(root),
+            }
+            processes = []
+            try:
+                for identifier in ("first", "second"):
+                    processes.append(scale.subprocess.Popen(
+                        ["just", "--justfile", str(root / "Justfile"), "install-oha"],
+                        cwd=root,
+                        env={**environment, "TEST_INSTALLER_ID": identifier},
+                        stdout=scale.subprocess.PIPE,
+                        stderr=scale.subprocess.PIPE,
+                        text=True,
+                    ))
+                    if identifier == "first":
+                        deadline = scale.time.monotonic() + 5
+                        while not (root / "first").exists():
+                            self.assertLess(scale.time.monotonic(), deadline)
+                            scale.time.sleep(0.01)
+                for process in processes:
+                    stdout, stderr = process.communicate(timeout=10)
+                    self.assertEqual(process.returncode, 0, stdout + stderr)
+                self.assertEqual((root / "build/tools/oha").read_bytes(), payload)
+            finally:
+                for process in processes:
+                    if process.poll() is None:
+                        process.terminate()
+                        try:
+                            process.wait(timeout=3)
+                        except scale.subprocess.TimeoutExpired:
+                            process.kill()
+                            process.wait()
 
 
 if __name__ == "__main__":
