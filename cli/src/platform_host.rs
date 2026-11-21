@@ -217,7 +217,7 @@ enum IngressTlsInput {
     },
 }
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct CertManagerCredential {
     pub service_account_patch: Value,
@@ -236,7 +236,7 @@ pub(crate) struct CertManagerCredential {
     pub audits: Vec<CredentialAudit>,
 }
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct CredentialAudit {
     pub resource: String,
@@ -297,6 +297,14 @@ impl PlatformSettings {
             "cluster",
             "provider",
             crate::bootstrap::CORE_INVENTORY_KEY,
+            "ingressTlsMode",
+            "ingressTlsSecretNamespace",
+            "ingressTlsSecretName",
+            "ingressTlsIssuer",
+            "ingressDnsAddress",
+            "ingressCredential",
+            "ingressRetiringCredential",
+            "ingressServiceAnnotations",
         ] {
             ensure!(
                 !self.metadata.contains_key(reserved),
@@ -1695,6 +1703,7 @@ pub(crate) mod tests {
             "ingressTlsIssuer",
             "ingressDnsAddress",
             "ingressCredential",
+            "ingressRetiringCredential",
             "ingressServiceAnnotations",
         ] {
             let settings = json!({

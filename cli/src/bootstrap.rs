@@ -740,7 +740,7 @@ fn install_platform(
                 &options.ingress.tls,
                 crate::platform_host::IngressTls::SelfSigned
             ) {
-                let certificates = wait_tls_secret(
+                let tls = wait_tls_secret(
                     kube,
                     &secret_namespace,
                     &secret_name,
@@ -751,7 +751,7 @@ fn install_platform(
                     kube,
                     options.domain,
                     options.https_port,
-                    &certificates,
+                    tls,
                     Duration::from_secs(120),
                 )?;
             }
@@ -835,6 +835,7 @@ fn install_platform(
         "ingressTlsMode": tls_mode, "ingressTlsSecretNamespace": secret_namespace,
         "ingressTlsSecretName": secret_name, "ingressTlsIssuer": issuer,
         "ingressDnsAddress": dns_address, "ingressCredential": credential,
+        "ingressRetiringCredential": Value::Null,
         "ingressServiceAnnotations": serde_json::to_string(
             &options.ingress.service.as_ref()
                 .map(|service| service.annotations.clone())
@@ -1277,18 +1278,21 @@ fn configure_ingress_tls(
     inventory: &mut Vec<Value>,
 ) -> Result<(String, String)> {
     use crate::platform_host::IngressTls;
-    let previous_credential = installed_cert_manager_credential(kube)?;
+    let installed_credentials = installed_cert_manager_credentials(kube)?;
     match &options.ingress.tls {
         IngressTls::SelfSigned => {
+            let previous_credentials = installed_credentials.previous_for(None);
+            persist_cert_manager_credentials(kube, None, &previous_credentials)?;
             remove_acme_resources(kube, options.installation_id, inventory)?;
-            configure_cert_manager_credential(kube, inventory, None, previous_credential.as_ref())?;
-            remove_credential_boundary(
+            configure_cert_manager_credential(kube, inventory, None, &previous_credentials)?;
+            remove_retired_credential_boundaries(
                 kube,
                 options.installation_id,
-                previous_credential.as_ref(),
+                &previous_credentials,
                 None,
                 inventory,
             )?;
+            persist_cert_manager_credentials(kube, None, &[])?;
             self_signed_tls(kube, options.domain, options.installation_id)?;
             Ok(("kourier-system".into(), "lampyr-kourier-tls".into()))
         }
@@ -1303,15 +1307,18 @@ fn configure_ingress_tls(
                 options.domain,
                 Duration::from_secs(120),
             )?;
+            let previous_credentials = installed_credentials.previous_for(None);
+            persist_cert_manager_credentials(kube, None, &previous_credentials)?;
             remove_acme_resources(kube, options.installation_id, inventory)?;
-            configure_cert_manager_credential(kube, inventory, None, previous_credential.as_ref())?;
-            remove_credential_boundary(
+            configure_cert_manager_credential(kube, inventory, None, &previous_credentials)?;
+            remove_retired_credential_boundaries(
                 kube,
                 options.installation_id,
-                previous_credential.as_ref(),
+                &previous_credentials,
                 None,
                 inventory,
             )?;
+            persist_cert_manager_credentials(kube, None, &[])?;
             Ok((secret_namespace.clone(), secret_name.clone()))
         }
         IngressTls::Acme {
@@ -1324,32 +1331,35 @@ fn configure_ingress_tls(
                 cert_manager_owned(inventory),
                 "ACME ingress requires the cert-manager installation managed by Lampyr"
             );
-            persist_cert_manager_credential(kube, Some(credential))?;
+            let previous_credentials =
+                installed_credentials.previous_for(Some(credential.as_ref()));
+            persist_cert_manager_credentials(
+                kube,
+                Some(credential.as_ref()),
+                &previous_credentials,
+            )?;
             configure_credential_boundary(kube, options.installation_id, credential, inventory)?;
             wait_credential_boundary(kube, credential)?;
             if let Err(error) = ensure_no_external_credential_resources(kube, credential) {
-                configure_cert_manager_credential(
-                    kube,
-                    inventory,
-                    None,
-                    previous_credential.as_ref(),
-                )
-                .context("disable cert-manager identity after unsafe Issuer discovery")?;
+                let active_credentials = installed_credentials.previous_for(None);
+                configure_cert_manager_credential(kube, inventory, None, &active_credentials)
+                    .context("disable cert-manager identity after unsafe Issuer discovery")?;
                 return Err(error);
             }
             configure_cert_manager_credential(
                 kube,
                 inventory,
                 Some(credential),
-                previous_credential.as_ref(),
+                &previous_credentials,
             )?;
-            remove_credential_boundary(
+            remove_retired_credential_boundaries(
                 kube,
                 options.installation_id,
-                previous_credential.as_ref(),
+                &previous_credentials,
                 Some(credential),
                 inventory,
             )?;
+            persist_cert_manager_credentials(kube, Some(credential.as_ref()), &[])?;
             let issuer_manifest = json!({
                 "apiVersion":"cert-manager.io/v1", "kind":"Issuer",
                 "metadata":{"name":issuer,"namespace":"kourier-system","annotations":{
@@ -1444,18 +1454,61 @@ fn cert_manager_owned(inventory: &[Value]) -> bool {
     })
 }
 
-fn persist_cert_manager_credential(
+#[derive(Default)]
+struct InstalledCertManagerCredentials {
+    current: Option<crate::platform_host::CertManagerCredential>,
+    retiring: Vec<crate::platform_host::CertManagerCredential>,
+}
+
+impl InstalledCertManagerCredentials {
+    fn previous_for(
+        &self,
+        current: Option<&crate::platform_host::CertManagerCredential>,
+    ) -> Vec<crate::platform_host::CertManagerCredential> {
+        let mut previous = Vec::new();
+        for credential in self.current.iter().chain(&self.retiring) {
+            if current.is_some_and(|current| current == credential)
+                || previous.iter().any(|existing| existing == credential)
+            {
+                continue;
+            }
+            previous.push(credential.clone());
+        }
+        previous
+    }
+}
+
+fn persist_cert_manager_credentials(
     kube: &Kube<'_>,
-    credential: Option<&crate::platform_host::CertManagerCredential>,
+    current: Option<&crate::platform_host::CertManagerCredential>,
+    retiring: &[crate::platform_host::CertManagerCredential],
 ) -> Result<()> {
     kube.patch(
         "kube-system",
         "configmap",
         "lampyr-install",
-        &json!({"data":{"ingressCredential":credential
-            .map(serde_json::to_string)
-            .transpose()?}}),
+        &cert_manager_credential_state_patch(current, retiring)?,
     )
+}
+
+fn cert_manager_credential_state_patch(
+    current: Option<&crate::platform_host::CertManagerCredential>,
+    retiring: &[crate::platform_host::CertManagerCredential],
+) -> Result<Value> {
+    let current = current
+        .map(serde_json::to_string)
+        .transpose()?
+        .map(Value::String)
+        .unwrap_or(Value::Null);
+    let retiring = if retiring.is_empty() {
+        Value::Null
+    } else {
+        Value::String(serde_json::to_string(retiring)?)
+    };
+    Ok(json!({"data":{
+        "ingressCredential":current,
+        "ingressRetiringCredential":retiring
+    }}))
 }
 
 fn apply_cert_manager_manifest(
@@ -1486,23 +1539,34 @@ fn apply_cert_manager_manifest(
     }
 }
 
-fn installed_cert_manager_credential(
-    kube: &Kube<'_>,
-) -> Result<Option<crate::platform_host::CertManagerCredential>> {
+fn installed_cert_manager_credentials(kube: &Kube<'_>) -> Result<InstalledCertManagerCredentials> {
     let Some(install) = kube.optional("kube-system", "configmap", "lampyr-install")? else {
-        return Ok(None);
+        return Ok(InstalledCertManagerCredentials::default());
     };
-    install["data"]["ingressCredential"]
+    decode_installed_cert_manager_credentials(&install)
+}
+
+fn decode_installed_cert_manager_credentials(
+    install: &Value,
+) -> Result<InstalledCertManagerCredentials> {
+    let current = install["data"]["ingressCredential"]
         .as_str()
         .map(serde_json::from_str)
         .transpose()
-        .context("decode installed cert-manager credential configuration")
+        .context("decode installed cert-manager credential configuration")?;
+    let retiring = install["data"]["ingressRetiringCredential"]
+        .as_str()
+        .map(serde_json::from_str)
+        .transpose()
+        .context("decode retiring cert-manager credential configurations")?
+        .unwrap_or_default();
+    Ok(InstalledCertManagerCredentials { current, retiring })
 }
 
 fn cert_manager_controller_args(
     deployment: &Value,
     current: Option<&crate::platform_host::CertManagerCredential>,
-    previous: Option<&crate::platform_host::CertManagerCredential>,
+    previous: &[crate::platform_host::CertManagerCredential],
 ) -> Result<Vec<Value>> {
     let container = deployment
         .pointer("/spec/template/spec/containers")
@@ -1519,7 +1583,7 @@ fn cert_manager_controller_args(
         .clone();
     let prefixes: BTreeSet<_> = current
         .into_iter()
-        .chain(previous)
+        .chain(previous.iter())
         .flat_map(|credential| credential.controller_arg_prefixes.iter())
         .collect();
     args.retain(|arg| {
@@ -1549,11 +1613,12 @@ fn merge_json(target: &mut Value, patch: &Value) {
 fn cert_manager_credential_patch(
     deployment: &Value,
     current: Option<&crate::platform_host::CertManagerCredential>,
-    previous: Option<&crate::platform_host::CertManagerCredential>,
+    previous: &[crate::platform_host::CertManagerCredential],
 ) -> Result<Value> {
-    let mut patch = previous
-        .map(|credential| credential.deployment_cleanup_patch.clone())
-        .unwrap_or_else(|| json!({}));
+    let mut patch = json!({});
+    for credential in previous {
+        merge_json(&mut patch, &credential.deployment_cleanup_patch);
+    }
     if let Some(current) = current {
         merge_json(&mut patch, &current.deployment_patch);
     }
@@ -1688,7 +1753,7 @@ fn configure_cert_manager_credential(
     kube: &Kube<'_>,
     inventory: &[Value],
     current: Option<&crate::platform_host::CertManagerCredential>,
-    previous: Option<&crate::platform_host::CertManagerCredential>,
+    previous: &[crate::platform_host::CertManagerCredential],
 ) -> Result<()> {
     if current.is_some() {
         ensure!(
@@ -1696,10 +1761,14 @@ fn configure_cert_manager_credential(
             "managed ACME ingress requires the cert-manager installation managed by Lampyr"
         );
     }
-    if current.is_some() || previous.is_some() {
-        let mut service_account_patch = previous
-            .map(|credential| credential.service_account_cleanup_patch.clone())
-            .unwrap_or_else(|| json!({}));
+    if current.is_some() || !previous.is_empty() {
+        let mut service_account_patch = json!({});
+        for credential in previous {
+            merge_json(
+                &mut service_account_patch,
+                &credential.service_account_cleanup_patch,
+            );
+        }
         if let Some(current) = current {
             merge_json(&mut service_account_patch, &current.service_account_patch);
         }
@@ -1804,7 +1873,7 @@ fn wait_tls_secret(
     name: &str,
     domain: &str,
     timeout: Duration,
-) -> Result<Vec<CertificateDer<'static>>> {
+) -> Result<ValidatedTls> {
     kube.wait("ingress TLS Secret", timeout, || {
         let Some(secret) = kube.optional(namespace, "secret", name)? else {
             return Ok(None);
@@ -1816,7 +1885,30 @@ fn wait_tls_secret(
     })
 }
 
-fn validate_tls_secret(secret: &Value, domain: &str) -> Result<Vec<CertificateDer<'static>>> {
+fn wait_self_signed_tls_secret(
+    kube: &Kube<'_>,
+    namespace: &str,
+    name: &str,
+    domain: &str,
+    timeout: Duration,
+) -> Result<()> {
+    kube.wait("self-signed ingress TLS Secret", timeout, || {
+        let Some(secret) = kube.optional(namespace, "secret", name)? else {
+            return Ok(None);
+        };
+        if secret["type"] != "kubernetes.io/tls" {
+            return Ok(None);
+        }
+        validate_self_signed_tls_secret(&secret, domain).map(|()| Some(()))
+    })
+}
+
+#[derive(Debug)]
+struct ValidatedTls {
+    roots: rustls::RootCertStore,
+}
+
+fn tls_secret_certificates(secret: &Value) -> Result<Vec<CertificateDer<'static>>> {
     let certificate = secret["data"]["tls.crt"]
         .as_str()
         .context("ingress TLS Secret has no tls.crt")?;
@@ -1840,18 +1932,42 @@ fn validate_tls_secret(secret: &Value, domain: &str) -> Result<Vec<CertificateDe
         .with_no_client_auth()
         .with_single_cert(certificates.clone(), private_key)
         .context("ingress TLS certificate does not match its private key")?;
-    let mut roots = rustls::RootCertStore::empty();
-    roots
-        .add(certificates.last().unwrap().clone())
-        .context("ingress TLS chain has no usable trust anchor")?;
-    let verifier = rustls::client::WebPkiServerVerifier::builder(Arc::new(roots))
+    Ok(certificates)
+}
+
+fn add_secret_tls_roots(secret: &Value, roots: &mut rustls::RootCertStore) -> Result<()> {
+    if let Some(bundle) = secret["data"]["ca.crt"].as_str() {
+        let bundle = STANDARD
+            .decode(bundle)
+            .context("decode ingress TLS CA bundle")?;
+        if bundle.is_empty() {
+            return Ok(());
+        }
+        let certificates: Vec<_> = CertificateDer::pem_slice_iter(&bundle)
+            .collect::<std::result::Result<_, _>>()
+            .context("parse ingress TLS CA bundle")?;
+        ensure!(
+            !certificates.is_empty(),
+            "ingress TLS CA bundle has no certificates"
+        );
+        for certificate in certificates {
+            roots
+                .add(certificate)
+                .context("add ingress TLS CA trust anchor")?;
+        }
+    }
+    Ok(())
+}
+
+fn verify_tls_hostnames(
+    certificates: &[CertificateDer<'static>],
+    roots: rustls::RootCertStore,
+    domain: &str,
+    intermediates: &[CertificateDer<'static>],
+) -> Result<rustls::RootCertStore> {
+    let verifier = rustls::client::WebPkiServerVerifier::builder(Arc::new(roots.clone()))
         .build()
         .context("build ingress TLS certificate verifier")?;
-    let intermediates = if certificates.len() > 1 {
-        &certificates[1..certificates.len() - 1]
-    } else {
-        &[]
-    };
     use rustls::client::danger::ServerCertVerifier as _;
     let mut hostnames = vec![format!("lampyr-readiness.default.{domain}")];
     // WebPKI deliberately rejects a wildcard directly below a single-label
@@ -1875,23 +1991,67 @@ fn validate_tls_secret(secret: &Value, domain: &str) -> Result<Vec<CertificateDe
                 )
             })?;
     }
-    Ok(certificates)
+    Ok(roots)
+}
+
+fn validate_tls_secret(secret: &Value, domain: &str) -> Result<ValidatedTls> {
+    let mut roots = rustls::RootCertStore::empty();
+    let native = rustls_native_certs::load_native_certs();
+    let (_, ignored) = roots.add_parsable_certificates(native.certs);
+    let system_empty = roots.is_empty();
+    match validate_tls_secret_with_roots(secret, domain, roots) {
+        Err(error) if system_empty && error.to_string().contains("TLS trust store is empty") => {
+            Err(error).context(format!(
+                "{ignored} system certificates were ignored while loading native roots: {:?}",
+                native.errors
+            ))
+        }
+        result => result,
+    }
+}
+
+fn validate_tls_secret_with_roots(
+    secret: &Value,
+    domain: &str,
+    mut roots: rustls::RootCertStore,
+) -> Result<ValidatedTls> {
+    add_secret_tls_roots(secret, &mut roots)?;
+    ensure!(
+        !roots.is_empty(),
+        "TLS trust store is empty and the Secret has no non-empty ca.crt bundle"
+    );
+    let certificates = tls_secret_certificates(secret)?;
+    let roots = verify_tls_hostnames(&certificates, roots, domain, &certificates[1..])?;
+    Ok(ValidatedTls { roots })
+}
+
+fn validate_self_signed_tls_secret(secret: &Value, domain: &str) -> Result<()> {
+    let certificates = tls_secret_certificates(secret)?;
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(certificates.last().unwrap().clone())
+        .context("ingress TLS chain has no usable trust anchor")?;
+    let intermediates = if certificates.len() > 1 {
+        &certificates[1..certificates.len() - 1]
+    } else {
+        &[]
+    };
+    verify_tls_hostnames(&certificates, roots, domain, intermediates)?;
+    Ok(())
 }
 
 fn wait_tls_endpoint(
     kube: &Kube<'_>,
     domain: &str,
     port: u16,
-    certificates: &[CertificateDer<'static>],
+    tls: ValidatedTls,
     timeout: Duration,
 ) -> Result<()> {
     let hostname = format!("lampyr-readiness.default.{domain}");
     let server_name = ServerName::try_from(hostname.clone())?.to_owned();
-    let mut roots = rustls::RootCertStore::empty();
-    roots.add(certificates.last().unwrap().clone())?;
     let config = Arc::new(
         rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
+            .with_root_certificates(tls.roots)
             .with_no_client_auth(),
     );
     let mut resolver = AddressResolver::new(&hostname, port);
@@ -2027,6 +2187,19 @@ fn remove_credential_boundary(
     Ok(())
 }
 
+fn remove_retired_credential_boundaries(
+    kube: &Kube<'_>,
+    installation_id: &str,
+    previous: &[crate::platform_host::CertManagerCredential],
+    current: Option<&crate::platform_host::CertManagerCredential>,
+    inventory: &mut Vec<Value>,
+) -> Result<()> {
+    for credential in previous {
+        remove_credential_boundary(kube, installation_id, Some(credential), current, inventory)?;
+    }
+    Ok(())
+}
+
 fn remove_retired_issuers(
     kube: &Kube<'_>,
     installation_id: &str,
@@ -2116,7 +2289,7 @@ fn self_signed_secret_is_reusable(secret: &Value, domain: &str, installation_id:
             .pointer("/metadata/annotations/lampyr.dev~1tls-mode")
             .and_then(Value::as_str)
             == Some("selfSigned")
-        && validate_tls_secret(secret, domain).is_ok()
+        && validate_self_signed_tls_secret(secret, domain).is_ok()
 }
 
 pub(crate) fn delete_manifest(kube: &Kube<'_>, source: &str) -> Result<Vec<String>> {
@@ -2395,21 +2568,23 @@ pub fn health(kube: &Kube<'_>) -> Result<()> {
                 Duration::from_secs(10),
             )?;
         }
-        let certificates = wait_tls_secret(
-            kube,
-            secret_namespace,
-            secret_name,
-            domain,
-            Duration::from_secs(10),
-        )?;
-        if tls_mode != "selfSigned" {
-            wait_tls_endpoint(
+        if tls_mode == "selfSigned" {
+            wait_self_signed_tls_secret(
                 kube,
+                secret_namespace,
+                secret_name,
                 domain,
-                https_port,
-                &certificates,
                 Duration::from_secs(10),
             )?;
+        } else {
+            let tls = wait_tls_secret(
+                kube,
+                secret_namespace,
+                secret_name,
+                domain,
+                Duration::from_secs(10),
+            )?;
+            wait_tls_endpoint(kube, domain, https_port, tls, Duration::from_secs(10))?;
         }
         if let Some(address) = installed.data.get("ingressDnsAddress") {
             let address: IpAddr = address
@@ -2914,13 +3089,15 @@ metadata: {name: lampyr-grant-homes, namespace: default}
             json!({
                 "data":{
                     "tls.crt":STANDARD.encode(certified.cert.pem()),
-                    "tls.key":STANDARD.encode(key)
+                    "tls.key":STANDARD.encode(key),
+                    "ca.crt":STANDARD.encode(certified.cert.pem())
                 }
             })
         };
-        validate_tls_secret(
+        validate_tls_secret_with_roots(
             &secret(certified.signing_key.serialize_pem()),
             "apps.example.com",
+            rustls::RootCertStore::empty(),
         )
         .unwrap();
         let local = rcgen::generate_simple_self_signed(vec![
@@ -2928,12 +3105,14 @@ metadata: {name: lampyr-grant-homes, namespace: default}
             "*.default.localhost".into(),
         ])
         .unwrap();
-        validate_tls_secret(
+        validate_tls_secret_with_roots(
             &json!({"data":{
                 "tls.crt":STANDARD.encode(local.cert.pem()),
-                "tls.key":STANDARD.encode(local.signing_key.serialize_pem())
+                "tls.key":STANDARD.encode(local.signing_key.serialize_pem()),
+                "ca.crt":STANDARD.encode(local.cert.pem())
             }}),
             "localhost",
+            rustls::RootCertStore::empty(),
         )
         .unwrap();
         let incomplete =
@@ -2941,21 +3120,27 @@ metadata: {name: lampyr-grant-homes, namespace: default}
         let incomplete_secret = json!({
             "data":{
                 "tls.crt":STANDARD.encode(incomplete.cert.pem()),
-                "tls.key":STANDARD.encode(incomplete.signing_key.serialize_pem())
+                "tls.key":STANDARD.encode(incomplete.signing_key.serialize_pem()),
+                "ca.crt":STANDARD.encode(incomplete.cert.pem())
             }
         });
-        let error = validate_tls_secret(&incomplete_secret, "apps.example.com")
-            .unwrap_err()
-            .to_string();
+        let error = validate_tls_secret_with_roots(
+            &incomplete_secret,
+            "apps.example.com",
+            rustls::RootCertStore::empty(),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(error.contains("does not cover"), "{error}");
         assert!(
             error.contains("lampyr-readiness.apps.example.com"),
             "{error}"
         );
         assert!(
-            validate_tls_secret(
+            validate_tls_secret_with_roots(
                 &secret(certified.signing_key.serialize_pem()),
-                "other.example.com"
+                "other.example.com",
+                rustls::RootCertStore::empty(),
             )
             .unwrap_err()
             .to_string()
@@ -2963,10 +3148,14 @@ metadata: {name: lampyr-grant-homes, namespace: default}
         );
         let other = rcgen::KeyPair::generate().unwrap();
         assert!(
-            validate_tls_secret(&secret(other.serialize_pem()), "apps.example.com")
-                .unwrap_err()
-                .to_string()
-                .contains("does not match")
+            validate_tls_secret_with_roots(
+                &secret(other.serialize_pem()),
+                "apps.example.com",
+                rustls::RootCertStore::empty(),
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("does not match")
         );
     }
 
@@ -2987,20 +3176,137 @@ metadata: {name: lampyr-grant-homes, namespace: default}
             }
             json!({"data":data})
         };
-        let error = validate_tls_secret(&secret(None), "apps.example.com")
+        let unrelated =
+            rcgen::generate_simple_self_signed(vec!["unrelated.example.com".into()]).unwrap();
+        let roots = || {
+            let mut roots = rustls::RootCertStore::empty();
+            roots.add(unrelated.cert.der().clone()).unwrap();
+            roots
+        };
+        let error = validate_tls_secret_with_roots(&secret(None), "apps.example.com", roots())
             .unwrap_err()
             .to_string();
         assert!(error.contains("untrusted"), "{error}");
-        validate_tls_secret(&secret(Some(&certified.cert.pem())), "apps.example.com").unwrap();
+        let error = validate_tls_secret_with_roots(&secret(Some("")), "apps.example.com", roots())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("untrusted"), "{error}");
+        validate_tls_secret_with_roots(
+            &secret(Some(&certified.cert.pem())),
+            "apps.example.com",
+            roots(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn existing_tls_secret_uses_intermediates_but_not_a_presented_root() {
+        let mut root_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        root_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let root_key = rcgen::KeyPair::generate().unwrap();
+        let root = root_params.self_signed(&root_key).unwrap();
+        let root_issuer = rcgen::Issuer::new(root_params, root_key);
+
+        let mut intermediate_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        intermediate_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let intermediate_key = rcgen::KeyPair::generate().unwrap();
+        let intermediate = intermediate_params
+            .signed_by(&intermediate_key, &root_issuer)
+            .unwrap();
+        let intermediate_issuer = rcgen::Issuer::new(intermediate_params, intermediate_key);
+
+        let mut leaf_params = rcgen::CertificateParams::new(vec![
+            "*.apps.example.com".into(),
+            "*.default.apps.example.com".into(),
+        ])
+        .unwrap();
+        leaf_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+        let leaf_key = rcgen::KeyPair::generate().unwrap();
+        let leaf = leaf_params
+            .signed_by(&leaf_key, &intermediate_issuer)
+            .unwrap();
+        let secret = |include_ca: bool, present_root: bool| {
+            let mut chain = format!("{}{}", leaf.pem(), intermediate.pem());
+            if present_root {
+                chain.push_str(&root.pem());
+            }
+            let mut data = json!({
+                "tls.crt":STANDARD.encode(chain),
+                "tls.key":STANDARD.encode(leaf_key.serialize_pem())
+            });
+            if include_ca {
+                data["ca.crt"] = STANDARD.encode(root.pem()).into();
+            }
+            json!({"data":data})
+        };
+        validate_tls_secret_with_roots(
+            &secret(true, false),
+            "apps.example.com",
+            rustls::RootCertStore::empty(),
+        )
+        .unwrap();
+        let unrelated =
+            rcgen::generate_simple_self_signed(vec!["unrelated.example.com".into()]).unwrap();
+        let mut unrelated_roots = rustls::RootCertStore::empty();
+        unrelated_roots.add(unrelated.cert.der().clone()).unwrap();
+        let error = validate_tls_secret_with_roots(
+            &secret(false, true),
+            "apps.example.com",
+            unrelated_roots,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("untrusted"), "{error}");
     }
 
     #[test]
     fn credential_reconciliation_persists_retiring_configuration() {
-        let production = include_str!("bootstrap.rs")
-            .split("#[cfg(test)]")
-            .next()
-            .unwrap();
-        assert!(production.contains("ingressRetiringCredential"));
+        let credential = |identity: &str| crate::platform_host::CertManagerCredential {
+            service_account_patch: json!({"metadata":{"annotations":{"provider.example/id":identity}}}),
+            service_account_cleanup_patch: json!({"metadata":{"annotations":{"provider.example/id":Value::Null}}}),
+            deployment_patch: json!({"spec":{"template":{"metadata":{"annotations":{"provider.example/id":identity}}}}}),
+            deployment_cleanup_patch: json!({"spec":{"template":{"metadata":{"annotations":{"provider.example/id":Value::Null}}}}}),
+            controller_args: vec!["--provider-ambient=true".into()],
+            controller_arg_prefixes: vec!["--provider-ambient".into()],
+            boundary: json!({"apiVersion":"v1","kind":"List","items":[]}),
+            boundary_message: "provider boundary".into(),
+            probes: vec![],
+            audits: vec![],
+        };
+        let first = credential("first");
+        let older = credential("older");
+        let second = credential("second");
+        let installed = InstalledCertManagerCredentials {
+            current: Some(first.clone()),
+            retiring: vec![older.clone()],
+        };
+        assert_eq!(
+            installed.previous_for(Some(&second)),
+            vec![first.clone(), older.clone()]
+        );
+        let interrupted = InstalledCertManagerCredentials {
+            current: Some(second.clone()),
+            retiring: vec![first.clone(), older.clone()],
+        };
+        assert_eq!(
+            interrupted.previous_for(Some(&second)),
+            vec![first.clone(), older.clone()]
+        );
+        assert_eq!(
+            interrupted.previous_for(None),
+            vec![second.clone(), first.clone(), older.clone()]
+        );
+        let steady = InstalledCertManagerCredentials {
+            current: Some(second.clone()),
+            retiring: vec![],
+        };
+        assert_eq!(steady.previous_for(None), vec![second.clone()]);
+        let persisted =
+            cert_manager_credential_state_patch(Some(&second), &[first.clone(), older.clone()])
+                .unwrap();
+        let decoded = decode_installed_cert_manager_credentials(&persisted).unwrap();
+        assert_eq!(decoded.current, Some(second));
+        assert_eq!(decoded.retiring, vec![first, older]);
     }
 
     #[test]
@@ -3075,7 +3381,7 @@ metadata: {name: lampyr-grant-homes, namespace: default}
             audits: vec![],
         };
         let first = credential("first");
-        let patch = cert_manager_credential_patch(&deployment, Some(&first), None).unwrap();
+        let patch = cert_manager_credential_patch(&deployment, Some(&first), &[]).unwrap();
         assert_eq!(
             patch.pointer("/spec/template/spec/containers/0/args"),
             Some(&json!(["--v=2", "--provider-ambient=true"]))
@@ -3086,12 +3392,14 @@ metadata: {name: lampyr-grant-homes, namespace: default}
         );
         let second = credential("second");
         let changed =
-            cert_manager_credential_patch(&deployment, Some(&second), Some(&first)).unwrap();
+            cert_manager_credential_patch(&deployment, Some(&second), std::slice::from_ref(&first))
+                .unwrap();
         assert_ne!(
             patch.pointer("/spec/template/metadata/annotations"),
             changed.pointer("/spec/template/metadata/annotations")
         );
-        let disabled = cert_manager_credential_patch(&patch, None, Some(&second)).unwrap();
+        let disabled =
+            cert_manager_credential_patch(&patch, None, std::slice::from_ref(&second)).unwrap();
         assert_eq!(
             disabled.pointer("/spec/template/spec/containers/0/args"),
             Some(&json!(["--v=2"]))

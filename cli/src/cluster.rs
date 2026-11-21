@@ -842,12 +842,20 @@ fn validate_provider_manifest_capability_for_plan(
     plan: &RuntimePlan,
     declared: bool,
 ) -> Result<()> {
-    let has_manifests =
-        !plan.before.is_empty() || !plan.after.is_empty() || !plan.cleanup.is_empty();
+    let has_manifests = !plan.before.is_empty()
+        || !plan.after.is_empty()
+        || !plan.cleanup.is_empty()
+        || embedded_platform_mutations(plan).is_some();
     if !has_manifests {
         return Ok(());
     }
     validate_provider_manifest_capability(declared)
+}
+
+fn embedded_platform_mutations(plan: &RuntimePlan) -> Option<&Value> {
+    plan.options
+        .get("ingress")
+        .and_then(|ingress| ingress.pointer("/tls/credential"))
 }
 
 fn validate_provider_manifest_capability(declared: bool) -> Result<()> {
@@ -872,18 +880,33 @@ fn approve_install_manifests_at(
     plan: &RuntimePlan,
     approval: ManifestApproval,
 ) -> Result<()> {
-    if plan.before.is_empty() && plan.after.is_empty() {
+    let platform = embedded_platform_mutations(plan);
+    if plan.before.is_empty() && plan.after.is_empty() && platform.is_none() {
         return Ok(());
     }
     let before = directory.join("before.yaml");
     let after = directory.join("after.yaml");
     write_manifest_file(&before, &plan.before)?;
     write_manifest_file(&after, &plan.after)?;
+    let platform_path = directory.join("platform-mutations.yaml");
+    if let Some(platform) = platform {
+        write_yaml_file(&platform_path, platform)?;
+    } else if platform_path.try_exists()? {
+        std::fs::remove_file(&platform_path)?;
+    }
     let cleanup = directory.join("cleanup.yaml");
     if cleanup.try_exists()? {
         std::fs::remove_file(cleanup)?;
     }
-    show_install_manifests(plan, &before, &after);
+    show_install_manifests(
+        plan,
+        &before,
+        &after,
+        platform.map(|_| platform_path.as_path()),
+    );
+    if let Some(platform) = platform {
+        show_platform_mutations(platform);
+    }
     require_manifest_approval(approval, "Apply these provider Kubernetes manifests?")
 }
 
@@ -903,12 +926,26 @@ fn approve_cleanup_manifests_at(
     delete_cluster: bool,
     approval: ManifestApproval,
 ) -> Result<()> {
-    if delete_cluster || plan.cleanup.is_empty() {
+    let platform = embedded_platform_mutations(plan);
+    if delete_cluster || (plan.cleanup.is_empty() && platform.is_none()) {
         return Ok(());
     }
     let cleanup = directory.join("cleanup.yaml");
     write_manifest_file(&cleanup, &plan.cleanup)?;
-    show_cleanup_manifests(&plan.cleanup, &cleanup);
+    let platform_path = directory.join("platform-mutations.yaml");
+    if let Some(platform) = platform {
+        write_yaml_file(&platform_path, platform)?;
+    } else if platform_path.try_exists()? {
+        std::fs::remove_file(&platform_path)?;
+    }
+    show_cleanup_manifests(
+        &plan.cleanup,
+        &cleanup,
+        platform.map(|_| platform_path.as_path()),
+    );
+    if let Some(platform) = platform {
+        show_platform_mutations(platform);
+    }
     require_manifest_approval(approval, "Apply the provider cleanup manifests?")
 }
 
@@ -934,7 +971,12 @@ fn approve_providerless_uninstall_manifests(
     plan: &RuntimePlan,
     approval: ManifestApproval,
 ) -> Result<()> {
-    if plan.before.is_empty() && plan.after.is_empty() && plan.cleanup.is_empty() {
+    let platform = embedded_platform_mutations(plan);
+    if plan.before.is_empty()
+        && plan.after.is_empty()
+        && plan.cleanup.is_empty()
+        && platform.is_none()
+    {
         return Ok(());
     }
     let before = directory.join("before.yaml");
@@ -943,6 +985,10 @@ fn approve_providerless_uninstall_manifests(
     write_manifest_file(&before, &plan.before)?;
     write_manifest_file(&after, &plan.after)?;
     write_manifest_file(&cleanup, &plan.cleanup)?;
+    let platform_path = directory.join("platform-mutations.yaml");
+    if let Some(platform) = platform {
+        write_yaml_file(&platform_path, platform)?;
+    }
 
     eprintln!();
     eprintln!("{}", style("Provider Kubernetes resource removal", "1"));
@@ -955,11 +1001,20 @@ fn approve_providerless_uninstall_manifests(
         "36;1",
         &plan.before,
     );
+    if let Some(platform) = platform {
+        show_platform_mutations(platform);
+    }
     eprintln!();
     eprintln!("Files written locally:");
     eprintln!("  BEFORE  {}", style(&before.display().to_string(), "2"));
     eprintln!("  AFTER   {}", style(&after.display().to_string(), "2"));
     eprintln!("  CLEANUP {}", style(&cleanup.display().to_string(), "2"));
+    if platform.is_some() {
+        eprintln!(
+            "  PLATFORM {}",
+            style(&platform_path.display().to_string(), "2")
+        );
+    }
     eprintln!("Inspect these standard YAML files before continuing.");
     require_manifest_approval(
         approval,
@@ -986,7 +1041,26 @@ fn write_manifest_file(path: &Path, manifests: &[Value]) -> Result<()> {
     Ok(())
 }
 
-fn show_install_manifests(plan: &RuntimePlan, before: &Path, after: &Path) {
+fn write_yaml_file(path: &Path, value: &Value) -> Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(serde_yaml_ng::to_string(value)?.as_bytes())?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn show_install_manifests(
+    plan: &RuntimePlan,
+    before: &Path,
+    after: &Path,
+    platform: Option<&Path>,
+) {
     eprintln!();
     eprintln!("{}", style("Provider Kubernetes manifests", "1"));
     show_manifest_phase("BEFORE LAMPYR PLATFORM", "36;1", &plan.before);
@@ -995,18 +1069,55 @@ fn show_install_manifests(plan: &RuntimePlan, before: &Path, after: &Path) {
     eprintln!("Files written locally:");
     eprintln!("  BEFORE  {}", style(&before.display().to_string(), "2"));
     eprintln!("  AFTER   {}", style(&after.display().to_string(), "2"));
+    if let Some(platform) = platform {
+        eprintln!("  PLATFORM {}", style(&platform.display().to_string(), "2"));
+    }
     eprintln!("Inspect these standard YAML files or apply them manually in the phase order shown.");
 }
 
-fn show_cleanup_manifests(manifests: &[Value], cleanup: &Path) {
+fn show_cleanup_manifests(manifests: &[Value], cleanup: &Path, platform: Option<&Path>) {
     eprintln!();
     eprintln!("{}", style("Provider cleanup manifests", "1"));
     show_manifest_phase("CLEANUP", "35;1", manifests);
     eprintln!();
     eprintln!("File written locally:");
     eprintln!("  CLEANUP  {}", style(&cleanup.display().to_string(), "2"));
+    if let Some(platform) = platform {
+        eprintln!("  PLATFORM {}", style(&platform.display().to_string(), "2"));
+    }
     eprintln!(
         "Inspect this standard YAML file or apply it manually during retained-cluster cleanup."
+    );
+}
+
+fn show_platform_mutations(credential: &Value) {
+    let boundary = credential["boundary"]["items"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    show_manifest_phase("PLATFORM CREDENTIAL BOUNDARY", "33;1", boundary);
+    eprintln!();
+    eprintln!("{}", style("Platform credential mutations", "1"));
+    eprintln!(
+        "  ServiceAccount cert-manager/cert-manager patch: {}",
+        credential["serviceAccountPatch"]
+    );
+    eprintln!(
+        "  ServiceAccount cert-manager/cert-manager cleanup: {}",
+        credential["serviceAccountCleanupPatch"]
+    );
+    eprintln!(
+        "  Deployment cert-manager/cert-manager patch: {}",
+        credential["deploymentPatch"]
+    );
+    eprintln!(
+        "  Deployment cert-manager/cert-manager cleanup: {}",
+        credential["deploymentCleanupPatch"]
+    );
+    eprintln!("  Controller args: {}", credential["controllerArgs"]);
+    eprintln!(
+        "  Controller arg prefixes removed: {}",
+        credential["controllerArgPrefixes"]
     );
 }
 
@@ -1679,6 +1790,13 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("--approve-provider-manifests")
+        );
+        let mutations =
+            std::fs::read_to_string(directory.path().join("platform-mutations.yaml")).unwrap();
+        assert!(mutations.contains("serviceAccountPatch"), "{mutations}");
+        assert!(
+            mutations.contains("ValidatingAdmissionPolicy"),
+            "{mutations}"
         );
     }
 
