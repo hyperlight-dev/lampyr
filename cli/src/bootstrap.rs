@@ -2,12 +2,15 @@
 // Copyright 2026 The Hyperlight Authors.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::Path;
-use std::time::Duration;
+use std::sync::{Arc, mpsc};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use chrono::{Datelike, Utc};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, pem::PemObject};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -59,6 +62,7 @@ pub struct Options<'a> {
     pub zygote_registries: &'a [String],
     pub registry_mirrors: BTreeMap<String, Value>,
     pub ingress_ports: Option<Value>,
+    pub(crate) ingress: &'a crate::platform_host::IngressSettings,
 }
 
 pub(crate) fn run(kube: &Kube<'_>, namespace: Option<&str>, args: &[&str]) -> Result<()> {
@@ -171,6 +175,9 @@ fn record_manifest(value: &Value, inventory: &mut Vec<Value>) -> Result<()> {
         let mut metadata = json!({"name":name});
         if let Some(namespace) = item["metadata"]["namespace"].as_str() {
             metadata["namespace"] = namespace.into();
+        }
+        if item["metadata"]["annotations"]["lampyr.dev/credential-boundary"] == "true" {
+            metadata["annotations"] = json!({"lampyr.dev/credential-boundary":"true"});
         }
         let identity = json!({
             "apiVersion":api_version,
@@ -655,6 +662,9 @@ fn install_platform(
             wait_for_webhook_endpoint(kube)?;
             patch_fiber_serving_defaults(kube)
         })?;
+    kube.host.step("Installing certificate management", || {
+        install_cert_manager(kube, options, inventory)
+    })?;
     kube.host
         .step("Wiring your network and HTTPS ingress", || {
             apply_bundled_manifest(kube, options, "kourier.yaml", inventory)?;
@@ -672,32 +682,38 @@ fn install_platform(
                 "3scale-kourier-gateway",
                 "180s",
             )?;
-            if let Some(ports) = &options.ingress_ports {
-                ensure!(ports.is_array(), "ingress ports must be an array");
-                kube.patch(
-                    "kourier-system",
-                    "service",
-                    "kourier",
-                    &json!({ "spec": { "ports": ports } }),
-                )?;
-            } else {
-                kube.wait("public ingress address", Duration::from_secs(600), || {
-                    let service: Value = kube.get("kourier-system", "service", "kourier")?;
-                    Ok(service
-                        .pointer("/status/loadBalancer/ingress")
-                        .and_then(Value::as_array)
-                        .filter(|addresses| !addresses.is_empty())
-                        .map(|_| ()))
-                })?;
+            configure_ingress_service(kube, options)?;
+            if options.ingress_ports.is_none() {
+                let expected = options
+                    .ingress
+                    .service
+                    .as_ref()
+                    .map(|service| service.public_ip_address.as_str());
+                wait_ingress_address(kube, expected, Duration::from_secs(600))?;
             }
-            tls(kube, options.domain)?;
+            if options.ingress.service.is_some() {
+                wait_dns(
+                    kube,
+                    options.domain,
+                    options
+                        .ingress
+                        .service
+                        .as_ref()
+                        .unwrap()
+                        .public_ip_address
+                        .parse()?,
+                    options.https_port,
+                    Duration::from_secs(600),
+                )?;
+            }
+            let (secret_namespace, secret_name) = configure_ingress_tls(kube, options, inventory)?;
             kube.patch(
                 "knative-serving",
                 "configmap",
                 "config-kourier",
                 &json!({ "data": {
-            "certs-secret-name": "lampyr-kourier-tls", "certs-secret-namespace": "kourier-system"
-        } }),
+                    "certs-secret-name": secret_name, "certs-secret-namespace": secret_namespace
+                } }),
             )?;
             kube.patch(
                 "knative-serving",
@@ -719,7 +735,27 @@ fn install_platform(
                         { "op": "replace", "path": "/data", "value": { options.domain: "" } }
                     ]))?,
                 ],
-            )
+            )?;
+            if !matches!(
+                &options.ingress.tls,
+                crate::platform_host::IngressTls::SelfSigned
+            ) {
+                let tls = wait_tls_secret(
+                    kube,
+                    &secret_namespace,
+                    &secret_name,
+                    options.domain,
+                    Duration::from_secs(30),
+                )?;
+                wait_tls_endpoint(
+                    kube,
+                    options.domain,
+                    options.https_port,
+                    tls,
+                    Duration::from_secs(120),
+                )?;
+            }
+            Ok(())
         })?;
     kube.host.step("Making KVM available to Grant homes", || {
         apply_recorded_source(
@@ -783,22 +819,78 @@ fn install_platform(
         )?;
         Ok(())
     })?;
+    let (tls_mode, secret_namespace, secret_name, issuer, credential) =
+        ingress_metadata(options.ingress)?;
+    let dns_address = options
+        .ingress
+        .service
+        .as_ref()
+        .map(|service| Value::String(service.public_ip_address.clone()))
+        .unwrap_or(Value::Null);
     kube.patch("kube-system", "configmap", "lampyr-install", &json!({ "data": {
         "version": env!("CARGO_PKG_VERSION"), "domain": options.domain, "httpsPort": options.https_port.to_string(),
         "fiberdImage": options.fiberd_image, "routerImage": options.router_image,
         "grantImage": options.grant_image, "helperImage": options.helper_image,
-        "templateRepository": options.template_repository
+        "templateRepository": options.template_repository,
+        "ingressTlsMode": tls_mode, "ingressTlsSecretNamespace": secret_namespace,
+        "ingressTlsSecretName": secret_name, "ingressTlsIssuer": issuer,
+        "ingressDnsAddress": dns_address, "ingressCredential": credential,
+        "ingressRetiringCredential": Value::Null,
+        "ingressServiceAnnotations": serde_json::to_string(
+            &options.ingress.service.as_ref()
+                .map(|service| service.annotations.clone())
+                .unwrap_or_default()
+        )?
     } }))?;
     Ok(())
 }
 
-/// Installs fiberd-k8s-controller and makes namespace default its tenant:
-/// cert-manager and its csi-driver unless the cluster has them, the
-/// controller, the GrantPolicy that admits Lampyr's grant Pods, and the
-/// tenant objects the controller's config/tenant would add but its author
-/// RoleBinding: Lampyr's serving controller writes every CapacityGrant in
-/// default under its own ClusterRole, so no group of people needs to.
-fn install_controller(
+fn configure_ingress_service(kube: &Kube<'_>, options: &Options<'_>) -> Result<()> {
+    if let Some(ports) = &options.ingress_ports {
+        ensure!(ports.is_array(), "ingress ports must be an array");
+        kube.patch(
+            "kourier-system",
+            "service",
+            "kourier",
+            &json!({ "spec": { "ports": ports } }),
+        )?;
+    }
+    let service = options.ingress.service.as_ref();
+    let previous_annotations: BTreeMap<String, String> = kube
+        .optional("kube-system", "configmap", "lampyr-install")?
+        .and_then(|install| {
+            install["data"]["ingressServiceAnnotations"]
+                .as_str()
+                .map(str::to_owned)
+        })
+        .map(|value| serde_json::from_str(&value))
+        .transpose()
+        .context("decode installed ingress Service annotations")?
+        .unwrap_or_default();
+    let mut annotations = serde_json::Map::new();
+    for key in previous_annotations.keys() {
+        annotations.insert(key.clone(), Value::Null);
+    }
+    if let Some(service) = service {
+        for (key, value) in &service.annotations {
+            annotations.insert(key.clone(), value.clone().into());
+        }
+    }
+    kube.patch(
+        "kourier-system",
+        "service",
+        "kourier",
+        &json!({
+            "metadata": { "annotations": annotations },
+            "spec": { "loadBalancerIP":
+                service.map(|value| Value::String(value.public_ip_address.clone())).unwrap_or(Value::Null)
+            }
+        }),
+    )?;
+    Ok(())
+}
+
+fn install_cert_manager(
     kube: &Kube<'_>,
     options: &Options<'_>,
     inventory: &mut Vec<Value>,
@@ -864,6 +956,19 @@ fn install_controller(
             "180s",
         )?;
     }
+    Ok(())
+}
+
+/// Installs fiberd-k8s-controller and makes namespace default its tenant:
+/// the controller, the GrantPolicy that admits Lampyr's grant Pods, and the
+/// tenant objects the controller's config/tenant would add but its author
+/// RoleBinding: Lampyr's serving controller writes every CapacityGrant in
+/// default under its own ClusterRole, so no group of people needs to.
+fn install_controller(
+    kube: &Kube<'_>,
+    options: &Options<'_>,
+    inventory: &mut Vec<Value>,
+) -> Result<()> {
     // cert-manager reports Available before its webhook admits the
     // controller's CA Certificate.
     kube.wait(
@@ -1018,16 +1123,1145 @@ pub(crate) fn find_container<'a>(
         })
 }
 
-fn tls(kube: &Kube<'_>, domain: &str) -> Result<()> {
-    crate::platform_host::validate_domain(domain)?;
-    if let Some(secret) = kube.optional("kourier-system", "secret", "lampyr-kourier-tls")?
-        && secret
+fn wait_ingress_address(kube: &Kube<'_>, expected: Option<&str>, timeout: Duration) -> Result<()> {
+    kube.wait("public ingress address", timeout, || {
+        let service: Value = kube.get("kourier-system", "service", "kourier")?;
+        let addresses = service
+            .pointer("/status/loadBalancer/ingress")
+            .and_then(Value::as_array);
+        Ok(addresses.and_then(|addresses| {
+            addresses
+                .iter()
+                .any(|address| {
+                    expected.map_or_else(
+                        || {
+                            address["ip"].as_str().is_some()
+                                || address["hostname"].as_str().is_some()
+                        },
+                        |expected| address["ip"] == expected,
+                    )
+                })
+                .then_some(())
+        }))
+    })
+}
+
+struct AddressResolver {
+    request: mpsc::SyncSender<u64>,
+    result: mpsc::Receiver<(u64, std::io::Result<Vec<SocketAddr>>)>,
+    next: u64,
+    pending: Option<u64>,
+}
+
+impl AddressResolver {
+    fn new(hostname: &str, port: u16) -> Self {
+        let hostname = hostname.to_owned();
+        let (request, requests) = mpsc::sync_channel(1);
+        let (results, result) = mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            while let Ok(sequence) = requests.recv() {
+                let addresses = (hostname.as_str(), port)
+                    .to_socket_addrs()
+                    .map(|addresses| addresses.collect());
+                if results.send((sequence, addresses)).is_err() {
+                    break;
+                }
+            }
+        });
+        Self {
+            request,
+            result,
+            next: 0,
+            pending: None,
+        }
+    }
+
+    fn resolve(&mut self, timeout: Duration) -> Result<Option<Vec<SocketAddr>>> {
+        let sequence = if let Some(sequence) = self.pending {
+            sequence
+        } else {
+            self.next = self.next.wrapping_add(1);
+            let sequence = self.next;
+            match self.request.try_send(sequence) {
+                Ok(()) => self.pending = Some(sequence),
+                Err(mpsc::TrySendError::Disconnected(_)) => {
+                    anyhow::bail!("DNS resolver stopped")
+                }
+                Err(mpsc::TrySendError::Full(_)) => {
+                    anyhow::bail!("DNS resolver request state is inconsistent")
+                }
+            }
+            sequence
+        };
+        let deadline = Instant::now() + timeout;
+        loop {
+            match self
+                .result
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            {
+                Ok((received, result)) if received == sequence => {
+                    self.pending = None;
+                    return Ok(result.ok());
+                }
+                Ok(_) => {}
+                Err(mpsc::RecvTimeoutError::Timeout) => return Ok(None),
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    anyhow::bail!("DNS resolver stopped")
+                }
+            }
+        }
+    }
+}
+
+fn wait_dns(
+    kube: &Kube<'_>,
+    domain: &str,
+    expected: IpAddr,
+    port: u16,
+    timeout: Duration,
+) -> Result<()> {
+    let hostname = format!("lampyr-readiness.default.{domain}");
+    let mut resolver = AddressResolver::new(&hostname, port);
+    kube.wait(
+        &format!("DNS {hostname}:{port} resolving to {expected}"),
+        timeout,
+        || {
+            let addresses = match resolver.resolve(kube.timeout(Duration::from_secs(2))?)? {
+                Some(addresses) => addresses,
+                None => return Ok(None),
+            };
+            Ok(addresses
+                .iter()
+                .any(|address| address.ip() == expected)
+                .then_some(()))
+        },
+    )
+}
+
+fn ingress_metadata(
+    ingress: &crate::platform_host::IngressSettings,
+) -> Result<(String, String, String, Value, Value)> {
+    use crate::platform_host::IngressTls;
+    Ok(match &ingress.tls {
+        IngressTls::SelfSigned => (
+            "selfSigned".into(),
+            "kourier-system".into(),
+            "lampyr-kourier-tls".into(),
+            Value::Null,
+            Value::Null,
+        ),
+        IngressTls::ExistingSecret {
+            secret_name,
+            secret_namespace,
+        } => (
+            "existingSecret".into(),
+            secret_namespace.clone(),
+            secret_name.clone(),
+            Value::Null,
+            Value::Null,
+        ),
+        IngressTls::Acme {
+            issuer, credential, ..
+        } => (
+            "acme".into(),
+            "kourier-system".into(),
+            "lampyr-kourier-tls".into(),
+            Value::String(issuer.clone()),
+            Value::String(serde_json::to_string(credential)?),
+        ),
+    })
+}
+
+fn configure_ingress_tls(
+    kube: &Kube<'_>,
+    options: &Options<'_>,
+    inventory: &mut Vec<Value>,
+) -> Result<(String, String)> {
+    use crate::platform_host::IngressTls;
+    let installed_credentials = installed_cert_manager_credentials(kube)?;
+    match &options.ingress.tls {
+        IngressTls::SelfSigned => {
+            let previous_credentials = installed_credentials.previous_for(None);
+            persist_cert_manager_credentials(kube, None, &previous_credentials)?;
+            remove_acme_resources(kube, options.installation_id, inventory)?;
+            configure_cert_manager_credential(kube, inventory, None, &previous_credentials)?;
+            remove_retired_credential_boundaries(
+                kube,
+                options.installation_id,
+                &previous_credentials,
+                None,
+                inventory,
+            )?;
+            persist_cert_manager_credentials(kube, None, &[])?;
+            self_signed_tls(kube, options.domain, options.installation_id)?;
+            Ok(("kourier-system".into(), "lampyr-kourier-tls".into()))
+        }
+        IngressTls::ExistingSecret {
+            secret_name,
+            secret_namespace,
+        } => {
+            wait_tls_secret(
+                kube,
+                secret_namespace,
+                secret_name,
+                options.domain,
+                Duration::from_secs(120),
+            )?;
+            let previous_credentials = installed_credentials.previous_for(None);
+            persist_cert_manager_credentials(kube, None, &previous_credentials)?;
+            remove_acme_resources(kube, options.installation_id, inventory)?;
+            configure_cert_manager_credential(kube, inventory, None, &previous_credentials)?;
+            remove_retired_credential_boundaries(
+                kube,
+                options.installation_id,
+                &previous_credentials,
+                None,
+                inventory,
+            )?;
+            persist_cert_manager_credentials(kube, None, &[])?;
+            Ok((secret_namespace.clone(), secret_name.clone()))
+        }
+        IngressTls::Acme {
+            email,
+            issuer,
+            solver,
+            credential,
+        } => {
+            ensure!(
+                cert_manager_owned(inventory),
+                "ACME ingress requires the cert-manager installation managed by Lampyr"
+            );
+            let previous_credentials =
+                installed_credentials.previous_for(Some(credential.as_ref()));
+            persist_cert_manager_credentials(
+                kube,
+                Some(credential.as_ref()),
+                &previous_credentials,
+            )?;
+            configure_credential_boundary(kube, options.installation_id, credential, inventory)?;
+            wait_credential_boundary(kube, credential)?;
+            if let Err(error) = ensure_no_external_credential_resources(kube, credential) {
+                let active_credentials = installed_credentials.previous_for(None);
+                configure_cert_manager_credential(kube, inventory, None, &active_credentials)
+                    .context("disable cert-manager identity after unsafe Issuer discovery")?;
+                return Err(error);
+            }
+            configure_cert_manager_credential(
+                kube,
+                inventory,
+                Some(credential),
+                &previous_credentials,
+            )?;
+            remove_retired_credential_boundaries(
+                kube,
+                options.installation_id,
+                &previous_credentials,
+                Some(credential),
+                inventory,
+            )?;
+            persist_cert_manager_credentials(kube, Some(credential.as_ref()), &[])?;
+            let issuer_manifest = json!({
+                "apiVersion":"cert-manager.io/v1", "kind":"Issuer",
+                "metadata":{"name":issuer,"namespace":"kourier-system","annotations":{
+                    "lampyr.dev/installation-id":options.installation_id
+                }},
+                "spec":{"acme":{
+                    "email":email,
+                    "server":"https://acme-v02.api.letsencrypt.org/directory",
+                    "privateKeySecretRef":{"name":"lampyr-acme-account"},
+                    "solvers":[solver]
+                }}
+            });
+            ensure_owned_tls_resource(
+                kube,
+                Some("kourier-system"),
+                "issuer",
+                issuer,
+                options.installation_id,
+            )?;
+            apply_cert_manager_manifest(
+                kube,
+                options.installation_id,
+                "ACME Issuer admission",
+                &issuer_manifest,
+                inventory,
+            )?;
+            wait_ready_resource(
+                kube,
+                "kourier-system",
+                "issuer",
+                issuer,
+                "ACME issuer",
+                Duration::from_secs(300),
+            )?;
+            ensure_owned_tls_secret(kube, options.installation_id)?;
+            let certificate = json!({
+                "apiVersion":"cert-manager.io/v1", "kind":"Certificate",
+                "metadata":{"name":"lampyr-kourier-tls","namespace":"kourier-system",
+                    "annotations":{"lampyr.dev/installation-id":options.installation_id}},
+                "spec":{
+                    "secretName":"lampyr-kourier-tls",
+                    "secretTemplate":{"annotations":{
+                        "lampyr.dev/installation-id":options.installation_id,
+                        "lampyr.dev/domain":options.domain,
+                        "lampyr.dev/tls-mode":"acme"
+                    }},
+                    "dnsNames":[format!("*.{}",options.domain),format!("*.default.{}",options.domain)],
+                    "issuerRef":{"group":"cert-manager.io","kind":"Issuer","name":issuer}
+                }
+            });
+            ensure_owned_tls_resource(
+                kube,
+                Some("kourier-system"),
+                "certificate",
+                "lampyr-kourier-tls",
+                options.installation_id,
+            )?;
+            apply_cert_manager_manifest(
+                kube,
+                options.installation_id,
+                "ingress Certificate admission",
+                &certificate,
+                inventory,
+            )?;
+            wait_ready_resource(
+                kube,
+                "kourier-system",
+                "certificate",
+                "lampyr-kourier-tls",
+                "ingress Certificate",
+                Duration::from_secs(900),
+            )?;
+            wait_tls_secret(
+                kube,
+                "kourier-system",
+                "lampyr-kourier-tls",
+                options.domain,
+                Duration::from_secs(30),
+            )?;
+            remove_retired_issuers(kube, options.installation_id, issuer, inventory)?;
+            Ok(("kourier-system".into(), "lampyr-kourier-tls".into()))
+        }
+    }
+}
+
+fn cert_manager_owned(inventory: &[Value]) -> bool {
+    inventory.iter().any(|item| {
+        item["apiVersion"] == "apps/v1"
+            && item["kind"] == "Deployment"
+            && item["metadata"]["namespace"] == "cert-manager"
+            && item["metadata"]["name"] == "cert-manager"
+    })
+}
+
+#[derive(Default)]
+struct InstalledCertManagerCredentials {
+    current: Option<crate::platform_host::CertManagerCredential>,
+    retiring: Vec<crate::platform_host::CertManagerCredential>,
+}
+
+impl InstalledCertManagerCredentials {
+    fn previous_for(
+        &self,
+        current: Option<&crate::platform_host::CertManagerCredential>,
+    ) -> Vec<crate::platform_host::CertManagerCredential> {
+        let mut previous = Vec::new();
+        for credential in self.current.iter().chain(&self.retiring) {
+            if current.is_some_and(|current| current == credential)
+                || previous.iter().any(|existing| existing == credential)
+            {
+                continue;
+            }
+            previous.push(credential.clone());
+        }
+        previous
+    }
+}
+
+fn persist_cert_manager_credentials(
+    kube: &Kube<'_>,
+    current: Option<&crate::platform_host::CertManagerCredential>,
+    retiring: &[crate::platform_host::CertManagerCredential],
+) -> Result<()> {
+    kube.patch(
+        "kube-system",
+        "configmap",
+        "lampyr-install",
+        &cert_manager_credential_state_patch(current, retiring)?,
+    )
+}
+
+fn cert_manager_credential_state_patch(
+    current: Option<&crate::platform_host::CertManagerCredential>,
+    retiring: &[crate::platform_host::CertManagerCredential],
+) -> Result<Value> {
+    let current = current
+        .map(serde_json::to_string)
+        .transpose()?
+        .map(Value::String)
+        .unwrap_or(Value::Null);
+    let retiring = if retiring.is_empty() {
+        Value::Null
+    } else {
+        Value::String(serde_json::to_string(retiring)?)
+    };
+    Ok(json!({"data":{
+        "ingressCredential":current,
+        "ingressRetiringCredential":retiring
+    }}))
+}
+
+fn apply_cert_manager_manifest(
+    kube: &Kube<'_>,
+    installation_id: &str,
+    label: &str,
+    manifest: &Value,
+    inventory: &mut Vec<Value>,
+) -> Result<()> {
+    let mut last_retryable = None;
+    let result = kube.wait(
+        label,
+        Duration::from_secs(120),
+        || match apply_recorded_manifest(kube, installation_id, manifest, inventory) {
+            Ok(()) => Ok(Some(())),
+            Err(error) if cert_manager_webhook_is_starting(&error) => {
+                last_retryable = Some(format!("{error:#}"));
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        },
+    );
+    match (result, last_retryable) {
+        (Err(error), Some(last)) => {
+            Err(error).context(format!("last retryable admission error: {last}"))
+        }
+        (result, _) => result,
+    }
+}
+
+fn installed_cert_manager_credentials(kube: &Kube<'_>) -> Result<InstalledCertManagerCredentials> {
+    let Some(install) = kube.optional("kube-system", "configmap", "lampyr-install")? else {
+        return Ok(InstalledCertManagerCredentials::default());
+    };
+    decode_installed_cert_manager_credentials(&install)
+}
+
+fn decode_installed_cert_manager_credentials(
+    install: &Value,
+) -> Result<InstalledCertManagerCredentials> {
+    let current = install["data"]["ingressCredential"]
+        .as_str()
+        .map(serde_json::from_str)
+        .transpose()
+        .context("decode installed cert-manager credential configuration")?;
+    let retiring = install["data"]["ingressRetiringCredential"]
+        .as_str()
+        .map(serde_json::from_str)
+        .transpose()
+        .context("decode retiring cert-manager credential configurations")?
+        .unwrap_or_default();
+    Ok(InstalledCertManagerCredentials { current, retiring })
+}
+
+pub(crate) fn installed_cert_manager_credential_mutations(kube: &Kube<'_>) -> Result<Vec<Value>> {
+    installed_cert_manager_credentials(kube)?
+        .previous_for(None)
+        .iter()
+        .map(serde_json::to_value)
+        .collect::<std::result::Result<_, _>>()
+        .context("encode installed cert-manager credential mutations")
+}
+
+fn cert_manager_controller_args(
+    deployment: &Value,
+    current: Option<&crate::platform_host::CertManagerCredential>,
+    previous: &[crate::platform_host::CertManagerCredential],
+) -> Result<Vec<Value>> {
+    let container = deployment
+        .pointer("/spec/template/spec/containers")
+        .and_then(Value::as_array)
+        .and_then(|containers| {
+            containers
+                .iter()
+                .find(|container| container["name"] == "cert-manager-controller")
+        })
+        .context("cert-manager Deployment has no cert-manager-controller container")?;
+    let mut args = container["args"]
+        .as_array()
+        .context("cert-manager controller args must be an array")?
+        .clone();
+    let prefixes: BTreeSet<_> = current
+        .into_iter()
+        .chain(previous.iter())
+        .flat_map(|credential| credential.controller_arg_prefixes.iter())
+        .collect();
+    args.retain(|arg| {
+        arg.as_str()
+            .is_none_or(|arg| !prefixes.iter().any(|prefix| arg.starts_with(*prefix)))
+    });
+    if let Some(current) = current {
+        for argument in &current.controller_args {
+            if !args.iter().any(|existing| existing == argument) {
+                args.push(argument.clone().into());
+            }
+        }
+    }
+    Ok(args)
+}
+
+fn merge_json(target: &mut Value, patch: &Value) {
+    if let (Some(target), Some(patch)) = (target.as_object_mut(), patch.as_object()) {
+        for (key, value) in patch {
+            merge_json(target.entry(key.clone()).or_insert(Value::Null), value);
+        }
+    } else {
+        *target = patch.clone();
+    }
+}
+
+fn cert_manager_credential_patch(
+    deployment: &Value,
+    current: Option<&crate::platform_host::CertManagerCredential>,
+    previous: &[crate::platform_host::CertManagerCredential],
+) -> Result<Value> {
+    let mut patch = json!({});
+    for credential in previous {
+        merge_json(&mut patch, &credential.deployment_cleanup_patch);
+    }
+    if let Some(current) = current {
+        merge_json(&mut patch, &current.deployment_patch);
+    }
+    merge_json(
+        &mut patch,
+        &json!({"spec":{"template":{"spec":{"containers":[{
+            "name":"cert-manager-controller",
+            "args":cert_manager_controller_args(deployment, current, previous)?
+        }]}}}}),
+    );
+    Ok(patch)
+}
+
+fn field_path_exists(value: &Value, path: &[String]) -> bool {
+    let Some((head, tail)) = path.split_first() else {
+        return !value.is_null();
+    };
+    if head == "*" {
+        value
+            .as_array()
+            .is_some_and(|items| items.iter().any(|item| field_path_exists(item, tail)))
+    } else {
+        value
+            .get(head)
+            .is_some_and(|value| field_path_exists(value, tail))
+    }
+}
+
+fn ensure_no_external_credential_resources(
+    kube: &Kube<'_>,
+    credential: &crate::platform_host::CertManagerCredential,
+) -> Result<()> {
+    for audit in &credential.audits {
+        let mut command = kube.command(None)?;
+        command.args([
+            "get",
+            &audit.resource,
+            "--all-namespaces",
+            "--output",
+            "json",
+        ]);
+        let resources: Value = serde_json::from_str(&kube.capture(&mut command)?)
+            .with_context(|| format!("decode cert-manager {}s", audit.kind))?;
+        for item in resources["items"]
+            .as_array()
+            .with_context(|| format!("cert-manager {} list has no items", audit.kind))?
+        {
+            let namespace = item["metadata"]["namespace"].as_str().unwrap_or_default();
+            let issuer_kind_matches = audit.issuer_kind.as_ref().is_none_or(|expected| {
+                item.pointer("/spec/issuerRef/kind")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Issuer")
+                    == expected
+            });
+            if namespace != audit.allowed_namespace
+                && issuer_kind_matches
+                && field_path_exists(item, &audit.field_path)
+            {
+                let name = item["metadata"]["name"].as_str().unwrap_or("<unknown>");
+                anyhow::bail!(
+                    "{} {namespace}/{name} conflicts with the provider credential boundary",
+                    audit.kind
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn configure_credential_boundary(
+    kube: &Kube<'_>,
+    installation_id: &str,
+    credential: &crate::platform_host::CertManagerCredential,
+    inventory: &mut Vec<Value>,
+) -> Result<()> {
+    for item in credential.boundary["items"].as_array().unwrap() {
+        ensure!(
+            item.pointer("/metadata/annotations/lampyr.dev~1installation-id")
+                .and_then(Value::as_str)
+                == Some(installation_id)
+                && item
+                    .pointer("/metadata/annotations/lampyr.dev~1credential-boundary")
+                    .and_then(Value::as_str)
+                    == Some("true"),
+            "credential boundary resources must carry Lampyr ownership annotations"
+        );
+        let kind = item["kind"]
+            .as_str()
+            .context("credential boundary kind is missing")?
+            .to_ascii_lowercase();
+        let name = item["metadata"]["name"]
+            .as_str()
+            .context("credential boundary name is missing")?;
+        let namespace = item["metadata"]["namespace"].as_str();
+        ensure_owned_tls_resource(kube, namespace, &kind, name, installation_id)?;
+    }
+    apply_recorded_manifest(kube, installation_id, &credential.boundary, inventory)
+}
+
+fn wait_credential_boundary(
+    kube: &Kube<'_>,
+    credential: &crate::platform_host::CertManagerCredential,
+) -> Result<()> {
+    for resource in &credential.probes {
+        let kind = resource["kind"].as_str().unwrap_or("resource");
+        let mut probe = tempfile::NamedTempFile::new()?;
+        serde_json::to_writer(&mut probe, resource)?;
+        let path = probe
+            .path()
+            .to_str()
+            .context("credential boundary probe path must be UTF-8")?;
+        kube.wait(
+            &format!("{kind} credential admission boundary"),
+            Duration::from_secs(30),
+            || {
+                let mut command = kube.command(None)?;
+                command.args(["create", "--dry-run=server", "--filename", path]);
+                match kube.capture(&mut command) {
+                    Ok(_) => Ok(None),
+                    Err(error) if format!("{error:#}").contains(&credential.boundary_message) => {
+                        Ok(Some(()))
+                    }
+                    Err(error) => Err(error),
+                }
+            },
+        )?;
+    }
+    Ok(())
+}
+
+fn configure_cert_manager_credential(
+    kube: &Kube<'_>,
+    inventory: &[Value],
+    current: Option<&crate::platform_host::CertManagerCredential>,
+    previous: &[crate::platform_host::CertManagerCredential],
+) -> Result<()> {
+    if current.is_some() {
+        ensure!(
+            cert_manager_owned(inventory),
+            "managed ACME ingress requires the cert-manager installation managed by Lampyr"
+        );
+    }
+    if current.is_some() || !previous.is_empty() {
+        let mut service_account_patch = json!({});
+        for credential in previous {
+            merge_json(
+                &mut service_account_patch,
+                &credential.service_account_cleanup_patch,
+            );
+        }
+        if let Some(current) = current {
+            merge_json(&mut service_account_patch, &current.service_account_patch);
+        }
+        kube.patch(
+            "cert-manager",
+            "serviceaccount",
+            "cert-manager",
+            &service_account_patch,
+        )?;
+        let deployment: Value = kube.get("cert-manager", "deployment", "cert-manager")?;
+        run(
+            kube,
+            Some("cert-manager"),
+            &[
+                "patch",
+                "deployment",
+                "cert-manager",
+                "--type",
+                "strategic",
+                "--patch",
+                &serde_json::to_string(&cert_manager_credential_patch(
+                    &deployment,
+                    current,
+                    previous,
+                )?)?,
+            ],
+        )?;
+        rollout(kube, "cert-manager", "deployment", "cert-manager", "300s")?;
+    }
+    Ok(())
+}
+
+fn ensure_owned_tls_resource(
+    kube: &Kube<'_>,
+    namespace: Option<&str>,
+    kind: &str,
+    name: &str,
+    installation_id: &str,
+) -> Result<()> {
+    if let Some(resource) = kube.optional(namespace.unwrap_or("default"), kind, name)? {
+        ensure!(
+            resource
+                .pointer("/metadata/annotations/lampyr.dev~1installation-id")
+                .and_then(Value::as_str)
+                == Some(installation_id),
+            "{kind}/{name} is not owned by this Lampyr installation"
+        );
+    }
+    Ok(())
+}
+
+fn ensure_owned_tls_secret(kube: &Kube<'_>, installation_id: &str) -> Result<()> {
+    if let Some(secret) = kube.optional("kourier-system", "secret", "lampyr-kourier-tls")? {
+        let owner = secret
+            .pointer("/metadata/annotations/lampyr.dev~1installation-id")
+            .and_then(Value::as_str);
+        let legacy = secret
             .pointer("/metadata/annotations/lampyr.dev~1domain")
             .and_then(Value::as_str)
-            == Some(domain)
+            .is_some();
+        ensure!(
+            owner == Some(installation_id) || (owner.is_none() && legacy),
+            "secret/lampyr-kourier-tls is not owned by this Lampyr installation"
+        );
+    }
+    Ok(())
+}
+
+fn wait_ready_resource(
+    kube: &Kube<'_>,
+    namespace: &str,
+    kind: &str,
+    name: &str,
+    description: &str,
+    timeout: Duration,
+) -> Result<()> {
+    kube.wait(description, timeout, || {
+        let Some(resource) = kube.optional(namespace, kind, name)? else {
+            return Ok(None);
+        };
+        let generation = resource["metadata"]["generation"].as_i64();
+        let ready = resource["status"]["conditions"]
+            .as_array()
+            .is_some_and(|conditions| {
+                conditions.iter().any(|condition| {
+                    condition["type"] == "Ready"
+                        && condition["status"] == "True"
+                        && generation.is_none_or(|generation| {
+                            condition["observedGeneration"]
+                                .as_i64()
+                                .is_none_or(|observed| observed == generation)
+                        })
+                })
+            });
+        Ok(ready.then_some(()))
+    })
+}
+
+fn wait_tls_secret(
+    kube: &Kube<'_>,
+    namespace: &str,
+    name: &str,
+    domain: &str,
+    timeout: Duration,
+) -> Result<ValidatedTls> {
+    kube.wait("ingress TLS Secret", timeout, || {
+        let Some(secret) = kube.optional(namespace, "secret", name)? else {
+            return Ok(None);
+        };
+        if secret["type"] != "kubernetes.io/tls" {
+            return Ok(None);
+        }
+        validate_tls_secret(&secret, domain).map(Some)
+    })
+}
+
+fn wait_self_signed_tls_secret(
+    kube: &Kube<'_>,
+    namespace: &str,
+    name: &str,
+    domain: &str,
+    timeout: Duration,
+) -> Result<()> {
+    kube.wait("self-signed ingress TLS Secret", timeout, || {
+        let Some(secret) = kube.optional(namespace, "secret", name)? else {
+            return Ok(None);
+        };
+        if secret["type"] != "kubernetes.io/tls" {
+            return Ok(None);
+        }
+        validate_self_signed_tls_secret(&secret, domain).map(|()| Some(()))
+    })
+}
+
+#[derive(Debug)]
+struct ValidatedTls {
+    roots: rustls::RootCertStore,
+}
+
+fn tls_secret_certificates(secret: &Value) -> Result<Vec<CertificateDer<'static>>> {
+    let certificate = secret["data"]["tls.crt"]
+        .as_str()
+        .context("ingress TLS Secret has no tls.crt")?;
+    let key = secret["data"]["tls.key"]
+        .as_str()
+        .context("ingress TLS Secret has no tls.key")?;
+    let certificate = STANDARD
+        .decode(certificate)
+        .context("decode ingress TLS certificate")?;
+    let key = STANDARD.decode(key).context("decode ingress TLS key")?;
+    let certificates: Vec<_> = CertificateDer::pem_slice_iter(&certificate)
+        .collect::<std::result::Result<_, _>>()
+        .context("parse ingress TLS certificate chain")?;
+    ensure!(
+        !certificates.is_empty(),
+        "ingress TLS certificate chain is empty"
+    );
+    let private_key =
+        PrivateKeyDer::from_pem_slice(&key).context("parse ingress TLS private key")?;
+    rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certificates.clone(), private_key)
+        .context("ingress TLS certificate does not match its private key")?;
+    Ok(certificates)
+}
+
+fn add_secret_tls_roots(secret: &Value, roots: &mut rustls::RootCertStore) -> Result<()> {
+    if let Some(bundle) = secret["data"]["ca.crt"].as_str() {
+        let bundle = STANDARD
+            .decode(bundle)
+            .context("decode ingress TLS CA bundle")?;
+        if bundle.is_empty() {
+            return Ok(());
+        }
+        let certificates: Vec<_> = CertificateDer::pem_slice_iter(&bundle)
+            .collect::<std::result::Result<_, _>>()
+            .context("parse ingress TLS CA bundle")?;
+        ensure!(
+            !certificates.is_empty(),
+            "ingress TLS CA bundle has no certificates"
+        );
+        for certificate in certificates {
+            roots
+                .add(certificate)
+                .context("add ingress TLS CA trust anchor")?;
+        }
+    }
+    Ok(())
+}
+
+fn verify_tls_hostnames(
+    certificates: &[CertificateDer<'static>],
+    roots: rustls::RootCertStore,
+    domain: &str,
+    intermediates: &[CertificateDer<'static>],
+) -> Result<rustls::RootCertStore> {
+    let verifier = rustls::client::WebPkiServerVerifier::builder(Arc::new(roots.clone()))
+        .build()
+        .context("build ingress TLS certificate verifier")?;
+    use rustls::client::danger::ServerCertVerifier as _;
+    let mut hostnames = vec![format!("lampyr-readiness.default.{domain}")];
+    // WebPKI deliberately rejects a wildcard directly below a single-label
+    // name such as *.localhost. Multi-label production domains still require
+    // both wildcard levels.
+    if domain.contains('.') {
+        hostnames.insert(0, format!("lampyr-readiness.{domain}"));
+    }
+    for hostname in hostnames {
+        verifier
+            .verify_server_cert(
+                &certificates[0],
+                intermediates,
+                &ServerName::try_from(hostname.clone())?.to_owned(),
+                &[],
+                rustls::pki_types::UnixTime::now(),
+            )
+            .with_context(|| {
+                format!(
+                    "ingress TLS certificate is expired, untrusted, or does not cover {hostname}"
+                )
+            })?;
+    }
+    Ok(roots)
+}
+
+fn validate_tls_secret(secret: &Value, domain: &str) -> Result<ValidatedTls> {
+    let mut roots = rustls::RootCertStore::empty();
+    let native = rustls_native_certs::load_native_certs();
+    let (_, ignored) = roots.add_parsable_certificates(native.certs);
+    let system_empty = roots.is_empty();
+    match validate_tls_secret_with_roots(secret, domain, roots) {
+        Err(error) if system_empty && error.to_string().contains("TLS trust store is empty") => {
+            Err(error).context(format!(
+                "{ignored} system certificates were ignored while loading native roots: {:?}",
+                native.errors
+            ))
+        }
+        result => result,
+    }
+}
+
+fn validate_tls_secret_with_roots(
+    secret: &Value,
+    domain: &str,
+    mut roots: rustls::RootCertStore,
+) -> Result<ValidatedTls> {
+    add_secret_tls_roots(secret, &mut roots)?;
+    ensure!(
+        !roots.is_empty(),
+        "TLS trust store is empty and the Secret has no non-empty ca.crt bundle"
+    );
+    let certificates = tls_secret_certificates(secret)?;
+    let roots = verify_tls_hostnames(&certificates, roots, domain, &certificates[1..])?;
+    Ok(ValidatedTls { roots })
+}
+
+fn validate_self_signed_tls_secret(secret: &Value, domain: &str) -> Result<()> {
+    let certificates = tls_secret_certificates(secret)?;
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(certificates.last().unwrap().clone())
+        .context("ingress TLS chain has no usable trust anchor")?;
+    let intermediates = if certificates.len() > 1 {
+        &certificates[1..certificates.len() - 1]
+    } else {
+        &[]
+    };
+    verify_tls_hostnames(&certificates, roots, domain, intermediates)?;
+    Ok(())
+}
+
+fn wait_tls_endpoint(
+    kube: &Kube<'_>,
+    domain: &str,
+    port: u16,
+    tls: ValidatedTls,
+    timeout: Duration,
+) -> Result<()> {
+    let hostname = format!("lampyr-readiness.default.{domain}");
+    let server_name = ServerName::try_from(hostname.clone())?.to_owned();
+    let config = Arc::new(
+        rustls::ClientConfig::builder()
+            .with_root_certificates(tls.roots)
+            .with_no_client_auth(),
+    );
+    let mut resolver = AddressResolver::new(&hostname, port);
+    kube.wait(
+        &format!("trusted TLS at {hostname}:{port}"),
+        timeout,
+        || {
+            let addresses = match resolver.resolve(kube.timeout(Duration::from_secs(2))?)? {
+                Some(addresses) => addresses,
+                None => return Ok(None),
+            };
+            for address in addresses {
+                let connect_timeout = kube.timeout(Duration::from_secs(5))?;
+                if let Ok(mut socket) =
+                    std::net::TcpStream::connect_timeout(&address, connect_timeout)
+                {
+                    let io_timeout = kube.timeout(Duration::from_secs(10))?;
+                    socket.set_read_timeout(Some(io_timeout))?;
+                    socket.set_write_timeout(Some(io_timeout))?;
+                    let mut connection =
+                        rustls::ClientConnection::new(config.clone(), server_name.clone())?;
+                    if connection.complete_io(&mut socket).is_ok() {
+                        return Ok(Some(()));
+                    }
+                }
+            }
+            Ok(None)
+        },
+    )
+}
+
+fn remove_acme_resources(
+    kube: &Kube<'_>,
+    installation_id: &str,
+    inventory: &mut Vec<Value>,
+) -> Result<()> {
+    let resources: Vec<_> = inventory
+        .iter()
+        .filter(|item| {
+            item["apiVersion"] == "cert-manager.io/v1"
+                && item["metadata"]["namespace"] == "kourier-system"
+                && matches!(item["kind"].as_str(), Some("Certificate" | "Issuer"))
+        })
+        .cloned()
+        .collect();
+    for resource in &resources {
+        let kind = resource["kind"].as_str().unwrap();
+        let name = resource["metadata"]["name"].as_str().unwrap();
+        let namespace = resource["metadata"]["namespace"].as_str();
+        ensure_owned_tls_resource(
+            kube,
+            namespace,
+            &kind.to_ascii_lowercase(),
+            name,
+            installation_id,
+        )?;
+        run(
+            kube,
+            namespace,
+            &[
+                "delete",
+                &kind.to_ascii_lowercase(),
+                name,
+                "--ignore-not-found=true",
+                "--wait=true",
+                "--timeout=120s",
+            ],
+        )?;
+    }
+    inventory.retain(|item| !resources.contains(item));
+    if !resources.is_empty() {
+        persist_core_inventory(kube, installation_id, inventory.clone())?;
+    }
+    Ok(())
+}
+
+fn same_resource_identity(left: &Value, right: &Value) -> bool {
+    left["apiVersion"] == right["apiVersion"]
+        && left["kind"] == right["kind"]
+        && left["metadata"]["name"] == right["metadata"]["name"]
+        && left["metadata"]["namespace"] == right["metadata"]["namespace"]
+}
+
+fn remove_credential_boundary(
+    kube: &Kube<'_>,
+    installation_id: &str,
+    previous: Option<&crate::platform_host::CertManagerCredential>,
+    current: Option<&crate::platform_host::CertManagerCredential>,
+    inventory: &mut Vec<Value>,
+) -> Result<()> {
+    let Some(previous) = previous else {
+        return Ok(());
+    };
+    let boundary = previous.boundary["items"].as_array().unwrap();
+    let current_boundary = current
+        .and_then(|credential| credential.boundary["items"].as_array())
+        .cloned()
+        .unwrap_or_default();
+    let mut resources: Vec<_> = inventory
+        .iter()
+        .filter(|item| {
+            boundary
+                .iter()
+                .any(|resource| same_resource_identity(item, resource))
+                && !current_boundary
+                    .iter()
+                    .any(|resource| same_resource_identity(item, resource))
+        })
+        .cloned()
+        .collect();
+    resources.sort_by_key(|item| usize::from(item["kind"] == "ValidatingAdmissionPolicy"));
+    for resource in &resources {
+        let kind = resource["kind"].as_str().unwrap().to_ascii_lowercase();
+        let name = resource["metadata"]["name"].as_str().unwrap();
+        ensure_owned_tls_resource(kube, None, &kind, name, installation_id)?;
+        run(
+            kube,
+            None,
+            &[
+                "delete",
+                &kind,
+                name,
+                "--ignore-not-found=true",
+                "--wait=true",
+                "--timeout=120s",
+            ],
+        )?;
+    }
+    inventory.retain(|item| !resources.contains(item));
+    if !resources.is_empty() {
+        persist_core_inventory(kube, installation_id, inventory.clone())?;
+    }
+    Ok(())
+}
+
+fn remove_retired_credential_boundaries(
+    kube: &Kube<'_>,
+    installation_id: &str,
+    previous: &[crate::platform_host::CertManagerCredential],
+    current: Option<&crate::platform_host::CertManagerCredential>,
+    inventory: &mut Vec<Value>,
+) -> Result<()> {
+    for credential in previous {
+        remove_credential_boundary(kube, installation_id, Some(credential), current, inventory)?;
+    }
+    Ok(())
+}
+
+fn remove_retired_issuers(
+    kube: &Kube<'_>,
+    installation_id: &str,
+    current: &str,
+    inventory: &mut Vec<Value>,
+) -> Result<()> {
+    let retired: Vec<_> = inventory
+        .iter()
+        .filter(|item| {
+            item["apiVersion"] == "cert-manager.io/v1"
+                && item["kind"] == "Issuer"
+                && item["metadata"]["namespace"] == "kourier-system"
+                && item["metadata"]["name"] != current
+        })
+        .cloned()
+        .collect();
+    for resource in &retired {
+        let name = resource["metadata"]["name"].as_str().unwrap();
+        ensure_owned_tls_resource(
+            kube,
+            Some("kourier-system"),
+            "issuer",
+            name,
+            installation_id,
+        )?;
+        run(
+            kube,
+            Some("kourier-system"),
+            &[
+                "delete",
+                "issuer",
+                name,
+                "--ignore-not-found=true",
+                "--wait=true",
+                "--timeout=120s",
+            ],
+        )?;
+    }
+    inventory.retain(|item| !retired.contains(item));
+    if !retired.is_empty() {
+        persist_core_inventory(kube, installation_id, inventory.clone())?;
+    }
+    Ok(())
+}
+
+fn self_signed_tls(kube: &Kube<'_>, domain: &str, installation_id: &str) -> Result<()> {
+    crate::platform_host::validate_domain(domain)?;
+    if let Some(secret) = kube.optional("kourier-system", "secret", "lampyr-kourier-tls")?
+        && self_signed_secret_is_reusable(&secret, domain, installation_id)
     {
         return Ok(());
     }
+    ensure_owned_tls_secret(kube, installation_id)?;
     let mut parameters =
         rcgen::CertificateParams::new(vec![format!("*.{domain}"), format!("*.default.{domain}")])?;
     parameters
@@ -1043,9 +2277,28 @@ fn tls(kube: &Kube<'_>, domain: &str) -> Result<()> {
     let certificate = parameters.self_signed(&key)?;
     kube.apply(&json!({
         "apiVersion": "v1", "kind": "Secret", "type": "kubernetes.io/tls",
-        "metadata": { "name": "lampyr-kourier-tls", "namespace": "kourier-system", "annotations": { "lampyr.dev/domain": domain } },
+        "metadata": { "name": "lampyr-kourier-tls", "namespace": "kourier-system", "annotations": {
+            "lampyr.dev/domain": domain, "lampyr.dev/installation-id": installation_id,
+            "lampyr.dev/tls-mode":"selfSigned"
+        } },
         "data": { "tls.crt": STANDARD.encode(certificate.pem()), "tls.key": STANDARD.encode(key.serialize_pem()) }
     }))
+}
+
+fn self_signed_secret_is_reusable(secret: &Value, domain: &str, installation_id: &str) -> bool {
+    secret
+        .pointer("/metadata/annotations/lampyr.dev~1domain")
+        .and_then(Value::as_str)
+        == Some(domain)
+        && secret
+            .pointer("/metadata/annotations/lampyr.dev~1installation-id")
+            .and_then(Value::as_str)
+            == Some(installation_id)
+        && secret
+            .pointer("/metadata/annotations/lampyr.dev~1tls-mode")
+            .and_then(Value::as_str)
+            == Some("selfSigned")
+        && validate_self_signed_tls_secret(secret, domain).is_ok()
 }
 
 pub(crate) fn delete_manifest(kube: &Kube<'_>, source: &str) -> Result<Vec<String>> {
@@ -1141,7 +2394,9 @@ fn delete_inventory(kube: &Kube<'_>, items: Vec<Value>) -> Result<Vec<String>> {
             remaining.push((item, is_custom));
         }
     }
-    for (pass, items) in deletion_passes(&remaining).into_iter().enumerate() {
+    let passes = deletion_passes(&remaining);
+    let protects_provider_credential = !passes[3].is_empty();
+    for (pass, items) in passes.into_iter().enumerate() {
         if items.is_empty() {
             continue;
         }
@@ -1182,22 +2437,52 @@ fn delete_inventory(kube: &Kube<'_>, items: Vec<Value>) -> Result<Vec<String>> {
                 Err(error) => Err(error),
             },
         )?;
+        if pass == 2 && protects_provider_credential {
+            wait_cert_manager_identity_gone(kube)?;
+        }
     }
     Ok(namespaces)
+}
+
+fn wait_cert_manager_identity_gone(kube: &Kube<'_>) -> Result<()> {
+    kube.wait(
+        "cert-manager workload identity removal",
+        Duration::from_secs(180),
+        || {
+            if kube
+                .optional("default", "namespace", "cert-manager")?
+                .is_none()
+            {
+                return Ok(Some(()));
+            }
+            let deployment = kube.optional("cert-manager", "deployment", "cert-manager")?;
+            let pods: Vec<Value> = kube.list(
+                "cert-manager",
+                "pods",
+                "app.kubernetes.io/name=cert-manager",
+            )?;
+            Ok((deployment.is_none() && pods.is_empty()).then_some(()))
+        },
+    )
 }
 
 /// Orders inventory deletion. Admission policies go first, since
 /// fiberd-k8s-controller's refuses deleting the GrantPolicy named default.
 /// Custom objects go next, so their controllers can finalize them before the
-/// controllers, CRDs and namespaces go last.
-fn deletion_passes(remaining: &[(Value, bool)]) -> [Vec<&Value>; 3] {
-    let mut passes: [Vec<&Value>; 3] = Default::default();
+/// controllers, CRDs and namespaces. A provider credential boundary stays
+/// until cert-manager is gone, so its credential cannot outlive the guard.
+fn deletion_passes(remaining: &[(Value, bool)]) -> [Vec<&Value>; 4] {
+    let mut passes: [Vec<&Value>; 4] = Default::default();
     for (item, custom) in remaining {
         let admission = matches!(
             item["kind"].as_str(),
             Some("ValidatingAdmissionPolicy" | "ValidatingAdmissionPolicyBinding")
         );
-        passes[if admission {
+        let provider_credential_boundary = admission
+            && item["metadata"]["annotations"]["lampyr.dev/credential-boundary"] == "true";
+        passes[if provider_credential_boundary {
+            3
+        } else if admission {
             0
         } else if *custom {
             1
@@ -1247,6 +2532,77 @@ pub fn health(kube: &Kube<'_>) -> Result<()> {
             "Grant home {} is not ready",
             pod["metadata"]["name"]
         );
+    }
+    if let Some(domain) = installed.data.get("domain") {
+        let tls_mode = installed
+            .data
+            .get("ingressTlsMode")
+            .map(String::as_str)
+            .unwrap_or("selfSigned");
+        let secret_namespace = installed
+            .data
+            .get("ingressTlsSecretNamespace")
+            .map(String::as_str)
+            .unwrap_or("kourier-system");
+        let secret_name = installed
+            .data
+            .get("ingressTlsSecretName")
+            .map(String::as_str)
+            .unwrap_or("lampyr-kourier-tls");
+        let https_port = installed
+            .https_port
+            .as_deref()
+            .unwrap_or("443")
+            .parse::<u16>()
+            .context("invalid installed HTTPS port")?;
+        if tls_mode == "acme" {
+            let issuer = installed
+                .data
+                .get("ingressTlsIssuer")
+                .context("ACME ingress issuer is missing from installation metadata")?;
+            wait_ready_resource(
+                kube,
+                "kourier-system",
+                "issuer",
+                issuer,
+                "ACME issuer health",
+                Duration::from_secs(10),
+            )?;
+            wait_ready_resource(
+                kube,
+                "kourier-system",
+                "certificate",
+                "lampyr-kourier-tls",
+                "ingress Certificate health",
+                Duration::from_secs(10),
+            )?;
+        }
+        if tls_mode == "selfSigned" {
+            wait_self_signed_tls_secret(
+                kube,
+                secret_namespace,
+                secret_name,
+                domain,
+                Duration::from_secs(10),
+            )?;
+        } else {
+            let tls = wait_tls_secret(
+                kube,
+                secret_namespace,
+                secret_name,
+                domain,
+                Duration::from_secs(10),
+            )?;
+            wait_tls_endpoint(kube, domain, https_port, tls, Duration::from_secs(10))?;
+        }
+        if let Some(address) = installed.data.get("ingressDnsAddress") {
+            let address: IpAddr = address
+                .parse()
+                .context("invalid installed ingress DNS address")?;
+            let expected = address.to_string();
+            wait_ingress_address(kube, Some(&expected), Duration::from_secs(10))?;
+            wait_dns(kube, domain, address, https_port, Duration::from_secs(10))?;
+        }
     }
 
     if installed
@@ -1732,6 +3088,424 @@ metadata: {name: lampyr-grant-homes, namespace: default}
     }
 
     #[test]
+    fn existing_tls_secrets_must_match_the_domain_and_private_key() {
+        let certified = rcgen::generate_simple_self_signed(vec![
+            "*.apps.example.com".into(),
+            "*.default.apps.example.com".into(),
+        ])
+        .unwrap();
+        let secret = |key: String| {
+            json!({
+                "data":{
+                    "tls.crt":STANDARD.encode(certified.cert.pem()),
+                    "tls.key":STANDARD.encode(key),
+                    "ca.crt":STANDARD.encode(certified.cert.pem())
+                }
+            })
+        };
+        validate_tls_secret_with_roots(
+            &secret(certified.signing_key.serialize_pem()),
+            "apps.example.com",
+            rustls::RootCertStore::empty(),
+        )
+        .unwrap();
+        let local = rcgen::generate_simple_self_signed(vec![
+            "*.localhost".into(),
+            "*.default.localhost".into(),
+        ])
+        .unwrap();
+        validate_tls_secret_with_roots(
+            &json!({"data":{
+                "tls.crt":STANDARD.encode(local.cert.pem()),
+                "tls.key":STANDARD.encode(local.signing_key.serialize_pem()),
+                "ca.crt":STANDARD.encode(local.cert.pem())
+            }}),
+            "localhost",
+            rustls::RootCertStore::empty(),
+        )
+        .unwrap();
+        let incomplete =
+            rcgen::generate_simple_self_signed(vec!["*.default.apps.example.com".into()]).unwrap();
+        let incomplete_secret = json!({
+            "data":{
+                "tls.crt":STANDARD.encode(incomplete.cert.pem()),
+                "tls.key":STANDARD.encode(incomplete.signing_key.serialize_pem()),
+                "ca.crt":STANDARD.encode(incomplete.cert.pem())
+            }
+        });
+        let error = validate_tls_secret_with_roots(
+            &incomplete_secret,
+            "apps.example.com",
+            rustls::RootCertStore::empty(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("does not cover"), "{error}");
+        assert!(
+            error.contains("lampyr-readiness.apps.example.com"),
+            "{error}"
+        );
+        assert!(
+            validate_tls_secret_with_roots(
+                &secret(certified.signing_key.serialize_pem()),
+                "other.example.com",
+                rustls::RootCertStore::empty(),
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("does not cover")
+        );
+        let other = rcgen::KeyPair::generate().unwrap();
+        assert!(
+            validate_tls_secret_with_roots(
+                &secret(other.serialize_pem()),
+                "apps.example.com",
+                rustls::RootCertStore::empty(),
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("does not match")
+        );
+    }
+
+    #[test]
+    fn existing_tls_secret_does_not_promote_its_presented_chain_to_a_root() {
+        let certified = rcgen::generate_simple_self_signed(vec![
+            "*.apps.example.com".into(),
+            "*.default.apps.example.com".into(),
+        ])
+        .unwrap();
+        let secret = |ca: Option<&str>| {
+            let mut data = json!({
+                "tls.crt":STANDARD.encode(certified.cert.pem()),
+                "tls.key":STANDARD.encode(certified.signing_key.serialize_pem())
+            });
+            if let Some(ca) = ca {
+                data["ca.crt"] = STANDARD.encode(ca).into();
+            }
+            json!({"data":data})
+        };
+        let unrelated =
+            rcgen::generate_simple_self_signed(vec!["unrelated.example.com".into()]).unwrap();
+        let roots = || {
+            let mut roots = rustls::RootCertStore::empty();
+            roots.add(unrelated.cert.der().clone()).unwrap();
+            roots
+        };
+        let error = validate_tls_secret_with_roots(&secret(None), "apps.example.com", roots())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("untrusted"), "{error}");
+        let error = validate_tls_secret_with_roots(&secret(Some("")), "apps.example.com", roots())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("untrusted"), "{error}");
+        validate_tls_secret_with_roots(
+            &secret(Some(&certified.cert.pem())),
+            "apps.example.com",
+            roots(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn existing_tls_secret_uses_intermediates_but_not_a_presented_root() {
+        let mut root_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        root_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let root_key = rcgen::KeyPair::generate().unwrap();
+        let root = root_params.self_signed(&root_key).unwrap();
+        let root_issuer = rcgen::Issuer::new(root_params, root_key);
+
+        let mut intermediate_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        intermediate_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let intermediate_key = rcgen::KeyPair::generate().unwrap();
+        let intermediate = intermediate_params
+            .signed_by(&intermediate_key, &root_issuer)
+            .unwrap();
+        let intermediate_issuer = rcgen::Issuer::new(intermediate_params, intermediate_key);
+
+        let mut leaf_params = rcgen::CertificateParams::new(vec![
+            "*.apps.example.com".into(),
+            "*.default.apps.example.com".into(),
+        ])
+        .unwrap();
+        leaf_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+        let leaf_key = rcgen::KeyPair::generate().unwrap();
+        let leaf = leaf_params
+            .signed_by(&leaf_key, &intermediate_issuer)
+            .unwrap();
+        let secret = |include_ca: bool, present_root: bool| {
+            let mut chain = format!("{}{}", leaf.pem(), intermediate.pem());
+            if present_root {
+                chain.push_str(&root.pem());
+            }
+            let mut data = json!({
+                "tls.crt":STANDARD.encode(chain),
+                "tls.key":STANDARD.encode(leaf_key.serialize_pem())
+            });
+            if include_ca {
+                data["ca.crt"] = STANDARD.encode(root.pem()).into();
+            }
+            json!({"data":data})
+        };
+        validate_tls_secret_with_roots(
+            &secret(true, false),
+            "apps.example.com",
+            rustls::RootCertStore::empty(),
+        )
+        .unwrap();
+        let unrelated =
+            rcgen::generate_simple_self_signed(vec!["unrelated.example.com".into()]).unwrap();
+        let mut unrelated_roots = rustls::RootCertStore::empty();
+        unrelated_roots.add(unrelated.cert.der().clone()).unwrap();
+        let error = validate_tls_secret_with_roots(
+            &secret(false, true),
+            "apps.example.com",
+            unrelated_roots,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("untrusted"), "{error}");
+    }
+
+    #[test]
+    fn credential_reconciliation_persists_retiring_configuration() {
+        let credential = |identity: &str| crate::platform_host::CertManagerCredential {
+            service_account_patch: json!({"metadata":{"annotations":{"provider.example/id":identity}}}),
+            service_account_cleanup_patch: json!({"metadata":{"annotations":{"provider.example/id":Value::Null}}}),
+            deployment_patch: json!({"spec":{"template":{"metadata":{"annotations":{"provider.example/id":identity}}}}}),
+            deployment_cleanup_patch: json!({"spec":{"template":{"metadata":{"annotations":{"provider.example/id":Value::Null}}}}}),
+            controller_args: vec!["--provider-ambient=true".into()],
+            controller_arg_prefixes: vec!["--provider-ambient".into()],
+            boundary: json!({"apiVersion":"v1","kind":"List","items":[]}),
+            boundary_message: "provider boundary".into(),
+            probes: vec![],
+            audits: vec![],
+        };
+        let first = credential("first");
+        let older = credential("older");
+        let second = credential("second");
+        let installed = InstalledCertManagerCredentials {
+            current: Some(first.clone()),
+            retiring: vec![older.clone()],
+        };
+        assert_eq!(
+            installed.previous_for(Some(&second)),
+            vec![first.clone(), older.clone()]
+        );
+        let interrupted = InstalledCertManagerCredentials {
+            current: Some(second.clone()),
+            retiring: vec![first.clone(), older.clone()],
+        };
+        assert_eq!(
+            interrupted.previous_for(Some(&second)),
+            vec![first.clone(), older.clone()]
+        );
+        assert_eq!(
+            interrupted.previous_for(None),
+            vec![second.clone(), first.clone(), older.clone()]
+        );
+        let steady = InstalledCertManagerCredentials {
+            current: Some(second.clone()),
+            retiring: vec![],
+        };
+        assert_eq!(steady.previous_for(None), vec![second.clone()]);
+        let persisted =
+            cert_manager_credential_state_patch(Some(&second), &[first.clone(), older.clone()])
+                .unwrap();
+        let decoded = decode_installed_cert_manager_credentials(&persisted).unwrap();
+        assert_eq!(decoded.current, Some(second));
+        assert_eq!(decoded.retiring, vec![first, older]);
+    }
+
+    #[test]
+    fn self_signed_secret_reuse_requires_the_self_signed_mode() {
+        let secret = |mode: Option<&str>, expired: bool| {
+            let mut annotations = json!({
+                "lampyr.dev/domain":"apps.example.com",
+                "lampyr.dev/installation-id":"installation"
+            });
+            if let Some(mode) = mode {
+                annotations["lampyr.dev/tls-mode"] = mode.into();
+            }
+            let mut parameters = rcgen::CertificateParams::new(vec![
+                "*.apps.example.com".into(),
+                "*.default.apps.example.com".into(),
+            ])
+            .unwrap();
+            parameters.not_before = rcgen::date_time_ymd(2020, 1, 1);
+            parameters.not_after = if expired {
+                rcgen::date_time_ymd(2021, 1, 1)
+            } else {
+                rcgen::date_time_ymd(2035, 1, 1)
+            };
+            let key = rcgen::KeyPair::generate().unwrap();
+            let certificate = parameters.self_signed(&key).unwrap();
+            json!({
+                "metadata":{"annotations":annotations},
+                "data":{
+                    "tls.crt":STANDARD.encode(certificate.pem()),
+                    "tls.key":STANDARD.encode(key.serialize_pem())
+                }
+            })
+        };
+        assert!(self_signed_secret_is_reusable(
+            &secret(Some("selfSigned"), false),
+            "apps.example.com",
+            "installation"
+        ));
+        assert!(!self_signed_secret_is_reusable(
+            &secret(Some("acme"), false),
+            "apps.example.com",
+            "installation"
+        ));
+        assert!(!self_signed_secret_is_reusable(
+            &secret(None, false),
+            "apps.example.com",
+            "installation"
+        ));
+        assert!(!self_signed_secret_is_reusable(
+            &secret(Some("selfSigned"), true),
+            "apps.example.com",
+            "installation"
+        ));
+    }
+
+    #[test]
+    fn cert_manager_credential_rolls_when_provider_identity_changes() {
+        let deployment = json!({"spec":{"template":{"spec":{"containers":[{
+                "name":"cert-manager-controller",
+                "args":["--v=2","--provider-ambient=false"]
+        }]}}}});
+        let credential = |identity: &str| crate::platform_host::CertManagerCredential {
+            service_account_patch: json!({"metadata":{"annotations":{"provider.example/id":identity}}}),
+            service_account_cleanup_patch: json!({"metadata":{"annotations":{"provider.example/id":Value::Null}}}),
+            deployment_patch: json!({"spec":{"template":{"metadata":{"annotations":{"provider.example/id":identity}}}}}),
+            deployment_cleanup_patch: json!({"spec":{"template":{"metadata":{"annotations":{"provider.example/id":Value::Null}}}}}),
+            controller_args: vec!["--provider-ambient=true".into()],
+            controller_arg_prefixes: vec!["--provider-ambient".into()],
+            boundary: json!({"apiVersion":"v1","kind":"List","items":[]}),
+            boundary_message: "provider boundary".into(),
+            probes: vec![],
+            audits: vec![],
+        };
+        let first = credential("first");
+        let patch = cert_manager_credential_patch(&deployment, Some(&first), &[]).unwrap();
+        assert_eq!(
+            patch.pointer("/spec/template/spec/containers/0/args"),
+            Some(&json!(["--v=2", "--provider-ambient=true"]))
+        );
+        assert_eq!(
+            patch.pointer("/spec/template/metadata/annotations/provider.example~1id"),
+            Some(&json!("first"))
+        );
+        let second = credential("second");
+        let changed =
+            cert_manager_credential_patch(&deployment, Some(&second), std::slice::from_ref(&first))
+                .unwrap();
+        assert_ne!(
+            patch.pointer("/spec/template/metadata/annotations"),
+            changed.pointer("/spec/template/metadata/annotations")
+        );
+        let disabled =
+            cert_manager_credential_patch(&patch, None, std::slice::from_ref(&second)).unwrap();
+        assert_eq!(
+            disabled.pointer("/spec/template/spec/containers/0/args"),
+            Some(&json!(["--v=2"]))
+        );
+        assert_eq!(
+            disabled.pointer("/spec/template/metadata/annotations/provider.example~1id"),
+            Some(&Value::Null)
+        );
+    }
+
+    #[test]
+    fn provider_credential_boundary_is_opaque_and_auditable() {
+        let boundary = json!({"apiVersion":"v1","kind":"List","items":[
+            {"apiVersion":"admissionregistration.k8s.io/v1","kind":"ValidatingAdmissionPolicy",
+             "metadata":{"name":"provider-boundary","annotations":{"lampyr.dev/credential-boundary":"true"}},
+             "spec":{"validations":[{"expression":"!has(object.spec.providerDNS)","message":"provider boundary"}]}},
+            {"apiVersion":"admissionregistration.k8s.io/v1","kind":"ValidatingAdmissionPolicyBinding",
+             "metadata":{"name":"provider-boundary-binding","annotations":{"lampyr.dev/credential-boundary":"true"}},
+             "spec":{"policyName":"provider-boundary","validationActions":["Deny"]}}
+        ]});
+        let items = boundary["items"].as_array().unwrap();
+        let policy = items
+            .iter()
+            .find(|item| item["kind"] == "ValidatingAdmissionPolicy")
+            .unwrap();
+        assert_eq!(
+            policy.pointer("/spec/validations/0/message"),
+            Some(&json!("provider boundary"))
+        );
+        let binding = items
+            .iter()
+            .find(|item| item["kind"] == "ValidatingAdmissionPolicyBinding")
+            .unwrap();
+        assert_eq!(
+            binding.pointer("/spec/policyName"),
+            Some(&json!("provider-boundary"))
+        );
+        assert_eq!(
+            binding.pointer("/spec/validationActions"),
+            Some(&json!(["Deny"]))
+        );
+        assert!(field_path_exists(
+            &json!({"spec":{"solvers":[{"providerDNS":{}}]}}),
+            &[
+                "spec".into(),
+                "solvers".into(),
+                "*".into(),
+                "providerDNS".into()
+            ]
+        ));
+    }
+
+    #[test]
+    fn core_ingress_lifecycle_has_no_provider_specific_credential_fields() {
+        let bootstrap = include_str!("bootstrap.rs");
+        let platform_host = include_str!("platform_host.rs");
+        for provider_field in [
+            concat!("azure", "DNS"),
+            concat!("azure", ".workload.identity"),
+            concat!("azure", "-pip-name"),
+            concat!("azure", "-load-balancer-resource-group"),
+        ] {
+            assert!(!bootstrap.contains(provider_field), "{provider_field}");
+        }
+        for provider_field in [
+            concat!("azure", "DNS"),
+            concat!("azure", "-pip-name"),
+            concat!("azure", "-load-balancer-resource-group"),
+        ] {
+            assert!(!platform_host.contains(provider_field), "{provider_field}");
+        }
+    }
+
+    #[test]
+    fn ingress_waits_honor_cancellation_before_network_work() {
+        let cancellation = crate::runtime::Cancellation::default();
+        cancellation.cancel();
+        let host = crate::host::Host {
+            verbose: false,
+            cancellation,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let kube = Kube::new(directory.path(), Some("test"), &host).unwrap();
+        let error = wait_dns(
+            &kube,
+            "invalid.example",
+            "203.0.113.10".parse().unwrap(),
+            8443,
+            Duration::from_secs(10),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("cancelled"), "{error}");
+        assert!(error.contains(":8443"), "{error}");
+    }
+
+    #[test]
     fn device_capacity_accepts_canonical_kubernetes_quantities() {
         for value in ["2000", "2k", "1Ki", "1e3"] {
             assert!(super::positive_quantity(value).unwrap(), "{value}");
@@ -1791,11 +3565,33 @@ metadata:
     #[test]
     fn admission_policies_are_deleted_before_the_objects_they_guard() {
         let item = |kind: &str| json!({ "kind": kind, "metadata": { "name": "default" } });
+        let boundary = |kind: &str, name: &str| {
+            json!({ "apiVersion":"admissionregistration.k8s.io/v1",
+                "kind": kind, "metadata": { "name": name, "annotations":{
+                "lampyr.dev/credential-boundary":"true"
+            } } })
+        };
+        let mut recorded = Vec::new();
+        record_manifest(
+            &boundary(
+                "ValidatingAdmissionPolicyBinding",
+                "provider-boundary-binding",
+            ),
+            &mut recorded,
+        )
+        .unwrap();
+        record_manifest(
+            &boundary("ValidatingAdmissionPolicy", "provider-boundary"),
+            &mut recorded,
+        )
+        .unwrap();
         let remaining = vec![
             (item("Deployment"), false),
             (item("GrantPolicy"), true),
             (item("ValidatingAdmissionPolicyBinding"), false),
             (item("ValidatingAdmissionPolicy"), false),
+            (recorded[0].clone(), false),
+            (recorded[1].clone(), false),
         ];
         let kinds = deletion_passes(&remaining).map(|pass| {
             pass.iter()
@@ -1811,6 +3607,10 @@ metadata:
                 ],
                 vec!["GrantPolicy"],
                 vec!["Deployment"],
+                vec![
+                    "ValidatingAdmissionPolicyBinding",
+                    "ValidatingAdmissionPolicy"
+                ],
             ]
         );
     }

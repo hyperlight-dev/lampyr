@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context as _, Result, bail, ensure};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::host::Host;
@@ -164,9 +164,107 @@ struct PlatformSettings {
     #[serde(default)]
     ingress_ports: Option<Value>,
     #[serde(default)]
+    ingress: IngressSettings,
+    #[serde(default)]
     metadata: BTreeMap<String, String>,
     #[serde(default)]
     home_pod_metadata: Option<Value>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct IngressSettings {
+    #[serde(default)]
+    pub tls: IngressTls,
+    #[serde(default)]
+    pub service: Option<IngressService>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(tag = "mode", rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) enum IngressTls {
+    #[default]
+    SelfSigned,
+    Acme {
+        email: String,
+        issuer: String,
+        solver: Value,
+        credential: Box<CertManagerCredential>,
+    },
+    ExistingSecret {
+        #[serde(rename = "secretName", default = "default_tls_secret_name")]
+        secret_name: String,
+        #[serde(rename = "secretNamespace", default = "default_tls_secret_namespace")]
+        secret_namespace: String,
+    },
+}
+
+#[derive(Default, Deserialize)]
+#[serde(tag = "mode", rename_all = "camelCase", deny_unknown_fields)]
+enum IngressTlsInput {
+    #[default]
+    SelfSigned,
+    Acme {
+        email: String,
+        #[serde(default = "default_acme_issuer")]
+        issuer: String,
+    },
+    ExistingSecret {
+        #[serde(rename = "secretName", default = "default_tls_secret_name")]
+        secret_name: String,
+        #[serde(rename = "secretNamespace", default = "default_tls_secret_namespace")]
+        secret_namespace: String,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct CertManagerCredential {
+    pub service_account_patch: Value,
+    pub service_account_cleanup_patch: Value,
+    pub deployment_patch: Value,
+    pub deployment_cleanup_patch: Value,
+    #[serde(default)]
+    pub controller_args: Vec<String>,
+    #[serde(default)]
+    pub controller_arg_prefixes: Vec<String>,
+    pub boundary: Value,
+    pub boundary_message: String,
+    #[serde(default)]
+    pub probes: Vec<Value>,
+    #[serde(default)]
+    pub audits: Vec<CredentialAudit>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct CredentialAudit {
+    pub resource: String,
+    pub kind: String,
+    pub allowed_namespace: String,
+    pub field_path: Vec<String>,
+    #[serde(default)]
+    pub issuer_kind: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct IngressService {
+    pub public_ip_address: String,
+    #[serde(default)]
+    pub annotations: BTreeMap<String, String>,
+}
+
+fn default_tls_secret_name() -> String {
+    "lampyr-kourier-tls".into()
+}
+
+fn default_tls_secret_namespace() -> String {
+    "default".into()
+}
+
+fn default_acme_issuer() -> String {
+    "letsencrypt-prod".into()
 }
 
 impl PlatformSettings {
@@ -187,17 +285,33 @@ impl PlatformSettings {
         if let Some(ports) = &self.ingress_ports {
             ensure!(ports.is_array(), "ingress ports must be an array");
         }
+        self.ingress.validate()?;
+        if !matches!(self.ingress.tls, IngressTls::SelfSigned) {
+            ensure!(
+                self.domain.contains('.'),
+                "ACME and existing ingress TLS Secrets require a multi-label domain"
+            );
+        }
         for reserved in [
             "installationId",
             "cluster",
             "provider",
             crate::bootstrap::CORE_INVENTORY_KEY,
+            "ingressTlsMode",
+            "ingressTlsSecretNamespace",
+            "ingressTlsSecretName",
+            "ingressTlsIssuer",
+            "ingressDnsAddress",
+            "ingressCredential",
+            "ingressRetiringCredential",
+            "ingressServiceAnnotations",
         ] {
             ensure!(
                 !self.metadata.contains_key(reserved),
                 "provider platform metadata cannot replace {reserved}"
             );
         }
+
         if let Some(metadata) = &self.home_pod_metadata {
             validate_metadata(metadata)?;
         }
@@ -208,6 +322,267 @@ impl PlatformSettings {
     /// the GrantPolicy lists for them.
     fn templates(&self) -> Result<Templates> {
         templates(&self.zygote_registries, &self.registry_mirrors)
+    }
+}
+
+impl IngressSettings {
+    fn validate(&self) -> Result<()> {
+        self.tls.validate()?;
+        if let Some(service) = &self.service {
+            ensure!(
+                service
+                    .public_ip_address
+                    .parse::<std::net::Ipv4Addr>()
+                    .is_ok(),
+                "ingress public IP address is invalid"
+            );
+            ensure!(
+                service.annotations.iter().all(|(key, value)| {
+                    !key.is_empty()
+                        && !value.is_empty()
+                        && !key.chars().any(char::is_whitespace)
+                        && !value.chars().any(char::is_whitespace)
+                }),
+                "ingress Service annotations must be nonempty and contain no whitespace"
+            );
+        }
+        ensure!(
+            !matches!(&self.tls, IngressTls::Acme { .. }) || self.service.is_some(),
+            "ACME ingress requires a stable public IP and DNS records"
+        );
+        Ok(())
+    }
+}
+
+impl IngressTls {
+    fn validate(&self) -> Result<()> {
+        let dns_label = |value: &str| crate::project::validate_name(value).is_ok();
+        match self {
+            IngressTls::SelfSigned => {}
+            IngressTls::ExistingSecret {
+                secret_name,
+                secret_namespace,
+            } => {
+                ensure!(
+                    dns_label(secret_name) && dns_label(secret_namespace),
+                    "existing ingress TLS Secret name and namespace must be DNS labels"
+                );
+                ensure!(
+                    ![
+                        "cert-manager",
+                        "fiberd-system",
+                        "hyperlight-system",
+                        "knative-eventing",
+                        "knative-serving",
+                        "kourier-system",
+                        "lampyr-system",
+                    ]
+                    .contains(&secret_namespace.as_str()),
+                    "existing ingress TLS Secret must be outside Lampyr-owned namespaces"
+                );
+            }
+
+            IngressTls::Acme {
+                email,
+                issuer,
+                solver,
+                credential,
+            } => {
+                ensure!(
+                    email.len() <= 254
+                        && email.split_once('@').is_some_and(|(local, domain)| {
+                            !local.is_empty()
+                                && domain.contains('.')
+                                && !domain.chars().any(char::is_whitespace)
+                        }),
+                    "ACME email is invalid"
+                );
+                ensure!(dns_label(issuer), "ACME issuer must be a DNS label");
+                ensure!(solver.is_object(), "ACME solver must be an object");
+                credential.validate()?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl CertManagerCredential {
+    fn validate(&self) -> Result<()> {
+        validate_service_account_patch(&self.service_account_patch)?;
+        validate_service_account_patch(&self.service_account_cleanup_patch)?;
+        validate_deployment_patch(&self.deployment_patch)?;
+        validate_deployment_patch(&self.deployment_cleanup_patch)?;
+        ensure!(
+            self.controller_args == ["--issuer-ambient-credentials=true"]
+                && self.controller_arg_prefixes == ["--issuer-ambient-credentials"],
+            "managed cert-manager credentials may change only Issuer ambient credentials"
+        );
+        ensure!(
+            self.boundary["kind"] == "List" && self.boundary["items"].as_array().is_some(),
+            "cert-manager credential boundary must be a manifest List"
+        );
+        ensure!(
+            self.boundary["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|item| {
+                    matches!(
+                        item["kind"].as_str(),
+                        Some("ValidatingAdmissionPolicy" | "ValidatingAdmissionPolicyBinding")
+                    )
+                }),
+            "cert-manager credential boundary may contain only validating admission resources"
+        );
+        ensure!(
+            !self.boundary_message.is_empty(),
+            "cert-manager credential boundary message must be nonempty"
+        );
+        for audit in &self.audits {
+            ensure!(
+                !audit.resource.is_empty()
+                    && audit
+                        .resource
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || b".-".contains(&byte)),
+                "cert-manager credential audit resource is invalid"
+            );
+            ensure!(
+                !audit.kind.is_empty()
+                    && crate::project::validate_name(&audit.allowed_namespace).is_ok()
+                    && !audit.field_path.is_empty()
+                    && audit.field_path.iter().all(|segment| {
+                        segment == "*"
+                            || (!segment.is_empty()
+                                && segment.bytes().all(|byte| {
+                                    byte.is_ascii_alphanumeric() || b"_.-".contains(&byte)
+                                }))
+                    }),
+                "cert-manager credential audit is invalid"
+            );
+        }
+        ensure!(
+            self.probes.iter().all(|probe| {
+                matches!(probe["kind"].as_str(), Some("Issuer" | "Challenge"))
+                    && probe["metadata"]["namespace"] == "default"
+            }),
+            "cert-manager credential probes must be Issuers or Challenges in default"
+        );
+        Ok(())
+    }
+}
+
+pub(crate) fn validate_cert_manager_credential(value: &Value) -> Result<()> {
+    canonical_cert_manager_credential(value).map(|_| ())
+}
+
+pub(crate) fn canonical_cert_manager_credential(value: &Value) -> Result<Value> {
+    let credential: CertManagerCredential =
+        serde_json::from_value(value.clone()).context("decode cert-manager credential mutation")?;
+    credential.validate()?;
+    serde_json::to_value(credential).context("encode cert-manager credential mutation")
+}
+
+fn annotation_values(mapping: Option<&serde_json::Map<String, Value>>) -> bool {
+    mapping.is_some_and(|mapping| {
+        mapping
+            .values()
+            .all(|value| value.is_string() || value.is_null())
+    })
+}
+
+fn validate_service_account_patch(patch: &Value) -> Result<()> {
+    let object = patch
+        .as_object()
+        .context("ServiceAccount patch must be an object")?;
+    let metadata = object
+        .get("metadata")
+        .and_then(Value::as_object)
+        .context("ServiceAccount patch must contain metadata")?;
+    ensure!(
+        object.len() == 1
+            && metadata.len() == 1
+            && annotation_values(metadata.get("annotations").and_then(Value::as_object)),
+        "ServiceAccount patch may change only string or null annotations"
+    );
+    Ok(())
+}
+
+fn validate_deployment_patch(patch: &Value) -> Result<()> {
+    let object = patch
+        .as_object()
+        .context("Deployment patch must be an object")?;
+    let metadata = patch
+        .pointer("/spec/template/metadata")
+        .and_then(Value::as_object)
+        .context("Deployment patch must contain spec.template.metadata")?;
+    ensure!(
+        object.len() == 1
+            && object["spec"]
+                .as_object()
+                .is_some_and(|spec| spec.len() == 1)
+            && object["spec"]["template"]
+                .as_object()
+                .is_some_and(|template| template.len() == 1)
+            && metadata
+                .keys()
+                .all(|key| matches!(key.as_str(), "annotations" | "labels"))
+            && metadata
+                .get("annotations")
+                .is_none_or(|value| annotation_values(value.as_object()))
+            && metadata
+                .get("labels")
+                .is_none_or(|value| annotation_values(value.as_object())),
+        "Deployment patch may change only string or null Pod-template annotations and labels"
+    );
+    Ok(())
+}
+
+impl IngressTlsInput {
+    fn validate(&self) -> Result<()> {
+        let dns_label = |value: &str| crate::project::validate_name(value).is_ok();
+        match self {
+            IngressTlsInput::SelfSigned => {}
+            IngressTlsInput::ExistingSecret {
+                secret_name,
+                secret_namespace,
+            } => {
+                ensure!(
+                    dns_label(secret_name) && dns_label(secret_namespace),
+                    "existing ingress TLS Secret name and namespace must be DNS labels"
+                );
+                ensure!(
+                    ![
+                        "cert-manager",
+                        "fiberd-system",
+                        "hyperlight-system",
+                        "knative-eventing",
+                        "knative-serving",
+                        "kourier-system",
+                        "lampyr-system",
+                    ]
+                    .contains(&secret_namespace.as_str()),
+                    "existing ingress TLS Secret must be outside Lampyr-owned namespaces"
+                );
+            }
+            IngressTlsInput::Acme { email, issuer } => {
+                ensure!(
+                    email.len() <= 254
+                        && email.split_once('@').is_some_and(|(local, domain)| {
+                            !local.is_empty()
+                                && domain.contains('.')
+                                && !domain.chars().any(char::is_whitespace)
+                        }),
+                    "ACME email is invalid"
+                );
+                ensure!(dns_label(issuer), "ACME issuer must be a DNS label");
+            }
+        }
+        Ok(())
+    }
+
+    fn is_trusted(&self) -> bool {
+        !matches!(self, Self::SelfSigned)
     }
 }
 
@@ -585,6 +960,20 @@ pub(crate) fn validate_domain(domain: &str) -> Result<()> {
 pub(crate) fn validate_install_inputs(value: &Value) -> Result<()> {
     let domain = value["domain"].as_str().context("domain must be text")?;
     validate_domain(domain)?;
+    let tls: IngressTlsInput = serde_json::from_value(
+        value
+            .pointer("/ingress/tls")
+            .cloned()
+            .unwrap_or_else(|| json!({"mode":"selfSigned"})),
+    )
+    .context("decode ingress TLS settings")?;
+    tls.validate()?;
+    if tls.is_trusted() {
+        ensure!(
+            domain.contains('.'),
+            "ACME and existing ingress TLS Secrets require a multi-label domain"
+        );
+    }
     if let Some(https_port) = value.get("httpsPort") {
         ensure!(
             https_port
@@ -710,6 +1099,7 @@ pub(crate) fn install(
             zygote_registries: &templates.registries,
             registry_mirrors: templates.mirrors,
             ingress_ports: settings.ingress_ports,
+            ingress: &settings.ingress,
         },
     )?;
     let mut metadata = settings.metadata;
@@ -807,6 +1197,88 @@ pub(crate) mod tests {
         format!("registry.example/helper@sha256:{}", "1".repeat(64))
     }
 
+    fn platform_settings(ingress: Value) -> Value {
+        json!({
+            "domain":"apps.example.com",
+            "httpsPort":443,
+            "fiberdImage":"registry/fiberd:v1",
+            "routerImage":"registry/router:v1",
+            "controllerManifest":manifest(),
+            "grantImage":grant_image(),
+            "helperImage":helper_image(),
+            "zygoteRegistries":["registry.example/templates"],
+            "ingress":ingress,
+        })
+    }
+
+    #[test]
+    fn ingress_tls_modes_validate_their_required_ownership_inputs() {
+        validate_settings(&platform_settings(json!({}))).unwrap();
+        validate_settings(&platform_settings(json!({
+            "tls":{
+                "mode":"existingSecret",
+                "secretName":"corporate-ingress",
+                "secretNamespace":"security"
+            }
+        })))
+        .unwrap();
+        let mut trusted_single_label = platform_settings(json!({
+            "tls":{
+                "mode":"existingSecret",
+                "secretName":"corporate-ingress",
+                "secretNamespace":"security"
+            }
+        }));
+        trusted_single_label["domain"] = "localhost".into();
+        assert!(validate_settings(&trusted_single_label).is_err());
+        for namespace in ["knative-eventing", "kourier-system"] {
+            let error = validate_settings(&platform_settings(json!({
+                "tls":{
+                    "mode":"existingSecret",
+                    "secretName":"corporate-ingress",
+                    "secretNamespace":namespace
+                }
+            })))
+            .unwrap_err()
+            .to_string();
+            assert!(
+                error.contains("outside Lampyr-owned namespaces"),
+                "{namespace}: {error}"
+            );
+        }
+        let acme = json!({
+            "service":{
+                "publicIpAddress":"203.0.113.10",
+                "annotations":{"provider.example/ip":"lampyr-ingress"}
+            },
+            "tls":{
+                "mode":"acme",
+                "email":"platform@example.com",
+                "issuer":"letsencrypt-prod",
+                "solver":{"dns01":{"providerDNS":{}}},
+                "credential":{
+                    "serviceAccountPatch":{"metadata":{"annotations":{}}},
+                    "serviceAccountCleanupPatch":{"metadata":{"annotations":{}}},
+                    "deploymentPatch":{"spec":{"template":{"metadata":{}}}},
+                    "deploymentCleanupPatch":{"spec":{"template":{"metadata":{}}}},
+                    "controllerArgs":["--issuer-ambient-credentials=true"],
+                    "controllerArgPrefixes":["--issuer-ambient-credentials"],
+                    "boundary":{"apiVersion":"v1","kind":"List","items":[]},
+                    "boundaryMessage":"provider boundary"
+                }
+            }
+        });
+        validate_settings(&platform_settings(acme.clone())).unwrap();
+        let mut missing_service = acme;
+        missing_service.as_object_mut().unwrap().remove("service");
+        assert!(
+            validate_settings(&platform_settings(missing_service))
+                .unwrap_err()
+                .to_string()
+                .contains("stable public IP")
+        );
+    }
+
     #[test]
     fn install_inputs_reject_invalid_domains_before_cluster_mutation() {
         let settings = |domain: &str| {
@@ -827,6 +1299,28 @@ pub(crate) mod tests {
         assert!(validate_install_inputs(&dynamic).is_ok());
         dynamic.as_object_mut().unwrap().remove("httpsPort");
         assert!(validate_install_inputs(&dynamic).is_ok());
+        let mut trusted_single_label = settings("localhost");
+        trusted_single_label["ingress"] = json!({"tls":{
+            "mode":"existingSecret",
+            "secretName":"corporate-ingress",
+            "secretNamespace":"security"
+        }});
+        assert!(validate_install_inputs(&trusted_single_label).is_err());
+        trusted_single_label["ingress"]["tls"]["mode"] = "acme".into();
+        assert!(validate_install_inputs(&trusted_single_label).is_err());
+        assert!(validate_install_inputs(&settings("localhost")).is_ok());
+        let mut valid_acme = settings("apps.example.com");
+        valid_acme["ingress"] = json!({"tls":{"mode":"acme","email":"platform@example.com"}});
+        assert!(validate_install_inputs(&valid_acme).is_ok());
+        let mut invalid_ingress = settings("apps.example.com");
+        invalid_ingress["ingress"] = json!({"tls":{"mode":"acmee"}});
+        assert!(validate_install_inputs(&invalid_ingress).is_err());
+        invalid_ingress["ingress"] = json!({"tls":{
+            "mode":"existingSecret",
+            "secretName":"corporate-ingress",
+            "secretNamespace":"kourier-system"
+        }});
+        assert!(validate_install_inputs(&invalid_ingress).is_err());
         for domain in [
             "UPPER.example.com",
             "bad_name.example.com",
@@ -1212,24 +1706,31 @@ pub(crate) mod tests {
 
     #[test]
     fn provider_metadata_cannot_replace_core_manifest_inventory() {
-        let settings = json!({
-            "domain":"apps.example.com",
-            "httpsPort":443,
-            "fiberdImage":"registry/fiberd:v1",
-            "routerImage":"registry/router:v1",
-            "controllerManifest":manifest(),
-            "grantImage":grant_image(),
-            "helperImage":helper_image(),
-            "metadata":{
-                crate::bootstrap::CORE_INVENTORY_KEY:"attacker-controlled"
-            },
-        });
-        assert!(
-            validate_settings(&settings)
-                .unwrap_err()
-                .to_string()
-                .contains(crate::bootstrap::CORE_INVENTORY_KEY)
-        );
+        for reserved in [
+            crate::bootstrap::CORE_INVENTORY_KEY,
+            "ingressTlsMode",
+            "ingressTlsSecretNamespace",
+            "ingressTlsSecretName",
+            "ingressTlsIssuer",
+            "ingressDnsAddress",
+            "ingressCredential",
+            "ingressRetiringCredential",
+            "ingressServiceAnnotations",
+        ] {
+            let settings = json!({
+                "domain":"apps.example.com",
+                "httpsPort":443,
+                "fiberdImage":"registry/fiberd:v1",
+                "routerImage":"registry/router:v1",
+                "controllerManifest":manifest(),
+                "grantImage":grant_image(),
+                "helperImage":helper_image(),
+                "zygoteRegistries":["ghcr.io/team/templates"],
+                "metadata":{reserved:"attacker-controlled"},
+            });
+            let error = validate_settings(&settings).unwrap_err().to_string();
+            assert!(error.contains(reserved), "{reserved}: {error}");
+        }
     }
 
     #[test]
