@@ -24,6 +24,7 @@ CI_WORKFLOW = ROOT / ".github/workflows/ci.yml"
 DEPENDABOT = ROOT / ".github/dependabot.yml"
 PUBLISH_SCRIPT = ROOT / "scripts/publish-preview-release.sh"
 KIND_INTEGRATION = ROOT / "scripts/test-kind-integration.sh"
+AZURE_INGRESS_INTEGRATION = ROOT / "scripts/test-azure-ingress-integration.sh"
 VERSION_SCRIPT = ROOT / "scripts/publish-version-release.sh"
 TOOLCHAIN = ROOT / "cli/rust-toolchain.toml"
 CLI_JUSTFILE = ROOT / "cli/Justfile"
@@ -731,6 +732,282 @@ class PreviewWorkflowPolicyTests(unittest.TestCase):
         remove_registry = cleanup.index('docker rm -f "$registry"')
         self.assertLess(disconnect, uninstall)
         self.assertLess(uninstall, remove_registry)
+
+    def test_azure_ingress_cleanup_is_conditional_complete_and_recoverable(self):
+        script = AZURE_INGRESS_INTEGRATION.read_text(encoding="utf-8")
+        cleanup = script.split("cleanup() {", 1)[1].split(
+            "\n}\ntrap cleanup EXIT", 1
+        )[0]
+        self.assertIn('--if-match "$etag"', cleanup)
+        self.assertIn("az group wait --deleted", cleanup)
+        self.assertIn("cleanup_succeeded=true", cleanup)
+        self.assertIn('if [[ $cleanup_succeeded == true ]]', cleanup)
+        self.assertIn('retained Azure ingress test workspace: $project', cleanup)
+        verification = script.split(
+            'phase "uninstalling and checking owned cleanup"', 1
+        )[1]
+        self.assertIn("az network dns record-set a list", verification)
+        self.assertNotIn('az resource show --ids "$zone_id/A/$record"', verification)
+
+    def test_azure_ingress_cleanup_retains_recovery_state_on_failures(self):
+        source = AZURE_INGRESS_INTEGRATION.read_text(encoding="utf-8")
+        cleanup = "cleanup() {" + source.split("cleanup() {", 1)[1].split(
+            "\n}\ntrap cleanup EXIT", 1
+        )[0] + "\n}"
+        harness = f"""set -euo pipefail
+{cleanup}
+az() {{
+  printf '%s\\n' "$*" >> "$CALLS"
+  if [[ $1 == network && $2 == dns && $3 == record-set && $4 == a && $5 == list ]]; then
+    printf '[]\\n'
+  elif [[ $1 == group && $2 == exists ]]; then
+    if [[ $* == *"--name cluster-group"* ]]; then
+      printf '%s\\n' "$CLUSTER_GROUP_EXISTS"
+    else
+      printf 'true\\n'
+    fi
+  elif [[ $1 == group && $2 == show ]]; then
+    printf '{{"tags":{{"lampyr-installation-id":"%s"}}}}\\n' "$GROUP_OWNER"
+  elif [[ $1 == identity && $2 == list ]]; then
+    printf '%s\\n' "$IDENTITIES"
+  elif [[ $1 == role && $2 == assignment && $3 == list ]]; then
+    printf '%s\\n' "$ROLE_ASSIGNMENTS"
+  elif [[ $1 == role && $2 == assignment && $3 == delete && $FAIL_ROLE_DELETE == true ]]; then
+    return 1
+  fi
+}}
+repo_root=$ROOT
+project=$PROJECT
+LAMPYR_HOME=$PROJECT/data
+cluster=cluster
+resource_group=cluster-group
+subscription_id=11111111-1111-1111-1111-111111111111
+zone_subscription=$subscription_id
+zone_group=dns
+zone_name=example.com
+zone_id=/subscriptions/$subscription_id/resourceGroups/dns/providers/Microsoft.Network/dnsZones/$zone_name
+ingress_inventory=$INGRESS_INVENTORY
+uninstalled=false
+install_attempted=true
+cleanup
+"""
+        zone = (
+            "/subscriptions/11111111-1111-1111-1111-111111111111/"
+            "resourceGroups/dns/providers/Microsoft.Network/dnsZones/example.com"
+        )
+        expected_role = (
+            zone + "/providers/Microsoft.Authorization/roleAssignments/"
+            "33333333-3333-3333-3333-333333333333"
+        )
+        customer_role = (
+            zone + "/providers/Microsoft.Authorization/roleAssignments/"
+            "44444444-4444-4444-4444-444444444444"
+        )
+        role_assignments = json.dumps([
+            {
+                "id": expected_role,
+                "scope": zone,
+                "principalId": "22222222-2222-2222-2222-222222222222",
+                "roleDefinitionId": (
+                    "/subscriptions/11111111-1111-1111-1111-111111111111/"
+                    "providers/Microsoft.Authorization/roleDefinitions/"
+                    "befefa01-2a29-4197-83a8-272ff33ce314"
+                ),
+            },
+            {
+                "id": customer_role,
+                "scope": zone,
+                "principalId": "22222222-2222-2222-2222-222222222222",
+                "roleDefinitionId": (
+                    "/subscriptions/11111111-1111-1111-1111-111111111111/"
+                    "providers/Microsoft.Authorization/roleDefinitions/"
+                    "befefa01-2a29-4197-83a8-272ff33ce314"
+                ),
+            },
+        ])
+        inventory = json.dumps({
+            "dnsRoleAssignmentId": expected_role,
+            "dnsIdentityPrincipalId": "22222222-2222-2222-2222-222222222222",
+        })
+        owned_identity = "22222222-2222-2222-2222-222222222222"
+        duplicate_assignments = json.dumps([
+            json.loads(role_assignments)[0],
+            json.loads(role_assignments)[0],
+        ])
+        for name, installation, fail_role, group_owner, identities, assignments, \
+                cluster_group_exists, expected_failure, diagnostic in (
+            (
+                "corrupt state",
+                "{",
+                False,
+                "a" * 32,
+                owned_identity,
+                role_assignments,
+                "true",
+                True,
+                "installation state",
+            ),
+            (
+                "role deletion",
+                json.dumps({"id": "a" * 32}),
+                True,
+                "a" * 32,
+                owned_identity,
+                role_assignments,
+                "true",
+                True,
+                "role assignment",
+            ),
+            (
+                "unowned ingress group",
+                json.dumps({"id": "a" * 32}),
+                False,
+                "customer",
+                owned_identity,
+                role_assignments,
+                "true",
+                True,
+                "not owned",
+            ),
+            (
+                "missing managed identity",
+                json.dumps({"id": "a" * 32}),
+                False,
+                "a" * 32,
+                "",
+                role_assignments,
+                "true",
+                True,
+                "managed identity",
+            ),
+            (
+                "duplicate recorded role",
+                json.dumps({"id": "a" * 32}),
+                False,
+                "a" * 32,
+                owned_identity,
+                duplicate_assignments,
+                "true",
+                True,
+                "role assignment",
+            ),
+            (
+                "absent core group",
+                json.dumps({"id": "a" * 32}),
+                False,
+                "a" * 32,
+                owned_identity,
+                role_assignments,
+                "false",
+                False,
+                "",
+            ),
+            (
+                "role already absent",
+                json.dumps({"id": "a" * 32}),
+                False,
+                "a" * 32,
+                owned_identity,
+                "[]",
+                "false",
+                False,
+                "",
+            ),
+        ):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                work = Path(directory)
+                project = work / "project"
+                installation_record = (
+                    project / "data/installations/azure/cluster/host/installation.json"
+                )
+                installation_record.parent.mkdir(parents=True)
+                installation_record.write_text(installation)
+                calls = work / "calls"
+                result = subprocess.run(
+                    ["bash", "--noprofile", "--norc", "-c", harness],
+                    capture_output=True,
+                    text=True,
+                    env={
+                        **os.environ,
+                        "ROOT": str(ROOT),
+                        "PROJECT": str(project),
+                        "CALLS": str(calls),
+                        "FAIL_ROLE_DELETE": "true" if fail_role else "false",
+                        "GROUP_OWNER": group_owner,
+                        "IDENTITIES": identities,
+                        "ROLE_ASSIGNMENTS": assignments,
+                        "INGRESS_INVENTORY": inventory,
+                        "CLUSTER_GROUP_EXISTS": cluster_group_exists,
+                    },
+                )
+                if expected_failure:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertTrue(project.exists())
+                    self.assertIn("retained Azure ingress test workspace", result.stderr)
+                    self.assertIn(diagnostic, result.stderr)
+                else:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertFalse(project.exists())
+                if name == "corrupt state":
+                    self.assertIn("resource group matching cluster-ingress-*", result.stderr)
+                    self.assertIn("installation id unavailable", result.stderr)
+                commands = calls.read_text() if calls.exists() else ""
+                if name != "corrupt state":
+                    self.assertIn("--name cluster-group", commands)
+                if fail_role:
+                    self.assertFalse(any(
+                        line.startswith("group delete")
+                        and "cluster-ingress-" in line
+                        for line in commands.splitlines()
+                    ))
+                    self.assertIn(expected_role, commands)
+                    self.assertNotIn(customer_role, commands)
+                if name == "unowned ingress group":
+                    self.assertFalse(any(
+                        line.startswith("group delete")
+                        and (
+                            "cluster-ingress-" in line
+                            or "--name cluster-group" in line
+                        )
+                        for line in commands.splitlines()
+                    ))
+                    self.assertFalse(any(
+                        line.startswith("role assignment delete")
+                        for line in commands.splitlines()
+                    ))
+                if name in {"missing managed identity", "duplicate recorded role"}:
+                    self.assertFalse(any(
+                        line.startswith("role assignment delete")
+                        for line in commands.splitlines()
+                    ))
+
+    def test_azure_ingress_waits_for_kourier_to_serve_the_replacement_certificate(self):
+        script = AZURE_INGRESS_INTEGRATION.read_text(encoding="utf-8")
+        reconciliation = script.split(
+            'phase "forcing certificate reconciliation"', 1
+        )[1].split(
+            'phase "changing the Knative domain', 1
+        )[0]
+        self.assertIn("endpoint_serial()", script)
+        self.assertIn('served_serial=$(endpoint_serial', reconciliation)
+        self.assertIn('[[ ${served_serial:-} == "$serial" ]]', reconciliation)
+        domain_change = script.split(
+            'phase "changing the Knative domain', 1
+        )[1].split(
+            'phase "uninstalling and checking owned cleanup"', 1
+        )[0]
+        self.assertIn("secret_preserved=true", domain_change)
+        self.assertIn('certificate_serial >/dev/null 2>&1 || secret_preserved=false', domain_change)
+        self.assertIn('[[ $secret_preserved == true ]]', domain_change)
+        self.assertIn("az network dns record-set a list", domain_change)
+        self.assertNotIn('az resource show --ids "$zone_id/A/$old_record"', domain_change)
+
+    def test_azure_ingress_docs_cover_managed_cert_manager_and_self_signed_dns(self):
+        guide = (ROOT / "docs/cluster-aks.md").read_text(encoding="utf-8")
+        self.assertRegex(guide, r"Lampyr-managed\s+cert-manager")
+        self.assertIn("--resolve", guide)
+        self.assertIn("--cacert", guide)
+        self.assertNotIn("--insecure", guide)
 
     def test_archive_attestations_and_verification(self):
         subjects = {

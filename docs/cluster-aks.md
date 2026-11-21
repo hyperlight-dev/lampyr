@@ -105,6 +105,42 @@ Pods run by default. From a checkout, which has none, add the
 `just preview-mirror-images destination=REGISTRY/lampyr` writes to
 `build/preview-azure.yaml`; see [Preview images](contributing.md#preview-images).
 
+The configuration above keeps the default self-signed certificate and does not
+require a domain. To use trusted ACME ingress, set a domain in an existing
+public Azure DNS zone and add these settings. ACME requires the Lampyr-managed
+cert-manager installation; Lampyr cannot add its workload identity to a
+separately managed controller.
+
+```yaml
+domain: services.example.com
+ingress:
+  azureDnsZoneResourceId: /subscriptions/SUBSCRIPTION_ID/resourceGroups/DNS_RESOURCE_GROUP/providers/Microsoft.Network/dnszones/example.com
+  tls:
+    mode: acme
+    email: platform@example.com
+    issuer: letsencrypt-prod
+```
+
+Lampyr creates a static public IP, wildcard A records, a managed identity, a
+federated credential, and a DNS Zone Contributor assignment on the configured
+zone. It does not create, change, or delete the zone. The Azure account that
+runs the install must be able to create these resources and assign the
+zone-scoped role.
+
+To use a certificate that another system writes, replace the `tls` block:
+
+```yaml
+ingress:
+  tls:
+    mode: existingSecret
+    secretName: corporate-ingress
+    secretNamespace: security
+```
+
+Add `azureDnsZoneResourceId` beside `tls` when Lampyr should also manage the
+public IP and wildcard DNS records. Lampyr reads the Secret but does not
+change it. The Secret must use a namespace that Lampyr does not remove.
+
 The default installation uses resource group and cluster name `lampyr`, region
 `westus3`, one `Standard_D4s_v5` node, Ubuntu 24.04, and Kubernetes context
 `aks-lampyr`. See [`ly cluster`](cli/cluster.md) for resource group, location,
@@ -257,9 +293,15 @@ Test the deployed route directly against the ingress address. Use the host
 name from the Service URL that `ly deploy` printed as the `Host` header:
 
 ```bash
-curl --fail --insecure \
-  -H "Host: $SERVICE_HOST" \
-  "https://$INGRESS_IP/test"
+ingress_ca=$(mktemp)
+kubectl --context aks-lampyr -n kourier-system \
+  get secret lampyr-kourier-tls \
+  --output 'go-template={{index .data "tls.crt" | base64decode}}' \
+  > "$ingress_ca"
+curl --fail --cacert "$ingress_ca" \
+  --resolve "$SERVICE_HOST:443:$INGRESS_IP" \
+  "https://$SERVICE_HOST/test"
+rm "$ingress_ca"
 ```
 
 The response is:
@@ -268,21 +310,13 @@ The response is:
 {"message":"hello from Hyperlight edge","path":"/test"}
 ```
 
-To use a real domain later, set `domain` in `azure.yaml`, then apply the updated
-platform configuration:
+With ACME ingress enabled, Lampyr waits for wildcard DNS, the issuer,
+Certificate, TLS Secret, and Kourier before installation succeeds. The Service
+URL that `ly deploy` prints then uses the trusted custom domain:
 
 ```bash
-ly cluster install --provider azure \
-  --provider-config azure.yaml \
-  --approve-provider-manifests
+curl --fail "$SERVICE_URL/test"
 ```
-
-After installation is ready, create a wildcard DNS record for
-`*.default.<domain>` pointing to the ingress address.
-
-The generated development certificate is self-signed, so this example uses
-`--insecure`. Replace it with production certificate management before serving
-real traffic.
 
 ## Observe and clean up
 
@@ -307,7 +341,11 @@ ly cluster uninstall \
 
 Omit `--delete-cluster` to retain AKS. The Azure resource group and external
 registry are retained in either case; inspect them for remaining billable
-resources and remove published images when they are no longer needed.
+resources and remove published images when they are no longer needed. Lampyr
+uses a dedicated resource group for its ingress public IP and identity. It
+removes that group, its recorded DNS records and zone-scoped role assignment,
+issuer, and Certificate. It preserves the Azure DNS zone and an existing TLS
+Secret outside Lampyr namespaces.
 
 Keep the Workspace after uninstall. The local provider installation records
 its generated infrastructure source there and needs it for reconciliation or
