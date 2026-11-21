@@ -496,6 +496,38 @@ class ScaleTestTests(unittest.TestCase):
                     scale.main()
                 write.assert_not_called()
 
+    def test_scenario_rejects_disappeared_resource_series(self):
+        routers = [{"router-1": 420}] * 20
+        resources = [{"container-1": 400, "container-2": 400}]
+        resources += [{"container-1": 420}] * 20
+        with self.scenario_environment(routers, resources) as write:
+            with self.assertRaisesRegex(RuntimeError, "fresh.*resource"):
+                scale.main()
+            write.assert_not_called()
+
+    def test_scenario_accepts_fresh_resource_samples(self):
+        with self.scenario_environment(
+            [{"router-1": 420}] * 20,
+            [{"container-1": 420, "kube-state": 420}] * 20,
+        ) as write:
+            scale.main()
+            self.assertEqual(len(write.call_args.args[0]["scenarios"]), 2)
+
+    def test_resource_samples_require_every_input_family(self):
+        queries = {"cpu": "cpu_timestamp", "phase": "phase_timestamp"}
+        complete = [
+            {"metric": {"scale_input": "cpu", "pod": "one"}, "value": [450, "420"]},
+            {"metric": {"scale_input": "phase", "pod": "one"}, "value": [450, "410"]},
+        ]
+        with mock.patch.object(scale, "prometheus_results", return_value=complete):
+            samples = scale.resource_samples("context", queries, 450)
+        self.assertEqual(sorted(samples.values()), [410, 420])
+        for partial in ([], complete[:1]):
+            with self.subTest(partial=partial), mock.patch.object(
+                scale, "prometheus_results", return_value=partial
+            ):
+                self.assertIsNone(scale.resource_samples("context", queries, 450))
+
     def test_installer_uses_unique_downloads_for_concurrent_invocations(self):
         justfile = (PATH.parents[1] / "Justfile").read_text()
         recipe = justfile.split("\ninstall-oha:\n", 1)[1].split("\n\n", 1)[0]

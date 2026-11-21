@@ -212,11 +212,13 @@ install-oha:
         [ "$("{{repo-root}}/build/tools/oha" --version)" = "oha {{oha-version}}" ]; then exit 0; fi; \
     [ "$(uname -sm)" = "Linux x86_64" ] || { echo "install-oha supports linux-amd64 only" >&2; exit 1; }; \
     mkdir -p "{{repo-root}}/build/tools"; \
-    curl --fail --silent --show-error --location --output "{{repo-root}}/build/tools/oha.tmp" \
+    temporary=$(mktemp "{{repo-root}}/build/tools/oha.XXXXXXXX"); \
+    trap 'rm -f "$temporary"' EXIT; \
+    curl --fail --silent --show-error --location --output "$temporary" \
         "https://github.com/hatoo/oha/releases/download/v{{oha-version}}/oha-linux-amd64"; \
-    echo "85c6eb98066b8c8bd513b2dd96fafd8f9863249ea653606bae1ca2e3a75c43d2  {{repo-root}}/build/tools/oha.tmp" | sha256sum --check; \
-    chmod 0755 "{{repo-root}}/build/tools/oha.tmp"; \
-    mv "{{repo-root}}/build/tools/oha.tmp" "{{repo-root}}/build/tools/oha"
+    echo "85c6eb98066b8c8bd513b2dd96fafd8f9863249ea653606bae1ca2e3a75c43d2  $temporary" | sha256sum --check; \
+    chmod 0755 "$temporary"; \
+    mv "$temporary" "{{repo-root}}/build/tools/oha"
 
 prepare-workspace: build-ly
     if [[ ! -f build/workspace/lampyr.workspace.yaml ]]; then build/ly scaffold workspace build/workspace; fi
