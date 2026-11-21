@@ -10,13 +10,14 @@ fn fixture() -> std::path::PathBuf {
 }
 
 #[test]
-fn dev_help_offers_request_metrics() {
+fn dev_help_offers_independent_request_metrics_and_observability() {
     let output = Command::new(env!("CARGO_BIN_EXE_ly"))
         .args(["dev", "--help"])
         .output()
         .unwrap();
     assert!(output.status.success());
     assert!(String::from_utf8_lossy(&output.stdout).contains("--metrics"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("--observability"));
 }
 
 #[test]

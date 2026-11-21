@@ -31,6 +31,7 @@ pub enum Output {
     Capture,
     File(std::fs::File),
     Interactive,
+    InteractiveWithGrace(std::time::Duration),
 }
 
 pub fn run(
@@ -110,7 +111,11 @@ mod unix {
         deadline: Option<Instant>,
         cancellation: &Cancellation,
     ) -> Result<ToolOutput> {
-        let interactive = matches!(&output, Output::Interactive);
+        let shutdown_grace = match &output {
+            Output::Interactive => Some(Duration::from_secs(7)),
+            Output::InteractiveWithGrace(grace) => Some(*grace),
+            _ => None,
+        };
         match output {
             Output::Capture => {
                 command.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -118,7 +123,7 @@ mod unix {
             Output::File(file) => {
                 command.stdout(file).stderr(Stdio::piped());
             }
-            Output::Interactive => {
+            Output::Interactive | Output::InteractiveWithGrace(_) => {
                 command.stdout(Stdio::inherit()).stderr(Stdio::inherit());
             }
         }
@@ -141,8 +146,8 @@ mod unix {
                 .map(|pipe| scope.spawn(move || capture(pipe, limit, deadline, cancellation)));
             let status = loop {
                 if cancellation.is_cancelled() {
-                    if interactive {
-                        terminate_gracefully(&mut child)?;
+                    if let Some(grace) = shutdown_grace {
+                        terminate_gracefully(&mut child, grace)?;
                     } else {
                         terminate(&mut child)?;
                     }
@@ -254,12 +259,11 @@ mod unix {
         Ok(())
     }
 
-    fn terminate_gracefully(child: &mut Child) -> Result<()> {
+    fn terminate_gracefully(child: &mut Child, grace: Duration) -> Result<()> {
         let pid = i32::try_from(child.id()).context("local tool PID is out of range")?;
         ensure!(pid > 0, "invalid local tool process group");
         signal_process(pid, libc::SIGTERM)?;
-        // ly-dev gets five seconds to drain requests; leave time for cleanup and summary output.
-        let deadline = Instant::now() + Duration::from_secs(7);
+        let deadline = Instant::now() + grace;
         let mut reaped = false;
         loop {
             reaped |= child

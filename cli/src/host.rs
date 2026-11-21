@@ -193,10 +193,18 @@ impl Host {
     }
 
     pub fn interactive(&self, command: &mut Command) -> Result<()> {
+        self.interactive_with_grace(command, Duration::from_secs(7))
+    }
+
+    pub fn interactive_with_grace(
+        &self,
+        command: &mut Command,
+        shutdown_grace: Duration,
+    ) -> Result<()> {
         command.stdin(Stdio::inherit());
         let output = tools::execute(
             command,
-            Output::Interactive,
+            Output::InteractiveWithGrace(shutdown_grace),
             8 * 1024 * 1024,
             None,
             &self.cancellation,
