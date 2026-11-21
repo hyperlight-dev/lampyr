@@ -278,6 +278,7 @@ check-action-versions:
 
 # Run focused unit tests for Lampyr.
 test-unit:
+    python3 "{{repo-root}}/scripts/tests/test_scale_test.py"
     go test ./cmd/... ./internal/...
     python3 "{{repo-root}}/scripts/tests/test_worker_workspace.py"
 
