@@ -59,14 +59,14 @@ test-group-umask:
 test: lint test-packaging
     cargo test --locked --manifest-path "{{project-root}}/Cargo.toml" --lib --bins \
         --test adapter --test assets --test cluster --test connection --test dev --test event \
-        --test image --test installation --test kubernetes --test platform --test project \
+        --test image --test installation --test kubernetes --test observability --test platform --test project \
         --test provider_registry --test standalone --test template_versions --test tools --test workspace
 
 # Check and run the portable CLI integration tests on native macOS.
 test-macos: lint
     cargo test --locked --manifest-path "{{project-root}}/Cargo.toml" --bins \
         --test assets --test connection --test dev \
-        --test image --test installation --test platform --test project \
+        --test image --test installation --test observability --test platform --test project \
         --test standalone --test template_versions --test tools --test workspace \
         -- --test-threads=1
 

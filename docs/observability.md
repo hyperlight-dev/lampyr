@@ -9,6 +9,35 @@ fiber-router serves Prometheus metrics on port 9090 at `/metrics`. Every
 series is labelled with the Revision's `namespace` and `revision`. A Revision's
 series are removed when its route goes away.
 
+## Install the optional add-on
+
+Lampyr's optional add-on installs pinned Prometheus, kube-state-metrics, and
+Jaeger workloads. It configures fiber-router trace export.
+
+```bash
+ly observability install --context CONTEXT
+```
+
+The add-on keeps up to 24 hours of metrics on ephemeral cluster storage and up
+to 10,000 traces in memory. A Pod restart removes its traces. A Pod replacement
+can also remove its metrics. It is intended for
+development, performance analysis, and small clusters. Use an externally
+managed observability system when durable retention or high availability is
+required.
+
+Inspect or remove the add-on:
+
+```bash
+ly observability status --context CONTEXT
+ly observability uninstall --context CONTEXT
+```
+
+Uninstall disables fiber-router trace export before it removes Jaeger.
+Remove the add-on before `ly cluster uninstall` when retaining the Kubernetes
+cluster; the platform uninstall does not remove optional add-ons.
+
+## Platform metrics
+
 | Metric | Type | Meaning |
 |---|---|---|
 | `lampyr_router_fibers_busy` | gauge | Fibers serving a request right now. Idle reuse Fibers kept in a pool are not counted. |
@@ -22,7 +51,7 @@ series are removed when its route goes away.
 | `lampyr_router_shed_total` | counter | Requests the Revision's home refused, with a 503 and `Retry-After`: it was already running `fibers.max` Fibers, or it was under memory or task-limit (pids) pressure, or it still refused the request for now when its acquire deadline would pass: its clone rate limit, or its helper restoring so many Fibers that a new one couldn't start within the request's deadline. A request whose client went away first is counted as `canceled` in `lampyr_router_fiber_acquire_seconds` instead. fiberd-k8s-controller refusing for now to name the Revision's home also gets a 503 with `Retry-After`, but is not counted. |
 | `lampyr_router_clone_retries_total` | counter | Clones the router tried again within the request's acquire deadline, by `reason`: `rate_limit` after waiting out the home's clone rate limit, `restores_busy` after waiting 250ms to 1s when the home's helper was restoring too many Fibers to start one more in time, or `home_unreachable` after asking for the grant's homes again when the Clone reached no home, as when a rollout replaced the grant's Pod. A request that still gets no Fiber is counted where it fails, as a shed or an error. |
 
-## Scrape the router
+## Use another Prometheus installation
 
 The platform NetworkPolicy only admits ingress traffic to fiber-router, so a
 scraper needs a policy of its own. With the Prometheus Operator running in a

@@ -25,6 +25,7 @@ PLATFORM_STATIC = [
     "k8s/fiber-router.yaml",
     "k8s/fiberd-tenant.yaml",
     "k8s/hyperlight-device-plugin.yaml",
+    "k8s/observability.yaml",
     "k8s/serving-controller.yaml",
     "upstream/pins.env",
 ]
