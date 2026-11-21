@@ -8,7 +8,7 @@ description: Compare Lampyr with the same application in a Kubernetes Deployment
 The opt-in scale framework compares a Lampyr Service with the same Go
 application in a normal Kubernetes Deployment. It uses oha for client latency
 and throughput, and queries the optional observability add-on for platform
-metrics. It does not run in CI.
+metrics. The live comparison does not run in CI.
 
 Install the add-on and deploy the committed Go standalone example through
 Lampyr. Build and publish the normal Kubernetes image from the same source:
@@ -32,7 +32,7 @@ just scale-test \
 The default sweep runs each target for 30 seconds at concurrency 1, 4, 16,
 and 64. The framework:
 
-- creates a temporary one-replica Kubernetes Deployment and Service;
+- creates a temporary one-replica Deployment and Service with unique names;
 - warms both targets;
 - runs the same client against Lampyr and Kubernetes;
 - queries Prometheus for request, Fiber, CPU, and memory measurements;
@@ -46,14 +46,19 @@ port-forward and stops if it exits, but the tunnel can still limit high
 concurrency results. This framework is for repeatable comparisons, not a claim
 that the two network paths have identical overhead.
 
+The runner requires one baseline replica and a duration of at least 30 seconds.
+Both targets use a 10-second request timeout, including warmup. Cleanup removes
+only resources this run created.
+
 The report calculates HTTP success from response status codes and transport
 errors. Its latency columns include only successful HTTP responses. Platform
 error and shed counts come from Lampyr metrics. The runner waits for a final
-Prometheus scrape after each load interval. If needed, it waits for up to five
-more scrape intervals so short smoke tests still have enough cAdvisor samples.
-CPU measurements include that collection interval.
+healthy Prometheus scrape from every router after each load interval. It can
+wait for up to five more scrape intervals. Counter resets reject the scenario.
+The measurement window includes the pre-load router scrape and the final
+collection interval. Peak memory is the maximum combined usage at one time.
 
-Use the Lampyr Platform Grafana dashboard while a run is active. The JSON
+Use the Lampyr Platform Perses dashboard while a run is active. The JSON
 result remains the source for comparisons across commits or machines. It
 records the image digest, namespace, replica count, oha version, Git state, and
 a limited node summary without node addresses or machine identifiers.

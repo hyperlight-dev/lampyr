@@ -255,7 +255,7 @@ class ScaleTestTests(unittest.TestCase):
 
     def test_baseline_manifest_uses_restricted_pod_security(self):
         manifest = scale.baseline_manifest(
-            "example.test/baseline@sha256:abc", 1, "team-a"
+            "example.test/baseline@sha256:abc", 1, "team-a", "baseline-owned"
         )
         deployment = manifest["items"][0]
         pod = deployment["spec"]["template"]["spec"]
