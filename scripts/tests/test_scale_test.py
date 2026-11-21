@@ -427,7 +427,7 @@ class ScaleTestTests(unittest.TestCase):
             self.assertEqual(version[0], str(executable))
 
     @contextlib.contextmanager
-    def scenario_environment(self, routers, resources):
+    def scenario_environment(self, routers, resources, inventory=None):
         clock = scale.datetime.datetime.fromtimestamp(400, scale.datetime.timezone.utc)
         baseline = {
             "name": "baseline-owned",
@@ -439,6 +439,10 @@ class ScaleTestTests(unittest.TestCase):
             "httpSuccessRate": 1,
             "successfulLatencyMs": {"p95": 1},
         }
+        coverage = (
+            contextlib.nullcontext() if inventory is not None else
+            mock.patch.object(scale, "resource_coverage", create=True, return_value=True)
+        )
         with mock.patch.object(
             scale.sys, "argv", self.main_arguments()
         ), mock.patch.object(
@@ -459,6 +463,8 @@ class ScaleTestTests(unittest.TestCase):
         ), mock.patch.object(
             scale, "resource_samples", create=True, side_effect=resources,
         ), mock.patch.object(
+            scale, "resource_inventory", create=True, return_value=inventory or {},
+        ), mock.patch.object(
             scale.datetime, "datetime", wraps=scale.datetime.datetime
         ) as datetime, mock.patch.object(
             scale.time, "time", return_value=420
@@ -468,7 +474,7 @@ class ScaleTestTests(unittest.TestCase):
             scale, "write_json"
         ) as write, mock.patch.object(
             scale, "write_report"
-        ), mock.patch.object(scale, "print", create=True):
+        ), mock.patch.object(scale, "print", create=True), coverage:
             datetime.now.return_value = clock
             yield write
 
@@ -512,6 +518,39 @@ class ScaleTestTests(unittest.TestCase):
         ) as write:
             scale.main()
             self.assertEqual(len(write.call_args.args[0]["scenarios"]), 2)
+
+    def test_scenario_rejects_missing_router_membership_at_both_endpoints(self):
+        inventory = {
+            "lampyrRouter": {
+                ("lampyr-system", "router-1"), ("lampyr-system", "router-2"),
+            },
+            "lampyrHome": {("team-a", "home-1")},
+        }
+        queries = scale.resource_sample_queries(
+            "team-a", "demo-00001", "baseline-owned", "lampyr"
+        )
+        for missing in ("membership", "router-target"):
+            samples = {}
+            for source in queries:
+                pods = (
+                    [("lampyr-system", f"router-{number}") for number in (
+                        (1,) if missing == "membership" else (1, 2)
+                    )] if source.startswith("lampyrRouter")
+                    else [("team-a", "home-1")]
+                )
+                for namespace, pod in pods:
+                    labels = {"scale_input": source, "namespace": namespace, "pod": pod}
+                    samples[tuple(sorted(labels.items()))] = 420
+            routers = {
+                (("pod", f"router-{number}"),): 420
+                for number in ((1, 2) if missing == "membership" else (1,))
+            }
+            with self.subTest(missing=missing), self.scenario_environment(
+                [routers] * 20, [samples] * 20, inventory,
+            ) as write:
+                with self.assertRaisesRegex(RuntimeError, "fresh.*resource"):
+                    scale.main()
+                write.assert_not_called()
 
     def test_resource_samples_require_every_input_family(self):
         queries = {"cpu": "cpu_timestamp", "phase": "phase_timestamp"}
