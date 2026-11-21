@@ -183,6 +183,7 @@ def resource_samples(context, queries, evaluation_time):
     values = prometheus_results(context, query, evaluation_time)
     samples = {}
     sources = set()
+    containers = {}
     for item in values:
         source = item["metric"].get("scale_input")
         if source not in queries:
@@ -192,7 +193,19 @@ def resource_samples(context, queries, evaluation_time):
             raise RuntimeError("Prometheus resource sample timestamp is not finite")
         sources.add(source)
         samples[tuple(sorted(item["metric"].items()))] = timestamp
-    return samples if sources == queries.keys() else None
+        identity = tuple(sorted(
+            (label, value) for label, value in item["metric"].items()
+            if label not in {"scale_input", "__name__", "cpu"}
+        ))
+        containers.setdefault(source, set()).add(identity)
+    if sources != queries.keys():
+        return None
+    for source in queries:
+        if source.endswith("Cpu"):
+            memory = source.removesuffix("Cpu") + "Memory"
+            if containers[source] != containers[memory]:
+                return None
+    return samples
 
 
 def metric_queries(namespace, revision, window, baseline, window_seconds=30):
