@@ -103,22 +103,100 @@ def router_scrapes(context, evaluation_time):
     return scrapes
 
 
+def resource_inputs(namespace, revision, baseline):
+    baseline_pods = f'namespace="{namespace}",pod=~"{baseline}-.*"'
+    phase = f'kube_pod_status_phase{{namespace="{namespace}",phase="Running"}}'
+    return {
+        "lampyrRouter": {
+            "cpu": 'container_cpu_usage_seconds_total{namespace="lampyr-system",container="router"}',
+            "memory": 'container_memory_working_set_bytes{namespace="lampyr-system",container="router"}',
+            "phase": 'kube_pod_status_phase{namespace="lampyr-system",phase="Running"}',
+        },
+        "lampyrHome": {
+            "cpu": f'container_cpu_usage_seconds_total{{namespace="{namespace}",container="fiberd"}}',
+            "memory": f'container_memory_working_set_bytes{{namespace="{namespace}",container="fiberd"}}',
+            "phase": phase,
+            "labels": (
+                f'kube_pod_labels{{namespace="{namespace}",label_lampyr_dev_home="true",'
+                f'label_serving_knative_dev_revision="{revision}"}}'
+            ),
+        },
+        "baseline": {
+            "cpu": f'container_cpu_usage_seconds_total{{{baseline_pods},container="app"}}',
+            "memory": f'container_memory_working_set_bytes{{{baseline_pods},container="app"}}',
+            "phase": phase,
+        },
+    }
+
+
+def selected_resource(selector, inputs):
+    membership = f'({inputs["phase"]} == 1)'
+    if "labels" in inputs:
+        membership = (
+            f'({inputs["labels"]} * on(namespace,pod) group_left() {membership})'
+        )
+    return f"{selector} * on(namespace,pod) group_left() {membership}"
+
+
+def resource_sample_queries(namespace, revision, baseline, target):
+    inputs = resource_inputs(namespace, revision, baseline)
+    prefixes = {
+        "lampyr": ("lampyrRouter", "lampyrHome"),
+        "kubernetes": ("baseline",),
+    }[target]
+    queries = {
+        "kubeState": (
+            'timestamp(up{job="kube-state-metrics"}) '
+            '* (up{job="kube-state-metrics"} == bool 1)'
+        ),
+    }
+    for prefix in prefixes:
+        resource = inputs[prefix]
+        selected_cpu = selected_resource(resource["cpu"], resource)
+        selected_memory = selected_resource(resource["memory"], resource)
+        selected = f"({selected_cpu}) or ({selected_memory})"
+        pods = f"group by(namespace,pod) ({selected})"
+        nodes = f"group by(job,instance,node) ({selected})"
+        for kind in ("cpu", "memory"):
+            queries[f"{prefix}{kind.title()}"] = selected_resource(
+                f'timestamp({resource[kind]})', resource
+            )
+        for kind in ("phase", "labels"):
+            if kind in resource:
+                queries[f"{prefix}{kind.title()}"] = (
+                    f'timestamp({resource[kind]}) '
+                    f"* on(namespace,pod) group_left() ({pods})"
+                )
+        queries[f"{prefix}Cadvisor"] = (
+            'timestamp(up{job="kubernetes-cadvisor"}) '
+            '* (up{job="kubernetes-cadvisor"} == bool 1) '
+            f"and on(job,instance,node) ({nodes})"
+        )
+    return queries
+
+
+def resource_samples(context, queries, evaluation_time):
+    query = " or ".join(
+        f'label_replace(({expression}), "scale_input", "{name}", "", "")'
+        for name, expression in queries.items()
+    )
+    values = prometheus_results(context, query, evaluation_time)
+    samples = {}
+    sources = set()
+    for item in values:
+        source = item["metric"].get("scale_input")
+        if source not in queries:
+            raise RuntimeError(f"Prometheus returned an unknown resource input: {source}")
+        timestamp = float(item["value"][1])
+        if not math.isfinite(timestamp):
+            raise RuntimeError("Prometheus resource sample timestamp is not finite")
+        sources.add(source)
+        samples[tuple(sorted(item["metric"].items()))] = timestamp
+    return samples if sources == queries.keys() else None
+
+
 def metric_queries(namespace, revision, window, baseline, window_seconds=30):
     revision_match = f'namespace="{namespace}",revision="{revision}"'
-    running_home = (
-        '* on(namespace,pod) group_left() '
-        f'(kube_pod_status_phase{{namespace="{namespace}",phase="Running"}} == 1)'
-    )
-    running_router = (
-        '* on(namespace,pod) group_left() '
-        '(kube_pod_status_phase{namespace="lampyr-system",phase="Running"} == 1)'
-    )
-    home = (
-        '* on(namespace,pod) group_left() '
-        f'(kube_pod_labels{{namespace="{namespace}",label_lampyr_dev_home="true",'
-        f'label_serving_knative_dev_revision="{revision}"}} {running_home})'
-    )
-    baseline_pods = f'namespace="{namespace}",pod=~"{baseline}-.*"'
     counter_series = {
         "lampyrRequests": (
             "lampyr_router_request_duration_seconds_count"
@@ -131,24 +209,12 @@ def metric_queries(namespace, revision, window, baseline, window_seconds=30):
         "lampyrShed": f"lampyr_router_shed_total{{{revision_match}}}",
         "lampyrRetries": f"lampyr_router_clone_retries_total{{{revision_match}}}",
     }
-    router_memory = (
-        "sum(container_memory_working_set_bytes"
-        '{namespace="lampyr-system",container="router"} '
-        f"{running_router})"
-    )
-    home_memory = (
-        "sum(container_memory_working_set_bytes"
-        f'{{namespace="{namespace}",container="fiberd"}} {home})'
-    )
-    return {
+    queries = {
         **{name: f"sum({series})" for name, series in counter_series.items()},
         **{
             f"{name}Resets": f"sum(resets({series}[{window}]))"
             for name, series in counter_series.items()
         },
-        "lampyrMemoryBytes": (
-            f"max_over_time((({router_memory}) + ({home_memory}))[{window}:5s])"
-        ),
         "lampyrRequestP95Seconds": (
             "histogram_quantile(0.95,sum by(le)(increase("
             f"lampyr_router_request_duration_seconds_bucket{{{revision_match}}}"
@@ -167,37 +233,20 @@ def metric_queries(namespace, revision, window, baseline, window_seconds=30):
             "max_over_time((sum(lampyr_router_requests_in_flight"
             f"{{{revision_match}}}))[{window}:5s])"
         ),
-        "lampyrRouterCPU": (
-            "sum(increase(container_cpu_usage_seconds_total"
-            f'{{namespace="lampyr-system",container="router"}}[{window}])'
-            f" {running_router}"
-            ")"
-            f" / {window_seconds:.3f}"
-        ),
-        "lampyrRouterMemoryBytes": (
-            f"max_over_time(({router_memory})[{window}:5s])"
-        ),
-        "lampyrHomeCPU": (
-            "(sum(increase(container_cpu_usage_seconds_total"
-            f'{{namespace="{namespace}",container="fiberd"}}[{window}]) '
-            f"{home})) / {window_seconds:.3f}"
-        ),
-        "lampyrHomeMemoryBytes": (
-            f"max_over_time(({home_memory})[{window}:5s])"
-        ),
-        "baselineCPU": (
-            "sum(increase(container_cpu_usage_seconds_total"
-            f"{{{baseline_pods},container=\"app\"}}[{window}])"
-            f" {running_home}"
-            ")"
-            f" / {window_seconds:.3f}"
-        ),
-        "baselineMemoryBytes": (
-            "max_over_time((sum(container_memory_working_set_bytes"
-            f"{{{baseline_pods},container=\"app\"}} {running_home}))"
-            f"[{window}:5s])"
-        ),
     }
+    memory = {}
+    for prefix, resource in resource_inputs(namespace, revision, baseline).items():
+        cpu = selected_resource(f'increase({resource["cpu"]}[{window}])', resource)
+        memory[prefix] = f'sum({selected_resource(resource["memory"], resource)})'
+        queries[f"{prefix}CPU"] = f"sum({cpu}) / {window_seconds:.3f}"
+        queries[f"{prefix}MemoryBytes"] = (
+            f"max_over_time(({memory[prefix]})[{window}:5s])"
+        )
+    queries["lampyrMemoryBytes"] = (
+        f'max_over_time((({memory["lampyrRouter"]}) + '
+        f'({memory["lampyrHome"]}))[{window}:5s])'
+    )
+    return queries
 
 
 COUNTER_METRICS = {
@@ -639,11 +688,13 @@ def main():
         raise ValueError("concurrency values must be positive integers")
     if args.baseline_replicas != 1:
         raise ValueError("baseline must use one replica with Service port-forward")
+    output = Path(args.output)
+    if output.suffix.lower() == ".md":
+        raise ValueError("JSON and Markdown output files must be distinct; do not use .md")
     oha = Path(args.oha).resolve()
     if not oha.is_file():
         raise FileNotFoundError(f"load generator not found: {oha}")
     revision = active_revision(args.context, args.service, args.namespace)
-    output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     metadata = {
         "context": args.context,
@@ -690,6 +741,7 @@ def main():
             if target == "kubernetes":
                 require_running(baseline["process"], "baseline port-forward")
             warm_target(oha, url)
+        warmup_ended = datetime.datetime.now(datetime.timezone.utc).timestamp()
         time.sleep(6)
         for concurrency in concurrencies:
             for target, url in [
@@ -701,11 +753,32 @@ def main():
                 snapshot_queries = metric_queries(
                     args.namespace, revision, "1s", baseline["name"], 1
                 )
-                snapshot_time = time.time()
-                before_scrapes = router_scrapes(args.context, snapshot_time)
-                if any(timestamp <= 0 for timestamp in before_scrapes.values()):
-                    raise RuntimeError("Prometheus router targets are not healthy")
-                measurement_started = min(before_scrapes.values()) - 0.001
+                sample_queries = resource_sample_queries(
+                    args.namespace, revision, baseline["name"], target
+                )
+                for wait_seconds in (0, 5, 5, 5, 5, 5, 5):
+                    if wait_seconds:
+                        time.sleep(wait_seconds)
+                    snapshot_time = time.time()
+                    before_scrapes = router_scrapes(args.context, snapshot_time)
+                    before_resources = resource_samples(
+                        args.context, sample_queries, snapshot_time
+                    )
+                    if before_resources is not None and all(
+                        timestamp >= warmup_ended
+                        for timestamp in (
+                            *before_scrapes.values(), *before_resources.values()
+                        )
+                    ):
+                        break
+                else:
+                    raise RuntimeError(
+                        f"Prometheus did not collect fresh pre-load router and "
+                        f"resource samples for {target}"
+                    )
+                measurement_started = min(
+                    *before_scrapes.values(), *before_resources.values()
+                ) - 0.001
                 before = counter_snapshot(args.context, snapshot_queries, snapshot_time)
                 if before["lampyrRequests"] is None:
                     raise RuntimeError(
@@ -725,6 +798,12 @@ def main():
                     if scrapes.keys() != before_scrapes.keys() or any(
                         timestamp < load_ended.timestamp()
                         for timestamp in scrapes.values()
+                    ):
+                        continue
+                    samples = resource_samples(args.context, sample_queries, evaluated)
+                    if samples is None or samples.keys() != before_resources.keys() or any(
+                        timestamp < load_ended.timestamp()
+                        for timestamp in samples.values()
                     ):
                         continue
                     measured_seconds = evaluated - measurement_started
@@ -749,8 +828,8 @@ def main():
                         break
                 else:
                     raise RuntimeError(
-                        f"Prometheus did not collect fresh post-load router scrapes "
-                        f"and CPU and memory metrics for {target}"
+                        f"Prometheus did not collect fresh post-load router and "
+                        f"resource samples with CPU and memory metrics for {target}"
                     )
                 scenario = {
                     "target": target,
