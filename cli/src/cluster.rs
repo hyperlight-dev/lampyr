@@ -161,6 +161,8 @@ pub fn run(operation: Operation, options: Options<'_>, host: &Host) -> Result<()
 struct RuntimePlan {
     #[serde(default)]
     options: serde_json::Map<String, Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    platform_mutations: Vec<Value>,
     #[serde(default)]
     before: Vec<Value>,
     #[serde(default)]
@@ -171,6 +173,9 @@ struct RuntimePlan {
 
 impl RuntimePlan {
     fn validate(&self) -> Result<()> {
+        for mutation in &self.platform_mutations {
+            crate::platform_host::validate_cert_manager_credential(mutation)?;
+        }
         for manifest in self.before.iter().chain(&self.after).chain(&self.cleanup) {
             validate_manifest(manifest)?;
         }
@@ -475,7 +480,7 @@ fn existing_lifecycle(
     let defaulted = fill_controller_defaults(settings, &controller_defaults(root)?);
     crate::platform_host::validate_settings(&record.settings)?;
     let install_settings = record.settings.clone();
-    record.plan = effective_runtime_plan(&record.plan, &install_settings);
+    record.plan = approval_runtime_plan(&kube, &record.plan, &install_settings)?;
     record.settings = without_fields(&record.settings, &defaulted);
     record.eventing |= requested_eventing == Some(json!(true));
     let provider = data
@@ -698,6 +703,10 @@ fn lifecycle(
                 .unwrap_or(json!({})),
         )
         .context("decode provider-emitted runtime manifests")?;
+        ensure!(
+            plan.platform_mutations.is_empty(),
+            "provider runtime plans cannot predeclare installed platform mutations"
+        );
         let mut settings = plan.options.clone();
         for field in ["domain", "fiberdImage", "routerImage"] {
             settings.insert(field.into(), config[field].clone());
@@ -717,7 +726,7 @@ fn lifecycle(
         settings.entry("httpsPort").or_insert(json!(443));
         let settings = Value::Object(settings);
         crate::platform_host::validate_settings(&settings)?;
-        let plan = effective_runtime_plan(&plan, &settings);
+        let plan = approval_runtime_plan(&kube, &plan, &settings)?;
         plan.validate()?;
         validate_provider_manifest_capability_for_plan(&plan, provider_manifests)?;
         if let Err(approval_error) = approve_install_manifests(installation, &plan, manifests) {
@@ -899,9 +908,34 @@ fn effective_runtime_plan(plan: &RuntimePlan, settings: &Value) -> RuntimePlan {
     effective
 }
 
-#[cfg(test)]
-fn credential_transition_mutations(effective: Option<&Value>, _installed: &[Value]) -> Vec<Value> {
-    effective.cloned().into_iter().collect()
+fn credential_transition_mutations(effective: Option<&Value>, installed: &[Value]) -> Vec<Value> {
+    let mut mutations = Vec::new();
+    for mutation in effective.into_iter().chain(installed) {
+        if !mutations.contains(mutation) {
+            mutations.push(mutation.clone());
+        }
+    }
+    mutations
+}
+
+fn approval_runtime_plan(
+    kube: &Kube<'_>,
+    plan: &RuntimePlan,
+    settings: &Value,
+) -> Result<RuntimePlan> {
+    let mut effective = effective_runtime_plan(plan, settings);
+    let current = effective_credential_mutation(&effective)?;
+    let installed = crate::bootstrap::installed_cert_manager_credential_mutations(kube)?;
+    effective.platform_mutations = credential_transition_mutations(current.as_ref(), &installed);
+    Ok(effective)
+}
+
+fn effective_credential_mutation(plan: &RuntimePlan) -> Result<Option<Value>> {
+    plan.options
+        .get("ingress")
+        .and_then(|ingress| ingress.pointer("/tls/credential"))
+        .map(crate::platform_host::canonical_cert_manager_credential)
+        .transpose()
 }
 
 fn validate_provider_manifest_capability_for_plan(
@@ -911,17 +945,22 @@ fn validate_provider_manifest_capability_for_plan(
     let has_manifests = !plan.before.is_empty()
         || !plan.after.is_empty()
         || !plan.cleanup.is_empty()
-        || embedded_platform_mutations(plan).is_some();
+        || !embedded_platform_mutations(plan).is_empty();
     if !has_manifests {
         return Ok(());
     }
     validate_provider_manifest_capability(declared)
 }
 
-fn embedded_platform_mutations(plan: &RuntimePlan) -> Option<&Value> {
+fn embedded_platform_mutations(plan: &RuntimePlan) -> Vec<&Value> {
+    if !plan.platform_mutations.is_empty() {
+        return plan.platform_mutations.iter().collect();
+    }
     plan.options
         .get("ingress")
         .and_then(|ingress| ingress.pointer("/tls/credential"))
+        .into_iter()
+        .collect()
 }
 
 fn validate_provider_manifest_capability(declared: bool) -> Result<()> {
@@ -947,7 +986,7 @@ fn approve_install_manifests_at(
     approval: ManifestApproval,
 ) -> Result<()> {
     let platform = embedded_platform_mutations(plan);
-    if plan.before.is_empty() && plan.after.is_empty() && platform.is_none() {
+    if plan.before.is_empty() && plan.after.is_empty() && platform.is_empty() {
         return Ok(());
     }
     let before = directory.join("before.yaml");
@@ -955,8 +994,16 @@ fn approve_install_manifests_at(
     write_manifest_file(&before, &plan.before)?;
     write_manifest_file(&after, &plan.after)?;
     let platform_path = directory.join("platform-mutations.yaml");
-    if let Some(platform) = platform {
-        write_yaml_file(&platform_path, platform)?;
+    if !platform.is_empty() {
+        write_yaml_file(
+            &platform_path,
+            &Value::Array(
+                platform
+                    .iter()
+                    .map(|mutation| (*mutation).clone())
+                    .collect(),
+            ),
+        )?;
     } else if platform_path.try_exists()? {
         std::fs::remove_file(&platform_path)?;
     }
@@ -968,10 +1015,10 @@ fn approve_install_manifests_at(
         plan,
         &before,
         &after,
-        platform.map(|_| platform_path.as_path()),
+        (!platform.is_empty()).then_some(platform_path.as_path()),
     );
-    if let Some(platform) = platform {
-        show_platform_mutations(platform);
+    for mutation in platform {
+        show_platform_mutations(mutation);
     }
     require_manifest_approval(approval, "Apply these provider Kubernetes manifests?")
 }
@@ -993,24 +1040,32 @@ fn approve_cleanup_manifests_at(
     approval: ManifestApproval,
 ) -> Result<()> {
     let platform = embedded_platform_mutations(plan);
-    if delete_cluster || (plan.cleanup.is_empty() && platform.is_none()) {
+    if delete_cluster || (plan.cleanup.is_empty() && platform.is_empty()) {
         return Ok(());
     }
     let cleanup = directory.join("cleanup.yaml");
     write_manifest_file(&cleanup, &plan.cleanup)?;
     let platform_path = directory.join("platform-mutations.yaml");
-    if let Some(platform) = platform {
-        write_yaml_file(&platform_path, platform)?;
+    if !platform.is_empty() {
+        write_yaml_file(
+            &platform_path,
+            &Value::Array(
+                platform
+                    .iter()
+                    .map(|mutation| (*mutation).clone())
+                    .collect(),
+            ),
+        )?;
     } else if platform_path.try_exists()? {
         std::fs::remove_file(&platform_path)?;
     }
     show_cleanup_manifests(
         &plan.cleanup,
         &cleanup,
-        platform.map(|_| platform_path.as_path()),
+        (!platform.is_empty()).then_some(platform_path.as_path()),
     );
-    if let Some(platform) = platform {
-        show_platform_mutations(platform);
+    for mutation in platform {
+        show_platform_mutations(mutation);
     }
     require_manifest_approval(approval, "Apply the provider cleanup manifests?")
 }
@@ -1041,7 +1096,7 @@ fn approve_providerless_uninstall_manifests(
     if plan.before.is_empty()
         && plan.after.is_empty()
         && plan.cleanup.is_empty()
-        && platform.is_none()
+        && platform.is_empty()
     {
         return Ok(());
     }
@@ -1052,8 +1107,16 @@ fn approve_providerless_uninstall_manifests(
     write_manifest_file(&after, &plan.after)?;
     write_manifest_file(&cleanup, &plan.cleanup)?;
     let platform_path = directory.join("platform-mutations.yaml");
-    if let Some(platform) = platform {
-        write_yaml_file(&platform_path, platform)?;
+    if !platform.is_empty() {
+        write_yaml_file(
+            &platform_path,
+            &Value::Array(
+                platform
+                    .iter()
+                    .map(|mutation| (*mutation).clone())
+                    .collect(),
+            ),
+        )?;
     }
 
     eprintln!();
@@ -1067,15 +1130,15 @@ fn approve_providerless_uninstall_manifests(
         "36;1",
         &plan.before,
     );
-    if let Some(platform) = platform {
-        show_platform_mutations(platform);
+    for mutation in &platform {
+        show_platform_mutations(mutation);
     }
     eprintln!();
     eprintln!("Files written locally:");
     eprintln!("  BEFORE  {}", style(&before.display().to_string(), "2"));
     eprintln!("  AFTER   {}", style(&after.display().to_string(), "2"));
     eprintln!("  CLEANUP {}", style(&cleanup.display().to_string(), "2"));
-    if platform.is_some() {
+    if !platform.is_empty() {
         eprintln!(
             "  PLATFORM {}",
             style(&platform_path.display().to_string(), "2")
@@ -1944,6 +2007,29 @@ mod tests {
         assert_eq!(
             credential_transition_mutations(None, &[installed.clone(), retiring.clone()]),
             vec![installed, retiring]
+        );
+
+        let requested = json!({
+            "serviceAccountPatch":{"metadata":{"annotations":{"provider.example/id":"identity"}}},
+            "serviceAccountCleanupPatch":{"metadata":{"annotations":{"provider.example/id":null}}},
+            "deploymentPatch":{"spec":{"template":{"metadata":{"annotations":{"provider.example/id":"identity"}}}}},
+            "deploymentCleanupPatch":{"spec":{"template":{"metadata":{"annotations":{"provider.example/id":null}}}}},
+            "controllerArgs":["--issuer-ambient-credentials=true"],
+            "controllerArgPrefixes":["--issuer-ambient-credentials"],
+            "boundary":{"apiVersion":"v1","kind":"List","items":[]},
+            "boundaryMessage":"provider boundary"
+        });
+        let mut plan = RuntimePlan::default();
+        plan.options.insert(
+            "ingress".into(),
+            json!({"tls":{"mode":"acme","credential":requested.clone()}}),
+        );
+        let effective = effective_credential_mutation(&plan).unwrap().unwrap();
+        let installed =
+            crate::platform_host::canonical_cert_manager_credential(&requested).unwrap();
+        assert_eq!(
+            credential_transition_mutations(Some(&effective), &[installed]),
+            vec![effective]
         );
     }
 

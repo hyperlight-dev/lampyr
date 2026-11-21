@@ -472,6 +472,17 @@ impl CertManagerCredential {
     }
 }
 
+pub(crate) fn validate_cert_manager_credential(value: &Value) -> Result<()> {
+    canonical_cert_manager_credential(value).map(|_| ())
+}
+
+pub(crate) fn canonical_cert_manager_credential(value: &Value) -> Result<Value> {
+    let credential: CertManagerCredential =
+        serde_json::from_value(value.clone()).context("decode cert-manager credential mutation")?;
+    credential.validate()?;
+    serde_json::to_value(credential).context("encode cert-manager credential mutation")
+}
+
 fn annotation_values(mapping: Option<&serde_json::Map<String, Value>>) -> bool {
     mapping.is_some_and(|mapping| {
         mapping

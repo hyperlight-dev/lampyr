@@ -1563,6 +1563,15 @@ fn decode_installed_cert_manager_credentials(
     Ok(InstalledCertManagerCredentials { current, retiring })
 }
 
+pub(crate) fn installed_cert_manager_credential_mutations(kube: &Kube<'_>) -> Result<Vec<Value>> {
+    installed_cert_manager_credentials(kube)?
+        .previous_for(None)
+        .iter()
+        .map(serde_json::to_value)
+        .collect::<std::result::Result<_, _>>()
+        .context("encode installed cert-manager credential mutations")
+}
+
 fn cert_manager_controller_args(
     deployment: &Value,
     current: Option<&crate::platform_host::CertManagerCredential>,
