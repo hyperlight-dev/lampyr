@@ -319,7 +319,7 @@ impl<'a> Kube<'a> {
         }
     }
 
-    fn timeout(&self, timeout: Duration) -> Result<Duration> {
+    pub(crate) fn timeout(&self, timeout: Duration) -> Result<Duration> {
         let timeout = self.deadline.get().map_or(timeout, |deadline| {
             timeout.min(deadline.saturating_duration_since(Instant::now()))
         });
