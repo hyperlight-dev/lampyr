@@ -20,6 +20,8 @@ import (
 	"time"
 
 	"github.com/hyperlight-dev/lampyr/internal/fiberdintegration"
+	"github.com/hyperlight-dev/lampyr/internal/telemetry"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/rest"
 )
@@ -62,6 +64,18 @@ func main() {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	stopTracing, err := telemetry.ConfigureTracing(ctx, "lampyr-fiber-router")
+	if err != nil {
+		log.Fatalf("configure tracing: %v", err)
+	}
+	shutdownTracing := func() {
+		shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := stopTracing(shutdown); err != nil {
+			log.Printf("stop tracing: %v", err)
+		}
+	}
+	defer shutdownTracing()
 	client, err := apiClient()
 	if err != nil {
 		log.Fatal(err)
@@ -94,7 +108,8 @@ func main() {
 	protocols := new(http.Protocols)
 	protocols.SetHTTP1(true)
 	protocols.SetUnencryptedHTTP2(true)
-	server := &http.Server{Handler: router.Handler(), ReadHeaderTimeout: 5 * time.Second, Protocols: protocols}
+	handler := traceRouterHandler(router.Handler())
+	server := &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second, Protocols: protocols}
 	listener, err := net.Listen("tcp", *listen)
 	if err != nil {
 		router.Close()
@@ -102,9 +117,29 @@ func main() {
 	}
 	log.Printf("Lampyr protocol consumer on %s", *listen)
 	if err := serve(ctx, listener, server, router); err != nil {
+		shutdownTracing()
 		log.Println(err)
 		os.Exit(1)
 	}
+}
+
+func traceRouterHandler(handler http.Handler) http.Handler {
+	return otelhttp.NewHandler(
+		handler,
+		"lampyr.router.request",
+		otelhttp.WithFilter(traceRouterRequest),
+		otelhttp.WithSpanNameFormatter(func(string, *http.Request) string {
+			return "lampyr.router.request"
+		}),
+	)
+}
+
+func traceRouterRequest(request *http.Request) bool {
+	if request.Header.Get("Knative-Serving-Namespace") != "" ||
+		request.Header.Get("Knative-Serving-Revision") != "" {
+		return true
+	}
+	return request.URL.Path != "/healthz" && request.URL.Path != "/readyz"
 }
 
 // drainTimeout is how long a shutdown lets requests, streams and WebSockets

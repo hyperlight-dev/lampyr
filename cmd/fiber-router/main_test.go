@@ -15,6 +15,11 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"go.opentelemetry.io/otel"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	"go.opentelemetry.io/otel/trace"
 )
 
 func TestWriteProbeResponse(t *testing.T) {
@@ -61,6 +66,56 @@ func TestWriteProbeResponseRejectsInvalidInput(t *testing.T) {
 			t.Fatalf("accepted port %d path %q", test.port, test.path)
 		}
 	}
+}
+
+func TestTraceRouterRequestExcludesOnlyRouterProbes(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		path     string
+		selected bool
+		want     bool
+	}{
+		{"health probe", "/healthz", false, false},
+		{"readiness probe", "/readyz", false, false},
+		{"selected health path", "/healthz", true, true},
+		{"selected readiness path", "/readyz", true, true},
+		{"application path", "/", false, true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			request := httptest.NewRequest("GET", test.path, nil)
+			if test.selected {
+				request.Header.Set("Knative-Serving-Namespace", "default")
+				request.Header.Set("Knative-Serving-Revision", "demo-00001")
+			}
+			if got := traceRouterRequest(request); got != test.want {
+				t.Fatalf("traceRouterRequest() = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestTraceRouterHandlerUsesStableServerSpanName(t *testing.T) {
+	previous := otel.GetTracerProvider()
+	recorder := tracetest.NewSpanRecorder()
+	provider := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(recorder))
+	otel.SetTracerProvider(provider)
+	t.Cleanup(func() {
+		_ = provider.Shutdown(t.Context())
+		otel.SetTracerProvider(previous)
+	})
+	handler := traceRouterHandler(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "http://router/application", nil))
+	for _, span := range recorder.Ended() {
+		if span.SpanKind() == trace.SpanKindServer {
+			if got := span.Name(); got != "lampyr.router.request" {
+				t.Fatalf("server span name = %q, want lampyr.router.request", got)
+			}
+			return
+		}
+	}
+	t.Fatal("server span was not recorded")
 }
 
 // order records what a shutdown did, in order.

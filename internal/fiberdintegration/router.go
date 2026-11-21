@@ -26,6 +26,12 @@ import (
 	"github.com/Azure/fiberd/pkg/core"
 	consumer "github.com/Azure/fiberd/sdk/go/client"
 	"github.com/hyperlight-dev/lampyr/internal/project"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	otelcodes "go.opentelemetry.io/otel/codes"
+	semconv "go.opentelemetry.io/otel/semconv/v1.37.0"
+	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	netheader "knative.dev/networking/pkg/http/header"
@@ -35,6 +41,29 @@ import (
 // Namespaces and names arrive in requests, so only those a Kubernetes
 // object could have are looked up.
 var grantName = regexp.MustCompile(`^[a-z0-9][a-z0-9_.-]*$`)
+
+const tracerName = "github.com/hyperlight-dev/lampyr/internal/fiberdintegration"
+
+func finishServerSpan(span trace.Span, status int, err error) {
+	span.SetAttributes(semconv.HTTPResponseStatusCode(status))
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(otelcodes.Error, err.Error())
+	}
+	span.End()
+}
+
+func finishAbortServerSpan(
+	span trace.Span,
+	recorder *statusRecorder,
+	client context.Context,
+	revision context.Context,
+) {
+	if recorder.switched {
+		return
+	}
+	finishServerSpan(span, requestStatus(recorder, client, revision), http.ErrAbortHandler)
+}
 
 func tokenDigest(token []byte) string {
 	return fmt.Sprintf("sha256:%x", sha256.Sum256(token))
@@ -243,7 +272,13 @@ func NewRouter(homes HomeResolver, routesDir string) (*Router, error) {
 		revisions:   make(map[string]RevisionRoute),
 		generations: make(map[string]uint64),
 		pools:       make(map[string]*routerPool),
-		transport:   http.DefaultTransport, h2cTransport: newH2CTransport(),
+		transport:   tracedTransport(http.DefaultTransport),
+		h2cTransport: tracedTransport(
+			newH2CTransport(),
+			otelhttp.WithSpanNameFormatter(func(_ string, request *http.Request) string {
+				return request.Method + " Fiber"
+			}),
+		),
 		AcquireTimeout: DefaultAcquireTimeout,
 		requests:       newRequestTracker(),
 	}
@@ -252,6 +287,88 @@ func NewRouter(homes HomeResolver, routesDir string) (*Router, error) {
 		return nil, err
 	}
 	return router, nil
+}
+
+type upgradeCloseWriter interface {
+	CloseWrite() error
+}
+
+type upgradeCloseWriteCapture struct {
+	closeWriter upgradeCloseWriter
+}
+
+type upgradeCloseWriteCaptureKey struct{}
+
+type upgradeCloseWriteTransport struct {
+	transport http.RoundTripper
+}
+
+func (transport upgradeCloseWriteTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	response, err := transport.transport.RoundTrip(request)
+	if err != nil || response == nil || response.StatusCode != http.StatusSwitchingProtocols {
+		return response, err
+	}
+	capture, _ := request.Context().Value(upgradeCloseWriteCaptureKey{}).(*upgradeCloseWriteCapture)
+	if capture != nil {
+		capture.closeWriter, _ = response.Body.(upgradeCloseWriter)
+	}
+	return response, nil
+}
+
+type tracedRoundTripper struct {
+	transport http.RoundTripper
+}
+
+type tracedUpgradeBody struct {
+	io.ReadCloser
+	writer      io.Writer
+	closeWriter upgradeCloseWriter
+}
+
+func (body *tracedUpgradeBody) Write(data []byte) (int, error) {
+	return body.writer.Write(data)
+}
+
+func (body *tracedUpgradeBody) CloseWrite() error {
+	return body.closeWriter.CloseWrite()
+}
+
+func (transport *tracedRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
+	if request.Header.Get("Upgrade") == "" {
+		return transport.transport.RoundTrip(request)
+	}
+	capture := new(upgradeCloseWriteCapture)
+	request = request.WithContext(
+		context.WithValue(request.Context(), upgradeCloseWriteCaptureKey{}, capture),
+	)
+	response, err := transport.transport.RoundTrip(request)
+	if err != nil || response == nil || response.StatusCode != http.StatusSwitchingProtocols ||
+		capture.closeWriter == nil {
+		return response, err
+	}
+	writer, ok := response.Body.(io.Writer)
+	if !ok {
+		writer, ok = capture.closeWriter.(io.Writer)
+	}
+	if !ok {
+		_ = response.Body.Close()
+		return nil, fmt.Errorf("traced upgrade response body %T is not writable", response.Body)
+	}
+	response.Body = &tracedUpgradeBody{
+		ReadCloser:  response.Body,
+		writer:      writer,
+		closeWriter: capture.closeWriter,
+	}
+	return response, nil
+}
+
+func tracedTransport(transport http.RoundTripper, options ...otelhttp.Option) http.RoundTripper {
+	return &tracedRoundTripper{
+		transport: otelhttp.NewTransport(
+			upgradeCloseWriteTransport{transport: transport},
+			options...,
+		),
+	}
 }
 
 func newH2CTransport() http.RoundTripper {
@@ -967,14 +1084,29 @@ func (router *Router) ServeHTTP(w http.ResponseWriter, request *http.Request) {
 	defer cancel()
 	revisionCtx = ctx
 	request = request.WithContext(ctx)
+	serverSpan := trace.SpanFromContext(request.Context())
+	serverSpan.SetAttributes(
+		attribute.String("lampyr.namespace", namespace),
+		attribute.String("lampyr.revision", revision.Revision),
+		attribute.String("lampyr.execution.mode", execution.Mode),
+	)
 	start := time.Now()
-	acquireCtx, stopAcquire := context.WithTimeout(ctx, router.AcquireTimeout)
-	fiber, finish, err := router.acquire(acquireCtx, ctx, namespace, revision.Revision, execution, func(reason string) {
+	acquireTraceCtx, acquireSpan := otel.Tracer(tracerName).Start(ctx, "lampyr.fiber.acquire")
+	acquireSpan.SetAttributes(
+		attribute.String("lampyr.namespace", namespace),
+		attribute.String("lampyr.revision", revision.Revision),
+		attribute.String("lampyr.execution.mode", execution.Mode),
+	)
+	acquireCtx, stopAcquire := context.WithTimeout(acquireTraceCtx, router.AcquireTimeout)
+	fiber, finish, err := router.acquire(acquireCtx, acquireTraceCtx, namespace, revision.Revision, execution, func(reason string) {
 		metrics.record(func() { cloneRetriesTotal.WithLabelValues(namespace, revision.Revision, reason).Inc() })
 	})
 	stopAcquire()
 	metric.CloneDuration = time.Since(start)
 	if err != nil {
+		acquireSpan.RecordError(err)
+		acquireSpan.SetStatus(otelcodes.Error, "Fiber acquisition failed")
+		acquireSpan.End()
 		recorder.fail()
 		outcome := "error"
 		if clientCtx.Err() != nil {
@@ -1009,6 +1141,15 @@ func (router *Router) ServeHTTP(w http.ResponseWriter, request *http.Request) {
 		http.Error(w, "no Fiber is available for this Revision", http.StatusServiceUnavailable)
 		return
 	}
+	acquireSpan.SetAttributes(
+		attribute.String("lampyr.fiber.id", fiber.ID),
+		attribute.String("lampyr.fiber.kind", fiber.Kind.String()),
+	)
+	acquireSpan.End()
+	serverSpan.SetAttributes(
+		attribute.String("lampyr.fiber.id", fiber.ID),
+		attribute.String("lampyr.fiber.kind", fiber.Kind.String()),
+	)
 	transitionStage("proxy")
 	acquired := metric.CloneDuration
 	cloneMS := acquired.Milliseconds()
@@ -1070,12 +1211,24 @@ func (router *Router) ServeHTTP(w http.ResponseWriter, request *http.Request) {
 	defer func() {
 		if recorder.switched {
 			ended := time.Now()
+			outcome := websocketOutcome(recorder, revisionCtx)
+			var spanErr error
+			switch outcome {
+			case "timeout":
+				spanErr = context.DeadlineExceeded
+			case "error":
+				spanErr = errors.New("WebSocket proxy failed")
+			}
+			// The protocol switch is written on the hijacked connection, so
+			// otelhttp cannot observe 101. End its span here before it records
+			// the default 200 after the session returns.
+			finishServerSpan(serverSpan, http.StatusSwitchingProtocols, spanErr)
 			metrics.record(func() {
 				websocketSessions.WithLabelValues(namespace, revision.Revision).Dec()
 				websocketSessionSeconds.WithLabelValues(
 					namespace,
 					revision.Revision,
-					websocketOutcome(recorder, revisionCtx),
+					outcome,
 				).Observe(ended.Sub(websocketStarted).Seconds())
 			})
 		}
@@ -1085,6 +1238,7 @@ func (router *Router) ServeHTTP(w http.ResponseWriter, request *http.Request) {
 			if failure == http.ErrAbortHandler {
 				gone = true
 				recorder.fail()
+				finishAbortServerSpan(serverSpan, recorder, clientCtx, revisionCtx)
 			}
 			panic(failure)
 		}
