@@ -899,6 +899,11 @@ fn effective_runtime_plan(plan: &RuntimePlan, settings: &Value) -> RuntimePlan {
     effective
 }
 
+#[cfg(test)]
+fn credential_transition_mutations(effective: Option<&Value>, _installed: &[Value]) -> Vec<Value> {
+    effective.cloned().into_iter().collect()
+}
+
 fn validate_provider_manifest_capability_for_plan(
     plan: &RuntimePlan,
     declared: bool,
@@ -1921,6 +1926,24 @@ mod tests {
                 .unwrap()
                 .pointer("/tls/credential/boundaryMessage"),
             Some(&json!("new"))
+        );
+    }
+
+    #[test]
+    fn credential_transition_approval_includes_effective_installed_and_retiring_state() {
+        let effective = json!({"boundaryMessage":"effective"});
+        let installed = json!({"boundaryMessage":"installed"});
+        let retiring = json!({"boundaryMessage":"retiring"});
+        assert_eq!(
+            credential_transition_mutations(
+                Some(&effective),
+                &[installed.clone(), retiring.clone()]
+            ),
+            vec![effective, installed.clone(), retiring.clone()]
+        );
+        assert_eq!(
+            credential_transition_mutations(None, &[installed.clone(), retiring.clone()]),
+            vec![installed, retiring]
         );
     }
 
