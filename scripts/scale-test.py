@@ -108,11 +108,15 @@ def resource_inputs(namespace, revision, baseline):
     phase = f'kube_pod_status_phase{{namespace="{namespace}",phase="Running"}}'
     return {
         "lampyrRouter": {
+            "namespace": "lampyr-system",
+            "selector": "app=fiber-router",
             "cpu": 'container_cpu_usage_seconds_total{namespace="lampyr-system",container="router"}',
             "memory": 'container_memory_working_set_bytes{namespace="lampyr-system",container="router"}',
             "phase": 'kube_pod_status_phase{namespace="lampyr-system",phase="Running"}',
         },
         "lampyrHome": {
+            "namespace": namespace,
+            "selector": f"lampyr.dev/home=true,serving.knative.dev/revision={revision}",
             "cpu": f'container_cpu_usage_seconds_total{{namespace="{namespace}",container="fiberd"}}',
             "memory": f'container_memory_working_set_bytes{{namespace="{namespace}",container="fiberd"}}',
             "phase": phase,
@@ -122,6 +126,8 @@ def resource_inputs(namespace, revision, baseline):
             ),
         },
         "baseline": {
+            "namespace": namespace,
+            "selector": f"app={baseline}",
             "cpu": f'container_cpu_usage_seconds_total{{{baseline_pods},container="app"}}',
             "memory": f'container_memory_working_set_bytes{{{baseline_pods},container="app"}}',
             "phase": phase,
@@ -206,6 +212,51 @@ def resource_samples(context, queries, evaluation_time):
             if containers[source] != containers[memory]:
                 return None
     return samples
+
+
+def resource_inventory(context, namespace, revision, baseline, target):
+    inputs = resource_inputs(namespace, revision, baseline)
+    prefixes = {
+        "lampyr": ("lampyrRouter", "lampyrHome"),
+        "kubernetes": ("lampyrRouter", "baseline"),
+    }[target]
+    inventory = {}
+    for prefix in prefixes:
+        resource = inputs[prefix]
+        pods = json.loads(command(
+            "kubectl", "--context", context, "--namespace", resource["namespace"],
+            "get", "pods", "--selector", resource["selector"],
+            "--field-selector", "status.phase=Running", "--output", "json",
+        ))
+        inventory[prefix] = {
+            (pod["metadata"]["namespace"], pod["metadata"]["name"])
+            for pod in pods["items"]
+        }
+    return inventory
+
+
+def resource_coverage(samples, queries, inventory, scrapes):
+    if not samples:
+        return False
+    observed = {}
+    for identity in samples:
+        labels = dict(identity)
+        if "namespace" in labels and "pod" in labels:
+            observed.setdefault(labels["scale_input"], set()).add(
+                (labels["namespace"], labels["pod"])
+            )
+    for prefix, pods in inventory.items():
+        if not pods:
+            return False
+        for kind in ("Cpu", "Memory", "Phase", "Labels"):
+            source = prefix + kind
+            if source in queries and observed.get(source) != pods:
+                return False
+    routers = {
+        ("lampyr-system", dict(identity).get("pod"))
+        for identity in scrapes
+    }
+    return routers == inventory["lampyrRouter"]
 
 
 def metric_queries(namespace, revision, window, baseline, window_seconds=30):
@@ -773,11 +824,16 @@ def main():
                     if wait_seconds:
                         time.sleep(wait_seconds)
                     snapshot_time = time.time()
+                    before_inventory = resource_inventory(
+                        args.context, args.namespace, revision, baseline["name"], target
+                    )
                     before_scrapes = router_scrapes(args.context, snapshot_time)
                     before_resources = resource_samples(
                         args.context, sample_queries, snapshot_time
                     )
-                    if before_resources is not None and all(
+                    if resource_coverage(
+                        before_resources, sample_queries, before_inventory, before_scrapes
+                    ) and all(
                         timestamp >= warmup_ended
                         for timestamp in (
                             *before_scrapes.values(), *before_resources.values()
@@ -814,9 +870,17 @@ def main():
                     ):
                         continue
                     samples = resource_samples(args.context, sample_queries, evaluated)
-                    if samples is None or samples.keys() != before_resources.keys() or any(
-                        timestamp < load_ended.timestamp()
-                        for timestamp in samples.values()
+                    inventory = resource_inventory(
+                        args.context, args.namespace, revision, baseline["name"], target
+                    )
+                    if (
+                        not resource_coverage(samples, sample_queries, inventory, scrapes)
+                        or inventory != before_inventory
+                        or samples.keys() != before_resources.keys()
+                        or any(
+                            timestamp < load_ended.timestamp()
+                            for timestamp in samples.values()
+                        )
                     ):
                         continue
                     measured_seconds = evaluated - measurement_started

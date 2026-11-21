@@ -50,6 +50,7 @@ The runner requires one baseline replica and a duration of at least 30 seconds.
 Both targets use a 10-second request timeout, including warmup. Cleanup removes
 only resources this run created.
 Custom JSON output names must not use the `.md` extension.
+The context must allow read access to the measured Pods.
 
 The report calculates HTTP success from response status codes and transport
 errors. Its latency columns include only successful HTTP responses. Platform
@@ -57,6 +58,7 @@ error and shed counts come from Lampyr metrics. The runner waits for a final
 healthy Prometheus scrape from every router after each load interval. It also
 requires fresh cAdvisor samples from the measured containers and fresh
 kube-state-metrics inputs. Missing or changed input series reject the scenario.
+Coverage must match the running Pods from the Kubernetes API.
 It can wait for up to five more scrape intervals. Counter resets reject the
 scenario. The measurement window includes the pre-load router and resource
 samples after warmup, and the final collection interval. Peak memory is the
