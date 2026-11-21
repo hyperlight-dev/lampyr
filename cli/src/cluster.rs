@@ -717,6 +717,7 @@ fn lifecycle(
         settings.entry("httpsPort").or_insert(json!(443));
         let settings = Value::Object(settings);
         crate::platform_host::validate_settings(&settings)?;
+        let plan = effective_runtime_plan(&plan, &settings);
         plan.validate()?;
         validate_provider_manifest_capability_for_plan(&plan, provider_manifests)?;
         if let Err(approval_error) = approve_install_manifests(installation, &plan, manifests) {
@@ -863,11 +864,39 @@ fn merge_requested_settings(
 }
 
 fn merge_requested_ingress(generated: &mut Value, requested: &Value) {
-    *generated = requested.clone();
+    let (Some(generated), Some(requested)) = (generated.as_object_mut(), requested.as_object())
+    else {
+        *generated = requested.clone();
+        return;
+    };
+    for (field, value) in requested {
+        let target = generated.entry(field.clone()).or_insert(Value::Null);
+        let mode_changed =
+            field == "tls" && target["mode"].as_str().is_some() && target["mode"] != value["mode"];
+        if mode_changed {
+            *target = value.clone();
+        } else {
+            merge_requested_value(target, value);
+        }
+    }
 }
 
-fn effective_runtime_plan(plan: &RuntimePlan, _settings: &Value) -> RuntimePlan {
-    plan.clone()
+fn merge_requested_value(generated: &mut Value, requested: &Value) {
+    if let (Some(generated), Some(requested)) = (generated.as_object_mut(), requested.as_object()) {
+        for (field, value) in requested {
+            merge_requested_value(generated.entry(field.clone()).or_insert(Value::Null), value);
+        }
+    } else {
+        *generated = requested.clone();
+    }
+}
+
+fn effective_runtime_plan(plan: &RuntimePlan, settings: &Value) -> RuntimePlan {
+    let mut effective = plan.clone();
+    if let Some(ingress) = settings.get("ingress") {
+        effective.options.insert("ingress".into(), ingress.clone());
+    }
+    effective
 }
 
 fn validate_provider_manifest_capability_for_plan(
@@ -1859,6 +1888,19 @@ mod tests {
         assert_eq!(generated["tls"]["issuer"], "letsencrypt-staging");
         assert!(generated["tls"].get("solver").is_some());
         assert!(generated["tls"].get("credential").is_some());
+        assert!(generated.get("service").is_some());
+
+        merge_requested_ingress(
+            &mut generated,
+            &json!({"tls":{
+                "mode":"existingSecret",
+                "secretName":"edge-tls",
+                "secretNamespace":"security"
+            }}),
+        );
+        assert_eq!(generated["tls"]["mode"], "existingSecret");
+        assert!(generated["tls"].get("solver").is_none());
+        assert!(generated["tls"].get("credential").is_none());
         assert!(generated.get("service").is_some());
     }
 
