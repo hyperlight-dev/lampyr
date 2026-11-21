@@ -243,6 +243,7 @@ class PackagingTests(unittest.TestCase):
                     "k8s/fiber-router.yaml",
                     "k8s/fiberd-tenant.yaml",
                     "k8s/hyperlight-device-plugin.yaml",
+                    "k8s/observability-dashboard.json",
                     "k8s/observability.yaml",
                     "k8s/serving-controller.yaml",
                     "upstream/pins.env",

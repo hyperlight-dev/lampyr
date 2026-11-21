@@ -11,8 +11,9 @@ series are removed when its route goes away.
 
 ## Install the optional add-on
 
-Lampyr's optional add-on installs pinned Prometheus, kube-state-metrics, and
-Jaeger workloads. It configures fiber-router trace export.
+Lampyr's optional add-on installs pinned Prometheus, Perses,
+kube-state-metrics, and Jaeger workloads. It configures fiber-router trace export
+and provisions the Lampyr Platform dashboard.
 
 ```bash
 ly observability install --context CONTEXT
@@ -24,6 +25,28 @@ can also remove its metrics. It is intended for
 development, performance analysis, and small clusters. Use an externally
 managed observability system when durable retention or high availability is
 required.
+
+Open the dashboard:
+
+```bash
+kubectl --context CONTEXT \
+  --namespace lampyr-observability \
+  port-forward service/perses 8080:8080
+```
+
+In another terminal, forward Jaeger's trace UI:
+
+```bash
+kubectl --context CONTEXT \
+  --namespace lampyr-observability \
+  port-forward service/jaeger 16686:16686
+```
+
+Then open `http://localhost:8080/projects/lampyr/dashboards/lampyr-platform`.
+Perses is read-only and
+anonymous through its cluster-local Service; the add-on does not expose it
+outside the cluster. The dashboard's trace link opens Jaeger on
+`http://localhost:16686`.
 
 Inspect or remove the add-on:
 
