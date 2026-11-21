@@ -470,11 +470,12 @@ fn existing_lifecycle(
         .settings
         .as_object_mut()
         .context("saved platform settings must be a mapping")?;
-    settings.extend(config.as_object().unwrap().clone());
+    merge_requested_settings(settings, config.as_object().unwrap());
     apply_existing_cluster_defaults(settings, data)?;
     let defaulted = fill_controller_defaults(settings, &controller_defaults(root)?);
     crate::platform_host::validate_settings(&record.settings)?;
     let install_settings = record.settings.clone();
+    record.plan = effective_runtime_plan(&record.plan, &install_settings);
     record.settings = without_fields(&record.settings, &defaulted);
     record.eventing |= requested_eventing == Some(json!(true));
     let provider = data
@@ -703,7 +704,14 @@ fn lifecycle(
         }
         for field in PLATFORM_INPUTS {
             if let Some(value) = config.get(field) {
-                settings.insert(field.into(), value.clone());
+                if field == "ingress" {
+                    merge_requested_ingress(
+                        settings.entry(field).or_insert_with(|| json!({})),
+                        value,
+                    );
+                } else {
+                    settings.insert(field.into(), value.clone());
+                }
             }
         }
         settings.entry("httpsPort").or_insert(json!(443));
@@ -836,6 +844,30 @@ fn lifecycle(
         installation.invoke(Operation::Delete, teardown_config.clone(), host)?;
     }
     Ok(json!({"name":name,"uninstalled":true,"clusterRetained":!delete}))
+}
+
+fn merge_requested_settings(
+    settings: &mut serde_json::Map<String, Value>,
+    requested: &serde_json::Map<String, Value>,
+) {
+    for (field, value) in requested {
+        if field == "ingress" {
+            merge_requested_ingress(
+                settings.entry(field.clone()).or_insert_with(|| json!({})),
+                value,
+            );
+        } else {
+            settings.insert(field.clone(), value.clone());
+        }
+    }
+}
+
+fn merge_requested_ingress(generated: &mut Value, requested: &Value) {
+    *generated = requested.clone();
+}
+
+fn effective_runtime_plan(plan: &RuntimePlan, _settings: &Value) -> RuntimePlan {
+    plan.clone()
 }
 
 fn validate_provider_manifest_capability_for_plan(
@@ -1797,6 +1829,56 @@ mod tests {
         assert!(
             mutations.contains("ValidatingAdmissionPolicy"),
             "{mutations}"
+        );
+    }
+
+    #[test]
+    fn requested_ingress_preserves_provider_generated_runtime_fields() {
+        let mut generated = json!({
+            "tls":{
+                "mode":"acme",
+                "email":"old@example.com",
+                "issuer":"letsencrypt-prod",
+                "solver":{"dns01":{"providerDNS":{"zone":"example.com"}}},
+                "credential":{"serviceAccountPatch":{"metadata":{"annotations":{"provider.example/id":"identity"}}}}
+            },
+            "service":{
+                "publicIpAddress":"192.0.2.1",
+                "annotations":{"service.example/address":"edge"}
+            }
+        });
+        merge_requested_ingress(
+            &mut generated,
+            &json!({"tls":{
+                "mode":"acme",
+                "email":"new@example.com",
+                "issuer":"letsencrypt-staging"
+            }}),
+        );
+        assert_eq!(generated["tls"]["email"], "new@example.com");
+        assert_eq!(generated["tls"]["issuer"], "letsencrypt-staging");
+        assert!(generated["tls"].get("solver").is_some());
+        assert!(generated["tls"].get("credential").is_some());
+        assert!(generated.get("service").is_some());
+    }
+
+    #[test]
+    fn providerless_approval_plan_uses_effective_ingress_settings() {
+        let mut plan = RuntimePlan::default();
+        plan.options.insert(
+            "ingress".into(),
+            json!({"tls":{"mode":"acme","credential":{"boundaryMessage":"old"}}}),
+        );
+        let settings =
+            json!({"ingress":{"tls":{"mode":"acme","credential":{"boundaryMessage":"new"}}}});
+        let effective = effective_runtime_plan(&plan, &settings);
+        assert_eq!(
+            effective
+                .options
+                .get("ingress")
+                .unwrap()
+                .pointer("/tls/credential/boundaryMessage"),
+            Some(&json!("new"))
         );
     }
 
