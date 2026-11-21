@@ -14,9 +14,11 @@ import sys
 import tempfile
 import time
 import urllib.parse
+import uuid
 
 
 BASELINE = "lampyr-scale-baseline"
+REQUEST_TIMEOUT = "10s"
 PROMETHEUS_PROXY = (
     "/api/v1/namespaces/lampyr-observability/"
     "services/http:prometheus:9090/proxy/api/v1/query"
@@ -62,7 +64,7 @@ def active_revision(context, service, namespace):
     return next(iter(revisions))
 
 
-def prometheus_query(context, query, evaluation_time=None):
+def prometheus_results(context, query, evaluation_time=None):
     parameters = {"query": query}
     if evaluation_time is not None:
         parameters["time"] = f"{evaluation_time:.3f}"
@@ -70,13 +72,35 @@ def prometheus_query(context, query, evaluation_time=None):
     result = json.loads(command("kubectl", "--context", context, "get", "--raw", path))
     if result.get("status") != "success":
         raise RuntimeError(f"Prometheus query failed: {result}")
-    values = result["data"]["result"]
+    return result["data"]["result"]
+
+
+def prometheus_query(context, query, evaluation_time=None):
+    values = prometheus_results(context, query, evaluation_time)
     if not values:
         return None
     if len(values) != 1:
         raise RuntimeError(f"Prometheus query returned {len(values)} series: {query}")
     value = float(values[0]["value"][1])
     return value if math.isfinite(value) else None
+
+
+def router_scrapes(context, evaluation_time):
+    values = prometheus_results(
+        context,
+        'timestamp(up{job="fiber-router"}) * (up{job="fiber-router"} == bool 1)',
+        evaluation_time,
+    )
+    if not values:
+        raise RuntimeError("Prometheus router targets are missing")
+    scrapes = {}
+    for item in values:
+        timestamp = float(item["value"][1])
+        if not math.isfinite(timestamp):
+            raise RuntimeError("Prometheus router scrape timestamp is not finite")
+        identity = tuple(sorted(item["metric"].items()))
+        scrapes[identity] = timestamp
+    return scrapes
 
 
 def metric_queries(namespace, revision, window, baseline, window_seconds=30):
@@ -95,14 +119,35 @@ def metric_queries(namespace, revision, window, baseline, window_seconds=30):
         f'label_serving_knative_dev_revision="{revision}"}} {running_home})'
     )
     baseline_pods = f'namespace="{namespace}",pod=~"{baseline}-.*"'
-    return {
+    counter_series = {
         "lampyrRequests": (
-            "sum(lampyr_router_request_duration_seconds_count"
-            f"{{{revision_match}}})"
+            "lampyr_router_request_duration_seconds_count"
+            f"{{{revision_match}}}"
         ),
         "lampyrErrors": (
-            "sum(lampyr_router_request_duration_seconds_count"
-            f'{{{revision_match},code!~"2..|3.."}})'
+            "lampyr_router_request_duration_seconds_count"
+            f'{{{revision_match},code!~"2..|3.."}}'
+        ),
+        "lampyrShed": f"lampyr_router_shed_total{{{revision_match}}}",
+        "lampyrRetries": f"lampyr_router_clone_retries_total{{{revision_match}}}",
+    }
+    router_memory = (
+        "sum(container_memory_working_set_bytes"
+        '{namespace="lampyr-system",container="router"} '
+        f"{running_router})"
+    )
+    home_memory = (
+        "sum(container_memory_working_set_bytes"
+        f'{{namespace="{namespace}",container="fiberd"}} {home})'
+    )
+    return {
+        **{name: f"sum({series})" for name, series in counter_series.items()},
+        **{
+            f"{name}Resets": f"sum(resets({series}[{window}]))"
+            for name, series in counter_series.items()
+        },
+        "lampyrMemoryBytes": (
+            f"max_over_time((({router_memory}) + ({home_memory}))[{window}:5s])"
         ),
         "lampyrRequestP95Seconds": (
             "histogram_quantile(0.95,sum by(le)(increase("
@@ -113,12 +158,6 @@ def metric_queries(namespace, revision, window, baseline, window_seconds=30):
             "histogram_quantile(0.95,sum by(le)(increase("
             f"lampyr_router_fiber_acquire_seconds_bucket{{{revision_match}}}"
             f"[{window}])))"
-        ),
-        "lampyrShed": (
-            "sum(lampyr_router_shed_total" f"{{{revision_match}}})"
-        ),
-        "lampyrRetries": (
-            "sum(lampyr_router_clone_retries_total" f"{{{revision_match}}})"
         ),
         "lampyrPeakBusyFibers": (
             "max_over_time((sum(lampyr_router_fibers_busy"
@@ -136,10 +175,7 @@ def metric_queries(namespace, revision, window, baseline, window_seconds=30):
             f" / {window_seconds:.3f}"
         ),
         "lampyrRouterMemoryBytes": (
-            "max_over_time((sum(container_memory_working_set_bytes"
-            '{namespace="lampyr-system",container="router"} '
-            f"{running_router}))"
-            f"[{window}:5s])"
+            f"max_over_time(({router_memory})[{window}:5s])"
         ),
         "lampyrHomeCPU": (
             "(sum(increase(container_cpu_usage_seconds_total"
@@ -147,8 +183,7 @@ def metric_queries(namespace, revision, window, baseline, window_seconds=30):
             f"{home})) / {window_seconds:.3f}"
         ),
         "lampyrHomeMemoryBytes": (
-            "max_over_time((sum(container_memory_working_set_bytes"
-            f'{{namespace="{namespace}",container="fiberd"}} {home}))[{window}:5s])'
+            f"max_over_time(({home_memory})[{window}:5s])"
         ),
         "baselineCPU": (
             "sum(increase(container_cpu_usage_seconds_total"
@@ -173,9 +208,9 @@ COUNTER_METRICS = {
 }
 
 
-def counter_snapshot(context, queries):
+def counter_snapshot(context, queries, evaluation_time=None):
     return {
-        name: prometheus_query(context, query)
+        name: prometheus_query(context, query, evaluation_time)
         for name, query in queries.items()
         if name in COUNTER_METRICS
     }
@@ -183,8 +218,17 @@ def counter_snapshot(context, queries):
 
 def collect_metrics(context, queries, before, evaluation_time):
     collected = {}
+    reset_metrics = {f"{name}Resets": name for name in COUNTER_METRICS}
     for name, query in queries.items():
         value = prometheus_query(context, query, evaluation_time)
+        if name in reset_metrics:
+            counter = reset_metrics[name]
+            if value is None and before[counter] is not None:
+                raise RuntimeError(f"Prometheus reset metrics are missing: {counter}")
+            if value is not None and value > 0:
+                raise RuntimeError(f"Prometheus counter reset during scenario: {counter}")
+            collected[name] = value
+            continue
         if name not in COUNTER_METRICS:
             collected[name] = value
             continue
@@ -201,8 +245,8 @@ def collect_metrics(context, queries, before, evaluation_time):
     return collected
 
 
-def baseline_manifest(image, replicas, namespace):
-    labels = {"app": BASELINE}
+def baseline_manifest(image, replicas, namespace, name):
+    labels = {"app": name}
     return {
         "apiVersion": "v1",
         "kind": "List",
@@ -210,7 +254,7 @@ def baseline_manifest(image, replicas, namespace):
             {
                 "apiVersion": "apps/v1",
                 "kind": "Deployment",
-                "metadata": {"name": BASELINE, "namespace": namespace},
+                "metadata": {"name": name, "namespace": namespace},
                 "spec": {
                     "replicas": replicas,
                     "selector": {"matchLabels": labels},
@@ -254,7 +298,7 @@ def baseline_manifest(image, replicas, namespace):
             {
                 "apiVersion": "v1",
                 "kind": "Service",
-                "metadata": {"name": BASELINE, "namespace": namespace},
+                "metadata": {"name": name, "namespace": namespace},
                 "spec": {
                     "selector": labels,
                     "ports": [{"name": "http", "port": 80, "targetPort": "http"}],
@@ -284,10 +328,14 @@ def free_port():
 def baseline_server(context, image, replicas, namespace):
     if "@sha256:" not in image:
         raise ValueError("baseline image must be digest-pinned")
-    manifest = baseline_manifest(image, replicas, namespace)
+    name = f"{BASELINE}-{uuid.uuid4().hex}"
+    manifest = baseline_manifest(image, replicas, namespace, name)
+    created = []
     forward = None
     try:
-        kubectl_manifest(context, "apply", manifest)
+        for resource in manifest["items"]:
+            kubectl_manifest(context, "create", resource)
+            created.append(resource)
         subprocess.run(
             [
                 "kubectl",
@@ -297,7 +345,7 @@ def baseline_server(context, image, replicas, namespace):
                 namespace,
                 "rollout",
                 "status",
-                f"deployment/{BASELINE}",
+                f"deployment/{name}",
                 "--timeout=300s",
             ],
             check=True,
@@ -311,7 +359,7 @@ def baseline_server(context, image, replicas, namespace):
                 "--namespace",
                 namespace,
                 "port-forward",
-                f"service/{BASELINE}",
+                f"service/{name}",
                 f"{port}:80",
             ],
             stdout=subprocess.DEVNULL,
@@ -327,7 +375,7 @@ def baseline_server(context, image, replicas, namespace):
             time.sleep(0.1)
         else:
             raise RuntimeError("baseline port-forward did not become ready")
-        yield {"url": f"http://127.0.0.1:{port}/", "process": forward}
+        yield {"name": name, "url": f"http://127.0.0.1:{port}/", "process": forward}
     finally:
         original_error = sys.exc_info()[0] is not None
         if forward is not None:
@@ -337,14 +385,19 @@ def baseline_server(context, image, replicas, namespace):
             except subprocess.TimeoutExpired:
                 forward.kill()
                 forward.wait()
-        try:
-            kubectl_manifest(
-                context, "delete", manifest, "--ignore-not-found=true", "--wait=true"
-            )
-        except subprocess.CalledProcessError as error:
-            if not original_error:
-                raise
-            print(f"warning: baseline cleanup failed: {error}", file=sys.stderr)
+        if created:
+            try:
+                kubectl_manifest(
+                    context,
+                    "delete",
+                    {"apiVersion": "v1", "kind": "List", "items": created},
+                    "--ignore-not-found=true",
+                    "--wait=true",
+                )
+            except subprocess.CalledProcessError as error:
+                if not original_error:
+                    raise
+                print(f"warning: baseline cleanup failed: {error}", file=sys.stderr)
 
 
 def require_running(process, name):
@@ -361,6 +414,8 @@ def run_oha(oha, url, duration, concurrency):
             duration,
             "-c",
             str(concurrency),
+            "-t",
+            REQUEST_TIMEOUT,
             "--wait-ongoing-requests-after-deadline",
             "--stats-success-breakdown",
             "--no-tui",
@@ -370,6 +425,7 @@ def run_oha(oha, url, duration, concurrency):
             url,
         ],
         text=True,
+        timeout=duration_seconds(duration) + duration_seconds(REQUEST_TIMEOUT) + 5,
     )
     result = json.loads(output)
     client = {
@@ -406,6 +462,8 @@ def warm_target(oha, url):
             "20",
             "-c",
             "1",
+            "-t",
+            REQUEST_TIMEOUT,
             "--stats-success-breakdown",
             "--no-tui",
             "--output-format",
@@ -414,6 +472,7 @@ def warm_target(oha, url):
             url,
         ],
         text=True,
+        timeout=20 * duration_seconds(REQUEST_TIMEOUT) + 5,
     )
     client = json.loads(output)
     if http_success_rate(client) != 1:
@@ -443,6 +502,7 @@ def target_resource_names(target):
             "lampyrHomeCPU",
             "lampyrRouterMemoryBytes",
             "lampyrHomeMemoryBytes",
+            "lampyrMemoryBytes",
         )
     return ("baselineCPU", "baselineMemoryBytes")
 
@@ -494,10 +554,7 @@ def write_report(result, path):
             cpu = add_metrics(
                 metrics["lampyrRouterCPU"], metrics["lampyrHomeCPU"]
             )
-            memory = add_metrics(
-                metrics["lampyrRouterMemoryBytes"],
-                metrics["lampyrHomeMemoryBytes"],
-            )
+            memory = metrics.get("lampyrMemoryBytes")
             errors = metrics.get("lampyrErrors")
             shed = metrics.get("lampyrShed")
         else:
@@ -575,12 +632,14 @@ def main():
     args = parser.parse_args()
 
     seconds = duration_seconds(args.duration)
+    if seconds < 30:
+        raise ValueError("duration must be at least 30s to measure CPU across scrapes")
     concurrencies = [int(value) for value in args.concurrency.split(",")]
     if not concurrencies or any(value < 1 for value in concurrencies):
         raise ValueError("concurrency values must be positive integers")
-    if args.baseline_replicas < 1:
-        raise ValueError("baseline replicas must be a positive integer")
-    oha = Path(args.oha)
+    if args.baseline_replicas != 1:
+        raise ValueError("baseline must use one replica with Service port-forward")
+    oha = Path(args.oha).resolve()
     if not oha.is_file():
         raise FileNotFoundError(f"load generator not found: {oha}")
     revision = active_revision(args.context, args.service, args.namespace)
@@ -595,6 +654,7 @@ def main():
         "baselineImage": args.baseline_image,
         "baselineReplicas": args.baseline_replicas,
         "duration": args.duration,
+        "requestTimeout": REQUEST_TIMEOUT,
         "concurrency": concurrencies,
         "commit": command("git", "rev-parse", "HEAD"),
         "dirty": bool(command("git", "status", "--porcelain")),
@@ -622,6 +682,7 @@ def main():
     with baseline_server(
         args.context, args.baseline_image, args.baseline_replicas, args.namespace
     ) as baseline:
+        metadata["baselineName"] = baseline["name"]
         for target, url in [
             ("lampyr", args.lampyr_url),
             ("kubernetes", baseline["url"]),
@@ -638,9 +699,14 @@ def main():
                 if target == "kubernetes":
                     require_running(baseline["process"], "baseline port-forward")
                 snapshot_queries = metric_queries(
-                    args.namespace, revision, "1s", BASELINE, 1
+                    args.namespace, revision, "1s", baseline["name"], 1
                 )
-                before = counter_snapshot(args.context, snapshot_queries)
+                snapshot_time = time.time()
+                before_scrapes = router_scrapes(args.context, snapshot_time)
+                if any(timestamp <= 0 for timestamp in before_scrapes.values()):
+                    raise RuntimeError("Prometheus router targets are not healthy")
+                measurement_started = min(before_scrapes.values()) - 0.001
+                before = counter_snapshot(args.context, snapshot_queries, snapshot_time)
                 if before["lampyrRequests"] is None:
                     raise RuntimeError(
                         "Lampyr request metrics are missing after warmup; check the "
@@ -655,13 +721,19 @@ def main():
                 for wait_seconds in (6, 5, 5, 5, 5, 5):
                     time.sleep(wait_seconds)
                     evaluated = time.time()
-                    measured_seconds = evaluated - started.timestamp()
+                    scrapes = router_scrapes(args.context, evaluated)
+                    if scrapes.keys() != before_scrapes.keys() or any(
+                        timestamp < load_ended.timestamp()
+                        for timestamp in scrapes.values()
+                    ):
+                        continue
+                    measured_seconds = evaluated - measurement_started
                     window = f"{math.ceil(measured_seconds * 1000)}ms"
                     queries = metric_queries(
                         args.namespace,
                         revision,
                         window,
-                        BASELINE,
+                        baseline["name"],
                         measured_seconds,
                     )
                     resources = {
@@ -677,7 +749,8 @@ def main():
                         break
                 else:
                     raise RuntimeError(
-                        f"Prometheus did not collect CPU and memory metrics for {target}"
+                        f"Prometheus did not collect fresh post-load router scrapes "
+                        f"and CPU and memory metrics for {target}"
                     )
                 scenario = {
                     "target": target,
