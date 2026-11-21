@@ -528,6 +528,49 @@ class ScaleTestTests(unittest.TestCase):
             ):
                 self.assertIsNone(scale.resource_samples("context", queries, 450))
 
+    def test_resource_samples_require_cpu_and_memory_for_each_container(self):
+        queries = {
+            "routersCpu": "cpu_timestamp",
+            "routersMemory": "memory_timestamp",
+            "routersPhase": "phase_timestamp",
+        }
+        complete = []
+        for number in (1, 2):
+            labels = {
+                "namespace": "lampyr-system", "pod": f"router-{number}",
+                "container": "router", "id": f"/container-{number}",
+                "job": "kubernetes-cadvisor", "instance": f"node-{number}:10250",
+                "node": f"node-{number}",
+            }
+            for source in queries:
+                metric = {**labels, "scale_input": source}
+                if source == "routersCpu":
+                    metric["cpu"] = "total"
+                complete.append({"metric": metric, "value": [450, "420"]})
+        with mock.patch.object(scale, "prometheus_results", return_value=complete):
+            self.assertIsNotNone(scale.resource_samples("context", queries, 450))
+        for missing in ("routersCpu", "routersMemory"):
+            partial = [
+                item for item in complete
+                if not (
+                    item["metric"]["scale_input"] == missing
+                    and item["metric"]["pod"] == "router-2"
+                )
+            ]
+            with self.subTest(missing=missing), mock.patch.object(
+                scale, "prometheus_results", return_value=partial
+            ):
+                self.assertIsNone(scale.resource_samples("context", queries, 450))
+        mismatched = [
+            {
+                **item,
+                "metric": {**item["metric"], "id": "/different-container"},
+            } if item["metric"]["scale_input"] == "routersCpu" else item
+            for item in complete
+        ]
+        with mock.patch.object(scale, "prometheus_results", return_value=mismatched):
+            self.assertIsNone(scale.resource_samples("context", queries, 450))
+
     def test_installer_uses_unique_downloads_for_concurrent_invocations(self):
         justfile = (PATH.parents[1] / "Justfile").read_text()
         recipe = justfile.split("\ninstall-oha:\n", 1)[1].split("\n\n", 1)[0]
