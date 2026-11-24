@@ -242,8 +242,8 @@
                 "plugin": {
                   "kind": "PrometheusTimeSeriesQuery",
                   "spec": {
-                    "query": "sum by (revision,code)(rate(lampyr_router_request_duration_seconds_count{namespace=~\"$namespace\",revision=~\"$revision\"}[1m]))",
-                    "seriesNameFormat": "{{revision}} {{code}}"
+                    "query": "sum by (namespace,revision,code)(rate(lampyr_router_request_duration_seconds_count{namespace=~\"$namespace\",revision=~\"$revision\"}[1m]))",
+                    "seriesNameFormat": "{{namespace}}/{{revision}} {{code}}"
                   }
                 }
               }
