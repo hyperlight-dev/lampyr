@@ -390,6 +390,24 @@ mod tests {
                 "{variable}"
             );
         }
+        let revision_panel = dashboard["spec"]["panels"]
+            .as_object()
+            .unwrap()
+            .values()
+            .find(|panel| panel["spec"]["display"]["name"] == "Request rate by Revision and status")
+            .unwrap();
+        let query = &revision_panel["spec"]["queries"][0]["spec"]["plugin"]["spec"];
+        assert!(
+            query["query"]
+                .as_str()
+                .unwrap()
+                .contains("sum by (namespace,revision,code)"),
+            "{query}"
+        );
+        assert_eq!(
+            query["seriesNameFormat"],
+            "{{namespace}}/{{revision}} {{code}}"
+        );
     }
 
     fn router(env: serde_json::Value, owner: Option<&str>) -> serde_json::Value {
