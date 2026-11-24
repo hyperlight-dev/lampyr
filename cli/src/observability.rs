@@ -11,6 +11,7 @@ use crate::kube::Kube;
 
 const NAMESPACE: &str = "lampyr-observability";
 const MANIFEST: &str = "k8s/observability.yaml";
+const DASHBOARD: &str = "k8s/observability-dashboard.json";
 const TRACE_ENDPOINT: &str = "http://jaeger.lampyr-observability.svc.cluster.local:4317";
 const TRACE_OWNER: &str = "lampyr.dev/observability-trace-endpoint";
 
@@ -33,6 +34,8 @@ pub fn run(action: Action, context: Option<&str>, host: &Host) -> Result<()> {
 
 fn install(kube: &Kube<'_>, root: &Path) -> Result<()> {
     let manifest = root.join(MANIFEST);
+    let dashboard =
+        std::fs::read_to_string(root.join(DASHBOARD)).context("read Lampyr Perses dashboard")?;
     let router = kube.optional("lampyr-system", "deployment", "fiber-router")?;
     ensure!(router.is_some(), "Lampyr is not installed in this cluster");
     let router = router.unwrap();
@@ -46,6 +49,16 @@ fn install(kube: &Kube<'_>, root: &Path) -> Result<()> {
             "labels": {"app.kubernetes.io/part-of": "lampyr-observability"}
         }
     }))?;
+    kube.apply(&json!({
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {
+            "name": "lampyr-dashboard",
+            "namespace": NAMESPACE,
+            "labels": {"app.kubernetes.io/managed-by": "lampyr"}
+        },
+        "data": {"3-lampyr-platform.json": dashboard}
+    }))?;
     kube.host
         .verbose_step("Install observability workloads", || {
             kube.host.run(
@@ -54,7 +67,7 @@ fn install(kube: &Kube<'_>, root: &Path) -> Result<()> {
                     .arg(&manifest),
             )
         })?;
-    for deployment in ["kube-state-metrics", "prometheus", "jaeger"] {
+    for deployment in ["kube-state-metrics", "prometheus", "jaeger", "perses"] {
         kube.host.run(kube.command(Some(NAMESPACE))?.args([
             "rollout",
             "restart",
@@ -72,7 +85,13 @@ fn install(kube: &Kube<'_>, root: &Path) -> Result<()> {
         }
         return Err(error);
     }
-    println!("observability ready");
+    println!(
+        "observability ready\n\
+         dashboard kubectl --context {} --namespace {} port-forward service/perses 8080:8080\n\
+         traces kubectl --context {} --namespace {} port-forward service/jaeger 16686:16686\n\
+         open http://localhost:8080/projects/lampyr/dashboards/lampyr-platform",
+        kube.context, NAMESPACE, kube.context, NAMESPACE
+    );
     Ok(())
 }
 
@@ -91,6 +110,11 @@ fn status(kube: &Kube<'_>) -> Result<()> {
 
 fn uninstall(kube: &Kube<'_>, root: &Path) -> Result<()> {
     disable_router_tracing(kube).context("fiber-router did not finish disabling trace export")?;
+    kube.delete_manifest(&json!({
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {"name": "lampyr-dashboard", "namespace": NAMESPACE}
+    }))?;
     kube.host
         .verbose_step("Remove observability workloads", || {
             kube.host.run(
@@ -302,6 +326,87 @@ mod tests {
         assert_eq!(
             config["receivers"]["otlp"]["protocols"]["grpc"]["endpoint"],
             format!("0.0.0.0:{receiver_port}")
+        );
+    }
+
+    #[test]
+    fn dashboard_uses_pinned_read_only_perses() {
+        let objects: Vec<serde_json::Value> =
+            serde_yaml_ng::Deserializer::from_str(include_str!("../../k8s/observability.yaml"))
+                .map(|document| serde_json::Value::deserialize(document).unwrap())
+                .collect();
+        let deployment = objects
+            .iter()
+            .find(|object| object["kind"] == "Deployment" && object["metadata"]["name"] == "perses")
+            .unwrap();
+        let image = deployment["spec"]["template"]["spec"]["containers"][0]["image"]
+            .as_str()
+            .unwrap();
+        assert_eq!(
+            image,
+            "persesdev/perses:v0.55.1@sha256:292605f009770f07aa17217e70f877fabbc74858d0af9054d395064e1c411c06"
+        );
+        assert!(
+            objects.iter().all(|object| {
+                object["kind"] != "Deployment" || object["metadata"]["name"] != "grafana"
+            }),
+            "the Apache-2.0 dashboard layer must not deploy Grafana"
+        );
+        let config_map = objects
+            .iter()
+            .find(|object| object["kind"] == "ConfigMap" && object["metadata"]["name"] == "perses")
+            .unwrap();
+        let config: serde_json::Value =
+            serde_yaml_ng::from_str(config_map["data"]["config.yaml"].as_str().unwrap()).unwrap();
+        assert_eq!(config["security"]["readonly"], true);
+        assert_eq!(
+            config["provisioning"]["folders"][0],
+            "/etc/lampyr-perses/provisioning/"
+        );
+        assert_eq!(
+            config["datasource"]["proxy"]["allowed_hosts"][0],
+            "prometheus.lampyr-observability.svc.cluster.local"
+        );
+
+        let dashboard: serde_json::Value =
+            serde_json::from_str(include_str!("../../k8s/observability-dashboard.json")).unwrap();
+        assert_eq!(dashboard["kind"], "Dashboard");
+        assert_eq!(dashboard["metadata"]["project"], "lampyr");
+        assert_eq!(dashboard["metadata"]["name"], "lampyr-platform");
+        let serialized = serde_json::to_string(&dashboard).unwrap();
+        assert!(!serialized.contains("migration_from_grafana_not_supported"));
+        assert!(serialized.contains("lampyr_router_requests_in_flight"));
+        assert!(serialized.contains("http://localhost:16686/search"));
+        for variable in dashboard["spec"]["variables"].as_array().unwrap() {
+            assert_eq!(variable["spec"]["defaultValue"], "$__all", "{variable}");
+            let matchers = variable["spec"]["plugin"]["spec"]["matchers"]
+                .as_array()
+                .unwrap();
+            assert!(
+                matchers.iter().all(|matcher| matcher
+                    .as_str()
+                    .unwrap()
+                    .contains("lampyr_router_requests_in_flight")),
+                "{variable}"
+            );
+        }
+        let revision_panel = dashboard["spec"]["panels"]
+            .as_object()
+            .unwrap()
+            .values()
+            .find(|panel| panel["spec"]["display"]["name"] == "Request rate by Revision and status")
+            .unwrap();
+        let query = &revision_panel["spec"]["queries"][0]["spec"]["plugin"]["spec"];
+        assert!(
+            query["query"]
+                .as_str()
+                .unwrap()
+                .contains("sum by (namespace,revision,code)"),
+            "{query}"
+        );
+        assert_eq!(
+            query["seriesNameFormat"],
+            "{{namespace}}/{{revision}} {{code}}"
         );
     }
 

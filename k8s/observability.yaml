@@ -182,6 +182,72 @@ data:
                     host: 0.0.0.0
                     port: 8888
 ---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: perses
+  namespace: lampyr-observability
+  labels:
+    app.kubernetes.io/part-of: lampyr-observability
+data:
+  config.yaml: |
+    security:
+      readonly: true
+    database:
+      file:
+        folder: /perses
+        extension: json
+        case_sensitive: false
+    provisioning:
+      folders:
+        - /etc/lampyr-perses/provisioning/
+      interval: 30s
+      enable_watch: true
+    frontend:
+      important_dashboards:
+        - title: Lampyr
+          dashboards:
+            - project: lampyr
+              dashboard: lampyr-platform
+    datasource:
+      proxy:
+        allowed_hosts:
+          - prometheus.lampyr-observability.svc.cluster.local
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: perses-provisioning
+  namespace: lampyr-observability
+  labels:
+    app.kubernetes.io/part-of: lampyr-observability
+data:
+  1-project.json: |
+    {
+      "kind": "Project",
+      "metadata": {"name": "lampyr"},
+      "spec": {"display": {"name": "Lampyr"}}
+    }
+  2-prometheus.json: |
+    {
+      "kind": "Datasource",
+      "metadata": {"name": "prometheus", "project": "lampyr"},
+      "spec": {
+        "default": true,
+        "plugin": {
+          "kind": "PrometheusDatasource",
+          "spec": {
+            "proxy": {
+              "kind": "HTTPProxy",
+              "spec": {
+                "url": "http://prometheus.lampyr-observability.svc.cluster.local:9090"
+              }
+            }
+          }
+        }
+      }
+    }
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -352,7 +418,14 @@ spec:
     matchLabels:
       app: prometheus
   policyTypes: [Ingress]
-  ingress: []
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: perses
+      ports:
+        - protocol: TCP
+          port: 9090
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -471,6 +544,116 @@ spec:
       ports:
         - protocol: TCP
           port: 8888
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: perses
+  namespace: lampyr-observability
+  labels:
+    app: perses
+    app.kubernetes.io/part-of: lampyr-observability
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: perses
+  template:
+    metadata:
+      labels:
+        app: perses
+        app.kubernetes.io/part-of: lampyr-observability
+    spec:
+      securityContext:
+        fsGroup: 2000
+      containers:
+        - name: perses
+          image: persesdev/perses:v0.55.1@sha256:292605f009770f07aa17217e70f877fabbc74858d0af9054d395064e1c411c06
+          args:
+            - --config=/etc/lampyr-perses/config.yaml
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /api/v1/health
+              port: http
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+            readOnlyRootFilesystem: true
+            seccompProfile:
+              type: RuntimeDefault
+          resources:
+            requests:
+              cpu: 25m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+          volumeMounts:
+            - name: config
+              mountPath: /etc/lampyr-perses
+              readOnly: true
+            - name: plugins
+              mountPath: /etc/perses/plugins
+            - name: data
+              mountPath: /perses
+      volumes:
+        - name: config
+          projected:
+            sources:
+              - configMap:
+                  name: perses
+                  items:
+                    - key: config.yaml
+                      path: config.yaml
+              - configMap:
+                  name: perses-provisioning
+                  items:
+                    - key: 1-project.json
+                      path: provisioning/1-project.json
+                    - key: 2-prometheus.json
+                      path: provisioning/2-prometheus.json
+              - configMap:
+                  name: lampyr-dashboard
+                  items:
+                    - key: 3-lampyr-platform.json
+                      path: provisioning/3-lampyr-platform.json
+        - name: data
+          emptyDir: {}
+        - name: plugins
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: perses
+  namespace: lampyr-observability
+  labels:
+    app.kubernetes.io/part-of: lampyr-observability
+spec:
+  selector:
+    app: perses
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: perses
+  namespace: lampyr-observability
+  labels:
+    app.kubernetes.io/part-of: lampyr-observability
+spec:
+  podSelector:
+    matchLabels:
+      app: perses
+  policyTypes: [Ingress]
+  ingress: []
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy

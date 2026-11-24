@@ -1,0 +1,752 @@
+{
+  "kind": "Dashboard",
+  "metadata": {
+    "name": "lampyr-platform",
+    "tags": [
+      "lampyr"
+    ],
+    "project": "lampyr"
+  },
+  "spec": {
+    "display": {
+      "name": "Lampyr Platform"
+    },
+    "variables": [
+      {
+        "kind": "ListVariable",
+        "spec": {
+          "display": {
+            "name": "Namespace"
+          },
+          "defaultValue": "$__all",
+          "allowAllValue": true,
+          "allowMultiple": true,
+          "customAllValue": ".*",
+          "plugin": {
+            "kind": "PrometheusLabelValuesVariable",
+            "spec": {
+              "labelName": "namespace",
+              "matchers": [
+                "lampyr_router_requests_in_flight"
+              ]
+            }
+          },
+          "name": "namespace"
+        }
+      },
+      {
+        "kind": "ListVariable",
+        "spec": {
+          "display": {
+            "name": "Revision"
+          },
+          "defaultValue": "$__all",
+          "allowAllValue": true,
+          "allowMultiple": true,
+          "customAllValue": ".*",
+          "plugin": {
+            "kind": "PrometheusLabelValuesVariable",
+            "spec": {
+              "labelName": "revision",
+              "matchers": [
+                "lampyr_router_requests_in_flight{namespace=~\"$namespace\"}"
+              ]
+            }
+          },
+          "name": "revision"
+        }
+      }
+    ],
+    "panels": {
+      "0": {
+        "kind": "Panel",
+        "spec": {
+          "display": {
+            "name": "Request rate"
+          },
+          "plugin": {
+            "kind": "StatChart",
+            "spec": {
+              "calculation": "last-number",
+              "colorMode": "value",
+              "format": {
+                "unit": "requests/sec"
+              },
+              "sparkline": {}
+            }
+          },
+          "queries": [
+            {
+              "kind": "TimeSeriesQuery",
+              "spec": {
+                "plugin": {
+                  "kind": "PrometheusTimeSeriesQuery",
+                  "spec": {
+                    "query": "sum(rate(lampyr_router_request_duration_seconds_count{namespace=~\"$namespace\",revision=~\"$revision\"}[1m]))"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      "1": {
+        "kind": "Panel",
+        "spec": {
+          "display": {
+            "name": "Request errors"
+          },
+          "plugin": {
+            "kind": "StatChart",
+            "spec": {
+              "calculation": "last-number",
+              "colorMode": "value",
+              "format": {
+                "unit": "requests/sec"
+              },
+              "sparkline": {}
+            }
+          },
+          "queries": [
+            {
+              "kind": "TimeSeriesQuery",
+              "spec": {
+                "plugin": {
+                  "kind": "PrometheusTimeSeriesQuery",
+                  "spec": {
+                    "query": "sum(rate(lampyr_router_request_duration_seconds_count{namespace=~\"$namespace\",revision=~\"$revision\",code!~\"2..|3..\"}[1m]))"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      "10": {
+        "kind": "Panel",
+        "spec": {
+          "display": {
+            "name": "Home Pods"
+          },
+          "plugin": {
+            "kind": "StatChart",
+            "spec": {
+              "calculation": "last-number",
+              "colorMode": "value",
+              "sparkline": {}
+            }
+          },
+          "queries": [
+            {
+              "kind": "TimeSeriesQuery",
+              "spec": {
+                "plugin": {
+                  "kind": "PrometheusTimeSeriesQuery",
+                  "spec": {
+                    "query": "count(kube_pod_labels{label_lampyr_dev_home=\"true\"})"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      "11": {
+        "kind": "Panel",
+        "spec": {
+          "display": {
+            "name": "Home storage requested"
+          },
+          "plugin": {
+            "kind": "StatChart",
+            "spec": {
+              "calculation": "last-number",
+              "colorMode": "value",
+              "format": {
+                "unit": "bytes"
+              },
+              "sparkline": {}
+            }
+          },
+          "queries": [
+            {
+              "kind": "TimeSeriesQuery",
+              "spec": {
+                "plugin": {
+                  "kind": "PrometheusTimeSeriesQuery",
+                  "spec": {
+                    "query": "sum(kube_pod_container_resource_requests{container=\"fiberd\",resource=\"ephemeral_storage\",unit=\"byte\"} * on(namespace,pod) group_left() kube_pod_labels{label_lampyr_dev_home=\"true\"})"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      "12": {
+        "kind": "Panel",
+        "spec": {
+          "display": {
+            "name": "Home filesystem used"
+          },
+          "plugin": {
+            "kind": "StatChart",
+            "spec": {
+              "calculation": "last-number",
+              "colorMode": "value",
+              "format": {
+                "unit": "bytes"
+              },
+              "sparkline": {}
+            }
+          },
+          "queries": [
+            {
+              "kind": "TimeSeriesQuery",
+              "spec": {
+                "plugin": {
+                  "kind": "PrometheusTimeSeriesQuery",
+                  "spec": {
+                    "query": "sum(container_fs_usage_bytes{container=\"fiberd\"} * on(namespace,pod) group_left() kube_pod_labels{label_lampyr_dev_home=\"true\"})"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      "13": {
+        "kind": "Panel",
+        "spec": {
+          "display": {
+            "name": "Request rate by Revision and status"
+          },
+          "plugin": {
+            "kind": "TimeSeriesChart",
+            "spec": {
+              "legend": {
+                "mode": "table",
+                "position": "bottom"
+              },
+              "yAxis": {
+                "format": {
+                  "unit": "requests/sec"
+                }
+              }
+            }
+          },
+          "queries": [
+            {
+              "kind": "TimeSeriesQuery",
+              "spec": {
+                "plugin": {
+                  "kind": "PrometheusTimeSeriesQuery",
+                  "spec": {
+                    "query": "sum by (namespace,revision,code)(rate(lampyr_router_request_duration_seconds_count{namespace=~\"$namespace\",revision=~\"$revision\"}[1m]))",
+                    "seriesNameFormat": "{{namespace}}/{{revision}} {{code}}"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      "2": {
+        "kind": "Panel",
+        "spec": {
+          "display": {
+            "name": "Request p95"
+          },
+          "plugin": {
+            "kind": "StatChart",
+            "spec": {
+              "calculation": "last-number",
+              "colorMode": "value",
+              "format": {
+                "unit": "seconds"
+              },
+              "sparkline": {}
+            }
+          },
+          "queries": [
+            {
+              "kind": "TimeSeriesQuery",
+              "spec": {
+                "plugin": {
+                  "kind": "PrometheusTimeSeriesQuery",
+                  "spec": {
+                    "query": "histogram_quantile(0.95,sum by (le)(rate(lampyr_router_request_duration_seconds_bucket{namespace=~\"$namespace\",revision=~\"$revision\"}[1m])))"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      "3": {
+        "kind": "Panel",
+        "spec": {
+          "display": {
+            "name": "Fiber acquisition p95"
+          },
+          "plugin": {
+            "kind": "StatChart",
+            "spec": {
+              "calculation": "last-number",
+              "colorMode": "value",
+              "format": {
+                "unit": "seconds"
+              },
+              "sparkline": {}
+            }
+          },
+          "queries": [
+            {
+              "kind": "TimeSeriesQuery",
+              "spec": {
+                "plugin": {
+                  "kind": "PrometheusTimeSeriesQuery",
+                  "spec": {
+                    "query": "histogram_quantile(0.95,sum by (le)(rate(lampyr_router_fiber_acquire_seconds_bucket{namespace=~\"$namespace\",revision=~\"$revision\"}[1m])))"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      "4": {
+        "kind": "Panel",
+        "spec": {
+          "display": {
+            "name": "Active work"
+          },
+          "plugin": {
+            "kind": "TimeSeriesChart",
+            "spec": {
+              "legend": {
+                "mode": "list",
+                "position": "bottom"
+              }
+            }
+          },
+          "queries": [
+            {
+              "kind": "TimeSeriesQuery",
+              "spec": {
+                "plugin": {
+                  "kind": "PrometheusTimeSeriesQuery",
+                  "spec": {
+                    "query": "sum by (stage)(lampyr_router_requests_in_flight{namespace=~\"$namespace\",revision=~\"$revision\"})",
+                    "seriesNameFormat": "{{stage}}"
+                  }
+                }
+              }
+            },
+            {
+              "kind": "TimeSeriesQuery",
+              "spec": {
+                "plugin": {
+                  "kind": "PrometheusTimeSeriesQuery",
+                  "spec": {
+                    "query": "sum(lampyr_router_fibers_busy{namespace=~\"$namespace\",revision=~\"$revision\"})",
+                    "seriesNameFormat": "busy Fibers"
+                  }
+                }
+              }
+            },
+            {
+              "kind": "TimeSeriesQuery",
+              "spec": {
+                "plugin": {
+                  "kind": "PrometheusTimeSeriesQuery",
+                  "spec": {
+                    "query": "sum(lampyr_router_websocket_sessions{namespace=~\"$namespace\",revision=~\"$revision\"})",
+                    "seriesNameFormat": "WebSockets"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      "5": {
+        "kind": "Panel",
+        "spec": {
+          "display": {
+            "name": "Reuse capacity"
+          },
+          "plugin": {
+            "kind": "TimeSeriesChart",
+            "spec": {
+              "legend": {
+                "mode": "list",
+                "position": "bottom"
+              }
+            }
+          },
+          "queries": [
+            {
+              "kind": "TimeSeriesQuery",
+              "spec": {
+                "plugin": {
+                  "kind": "PrometheusTimeSeriesQuery",
+                  "spec": {
+                    "query": "sum by (state)(lampyr_router_reuse_slots{namespace=~\"$namespace\",revision=~\"$revision\"})",
+                    "seriesNameFormat": "{{state}} slots"
+                  }
+                }
+              }
+            },
+            {
+              "kind": "TimeSeriesQuery",
+              "spec": {
+                "plugin": {
+                  "kind": "PrometheusTimeSeriesQuery",
+                  "spec": {
+                    "query": "sum(lampyr_router_reuse_slot_limit{namespace=~\"$namespace\",revision=~\"$revision\"})",
+                    "seriesNameFormat": "slot limit"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      "6": {
+        "kind": "Panel",
+        "spec": {
+          "display": {
+            "name": "Capacity pressure"
+          },
+          "plugin": {
+            "kind": "TimeSeriesChart",
+            "spec": {
+              "legend": {
+                "mode": "list",
+                "position": "bottom"
+              },
+              "yAxis": {
+                "format": {
+                  "unit": "ops/sec"
+                }
+              }
+            }
+          },
+          "queries": [
+            {
+              "kind": "TimeSeriesQuery",
+              "spec": {
+                "plugin": {
+                  "kind": "PrometheusTimeSeriesQuery",
+                  "spec": {
+                    "query": "sum(rate(lampyr_router_shed_total{namespace=~\"$namespace\",revision=~\"$revision\"}[1m]))",
+                    "seriesNameFormat": "shed"
+                  }
+                }
+              }
+            },
+            {
+              "kind": "TimeSeriesQuery",
+              "spec": {
+                "plugin": {
+                  "kind": "PrometheusTimeSeriesQuery",
+                  "spec": {
+                    "query": "sum by (reason)(rate(lampyr_router_clone_retries_total{namespace=~\"$namespace\",revision=~\"$revision\"}[1m]))",
+                    "seriesNameFormat": "retry {{reason}}"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      "7": {
+        "kind": "Panel",
+        "spec": {
+          "display": {
+            "name": "Acquisition by kind"
+          },
+          "plugin": {
+            "kind": "TimeSeriesChart",
+            "spec": {
+              "legend": {
+                "mode": "list",
+                "position": "bottom"
+              },
+              "yAxis": {
+                "format": {
+                  "unit": "seconds"
+                }
+              }
+            }
+          },
+          "queries": [
+            {
+              "kind": "TimeSeriesQuery",
+              "spec": {
+                "plugin": {
+                  "kind": "PrometheusTimeSeriesQuery",
+                  "spec": {
+                    "query": "histogram_quantile(0.95,sum by (le,kind)(rate(lampyr_router_fiber_acquire_seconds_bucket{namespace=~\"$namespace\",revision=~\"$revision\"}[1m])))",
+                    "seriesNameFormat": "p95 {{kind}}"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      "8": {
+        "kind": "Panel",
+        "spec": {
+          "display": {
+            "name": "Platform CPU"
+          },
+          "plugin": {
+            "kind": "TimeSeriesChart",
+            "spec": {
+              "legend": {
+                "mode": "list",
+                "position": "bottom"
+              }
+            }
+          },
+          "queries": [
+            {
+              "kind": "TimeSeriesQuery",
+              "spec": {
+                "plugin": {
+                  "kind": "PrometheusTimeSeriesQuery",
+                  "spec": {
+                    "query": "sum(rate(container_cpu_usage_seconds_total{namespace=\"lampyr-system\",pod=~\"fiber-router-.*\",container=\"router\"}[1m]))",
+                    "seriesNameFormat": "fiber-router"
+                  }
+                }
+              }
+            },
+            {
+              "kind": "TimeSeriesQuery",
+              "spec": {
+                "plugin": {
+                  "kind": "PrometheusTimeSeriesQuery",
+                  "spec": {
+                    "query": "sum(rate(container_cpu_usage_seconds_total{container=\"fiberd\"}[1m]) * on(namespace,pod) group_left() kube_pod_labels{label_lampyr_dev_home=\"true\"})",
+                    "seriesNameFormat": "Home Pods"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      "9": {
+        "kind": "Panel",
+        "spec": {
+          "display": {
+            "name": "Platform memory"
+          },
+          "plugin": {
+            "kind": "TimeSeriesChart",
+            "spec": {
+              "legend": {
+                "mode": "list",
+                "position": "bottom"
+              },
+              "yAxis": {
+                "format": {
+                  "unit": "bytes"
+                }
+              }
+            }
+          },
+          "queries": [
+            {
+              "kind": "TimeSeriesQuery",
+              "spec": {
+                "plugin": {
+                  "kind": "PrometheusTimeSeriesQuery",
+                  "spec": {
+                    "query": "sum(container_memory_working_set_bytes{namespace=\"lampyr-system\",pod=~\"fiber-router-.*\",container=\"router\"})",
+                    "seriesNameFormat": "fiber-router"
+                  }
+                }
+              }
+            },
+            {
+              "kind": "TimeSeriesQuery",
+              "spec": {
+                "plugin": {
+                  "kind": "PrometheusTimeSeriesQuery",
+                  "spec": {
+                    "query": "sum(container_memory_working_set_bytes{container=\"fiberd\"} * on(namespace,pod) group_left() kube_pod_labels{label_lampyr_dev_home=\"true\"})",
+                    "seriesNameFormat": "Home Pods"
+                  }
+                }
+              }
+            },
+            {
+              "kind": "TimeSeriesQuery",
+              "spec": {
+                "plugin": {
+                  "kind": "PrometheusTimeSeriesQuery",
+                  "spec": {
+                    "query": "sum(kube_pod_container_resource_requests{container=\"fiberd\",resource=\"memory\",unit=\"byte\"} * on(namespace,pod) group_left() kube_pod_labels{label_lampyr_dev_home=\"true\"})",
+                    "seriesNameFormat": "Home memory requested"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "layouts": [
+      {
+        "kind": "Grid",
+        "spec": {
+          "display": {
+            "title": "Panel Group 1"
+          },
+          "items": [
+            {
+              "x": 0,
+              "y": 0,
+              "width": 6,
+              "height": 5,
+              "content": {
+                "$ref": "#/spec/panels/0"
+              }
+            },
+            {
+              "x": 6,
+              "y": 0,
+              "width": 6,
+              "height": 5,
+              "content": {
+                "$ref": "#/spec/panels/1"
+              }
+            },
+            {
+              "x": 12,
+              "y": 0,
+              "width": 6,
+              "height": 5,
+              "content": {
+                "$ref": "#/spec/panels/2"
+              }
+            },
+            {
+              "x": 18,
+              "y": 0,
+              "width": 6,
+              "height": 5,
+              "content": {
+                "$ref": "#/spec/panels/3"
+              }
+            },
+            {
+              "x": 0,
+              "y": 5,
+              "width": 12,
+              "height": 8,
+              "content": {
+                "$ref": "#/spec/panels/4"
+              }
+            },
+            {
+              "x": 12,
+              "y": 5,
+              "width": 12,
+              "height": 8,
+              "content": {
+                "$ref": "#/spec/panels/5"
+              }
+            },
+            {
+              "x": 0,
+              "y": 13,
+              "width": 12,
+              "height": 8,
+              "content": {
+                "$ref": "#/spec/panels/6"
+              }
+            },
+            {
+              "x": 12,
+              "y": 13,
+              "width": 12,
+              "height": 8,
+              "content": {
+                "$ref": "#/spec/panels/7"
+              }
+            },
+            {
+              "x": 0,
+              "y": 21,
+              "width": 12,
+              "height": 8,
+              "content": {
+                "$ref": "#/spec/panels/8"
+              }
+            },
+            {
+              "x": 12,
+              "y": 21,
+              "width": 12,
+              "height": 8,
+              "content": {
+                "$ref": "#/spec/panels/9"
+              }
+            },
+            {
+              "x": 0,
+              "y": 29,
+              "width": 8,
+              "height": 6,
+              "content": {
+                "$ref": "#/spec/panels/10"
+              }
+            },
+            {
+              "x": 8,
+              "y": 29,
+              "width": 8,
+              "height": 6,
+              "content": {
+                "$ref": "#/spec/panels/11"
+              }
+            },
+            {
+              "x": 16,
+              "y": 29,
+              "width": 8,
+              "height": 6,
+              "content": {
+                "$ref": "#/spec/panels/12"
+              }
+            },
+            {
+              "x": 0,
+              "y": 35,
+              "width": 24,
+              "height": 8,
+              "content": {
+                "$ref": "#/spec/panels/13"
+              }
+            }
+          ]
+        }
+      }
+    ],
+    "duration": "30m",
+    "refreshInterval": "5s",
+    "links": [
+      {
+        "name": "Explore traces in Jaeger",
+        "url": "http://localhost:16686/search",
+        "targetBlank": true
+      }
+    ]
+  }
+}

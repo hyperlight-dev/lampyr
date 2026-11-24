@@ -37,6 +37,8 @@ mod lifecycle {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
         std::fs::write(root.join(".lampyr-platform"), "").unwrap();
+        std::fs::create_dir(root.join("k8s")).unwrap();
+        std::fs::write(root.join("k8s/observability-dashboard.json"), "{}").unwrap();
         std::fs::write(root.join("router.json"), router.to_string()).unwrap();
         let mut disabled = router;
         disabled["spec"]["template"]["spec"]["containers"][0]["env"] = json!([]);
@@ -92,6 +94,20 @@ esac
         assert!(
             String::from_utf8_lossy(&output.stdout).contains("deployment.apps/jaeger 1/1"),
             "{output:?}"
+        );
+    }
+
+    #[test]
+    fn install_prints_perses_and_jaeger_access() {
+        let directory = fixture(router(json!([])));
+        let output = run(directory.path(), "install", "");
+        assert!(output.status.success(), "{output:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("service/perses 8080:8080"), "{stdout}");
+        assert!(stdout.contains("service/jaeger 16686:16686"), "{stdout}");
+        assert!(
+            stdout.contains("/projects/lampyr/dashboards/lampyr-platform"),
+            "{stdout}"
         );
     }
 
