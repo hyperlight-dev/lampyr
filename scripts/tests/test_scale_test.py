@@ -427,7 +427,7 @@ class ScaleTestTests(unittest.TestCase):
             self.assertEqual(version[0], str(executable))
 
     @contextlib.contextmanager
-    def scenario_environment(self, routers, resources, inventory=None):
+    def scenario_environment(self, routers, resources, inventory=None, arguments=()):
         clock = scale.datetime.datetime.fromtimestamp(400, scale.datetime.timezone.utc)
         baseline = {
             "name": "baseline-owned",
@@ -444,7 +444,7 @@ class ScaleTestTests(unittest.TestCase):
             mock.patch.object(scale, "resource_coverage", create=True, return_value=True)
         )
         with mock.patch.object(
-            scale.sys, "argv", self.main_arguments()
+            scale.sys, "argv", self.main_arguments(*arguments)
         ), mock.patch.object(
             scale, "active_revision", return_value="demo-00001"
         ), mock.patch.object(
@@ -518,6 +518,66 @@ class ScaleTestTests(unittest.TestCase):
         ) as write:
             scale.main()
             self.assertEqual(len(write.call_args.args[0]["scenarios"]), 2)
+
+    def test_warmup_and_load_use_identical_request_paths_and_queries(self):
+        for lampyr, baseline in (
+            ("https://example.test/", "http://localhost/"),
+            (
+                "https://example.test/compute?iterations=1000&size=64",
+                "http://localhost/compute?iterations=1000&size=64",
+            ),
+            (
+                "https://example.test/a%2Fb?value=a%26b&value=c+d&empty=",
+                "http://localhost/a%2Fb?value=a%26b&value=c+d&empty=",
+            ),
+            (
+                "https://example.test//other.test/compute?next=https%3A%2F%2Felsewhere.test",
+                "http://localhost//other.test/compute?next=https%3A%2F%2Felsewhere.test",
+            ),
+            ("https://example.test?iterations=1000", "http://localhost/?iterations=1000"),
+        ):
+            expected_lampyr = lampyr.replace(
+                "example.test?", "example.test/?"
+            )
+            with self.subTest(lampyr=lampyr), self.scenario_environment(
+                [{"router-1": 420}] * 20,
+                [{"container-1": 420}] * 20,
+                arguments=("--lampyr-url", lampyr),
+            ), mock.patch.object(scale, "warm_target") as warm, mock.patch.object(
+                scale, "run_oha", return_value={
+                    "summary": {"requestsPerSec": 1},
+                    "httpSuccessRate": 1,
+                    "successfulLatencyMs": {"p95": 1},
+                },
+            ) as load:
+                scale.main()
+                for execute in (warm, load):
+                    self.assertEqual(
+                        [call.args[1] for call in execute.call_args_list],
+                        [expected_lampyr, baseline],
+                    )
+
+    def test_invalid_workload_urls_fail_before_cluster_work(self):
+        for url in (
+            "/compute?iterations=1000",
+            "ftp://example.test/compute",
+            "https:///compute",
+            "https://example.test:99999/compute",
+            "https://user:password@example.test/compute",
+            "https://example.test/compute#iterations=1000",
+            "https://example.test/compute#",
+            "https://example.test/a b",
+            "https://example.test/a\nb",
+            "https://example.test\\other.test/compute",
+        ):
+            with self.subTest(url=url), mock.patch.object(
+                scale.sys, "argv", self.main_arguments("--lampyr-url", url)
+            ), mock.patch.object(scale, "active_revision") as revision, mock.patch.object(
+                scale, "baseline_server", side_effect=AssertionError("cluster work started")
+            ):
+                with self.assertRaises(ValueError):
+                    scale.main()
+                revision.assert_not_called()
 
     def test_scenario_rejects_missing_router_membership_at_both_endpoints(self):
         inventory = {
