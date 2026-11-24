@@ -572,7 +572,11 @@ class ScaleTestTests(unittest.TestCase):
         ):
             with self.subTest(url=url), mock.patch.object(
                 scale.sys, "argv", self.main_arguments("--lampyr-url", url)
-            ), mock.patch.object(scale, "active_revision") as revision, mock.patch.object(
+            ), mock.patch.object(
+                scale, "active_revision", return_value="demo-00001"
+            ) as revision, mock.patch.object(
+                scale, "command", return_value="{}"
+            ), mock.patch.object(
                 scale, "baseline_server", side_effect=AssertionError("cluster work started")
             ):
                 with self.assertRaises(ValueError):

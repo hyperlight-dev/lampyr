@@ -29,6 +29,11 @@ just scale-test \
   REGISTRY/IMAGE@sha256:DIGEST
 ```
 
+The runner uses the Lampyr URL's path and query for both targets, during warmup
+and load. For example, `"https://LAMPYR_URL/compute?iterations=1000"` also sends
+`/compute?iterations=1000` to Kubernetes. Quote URLs that contain query parameters.
+Use an absolute HTTP or HTTPS URL without credentials or a fragment.
+
 The default sweep runs each target for 30 seconds at concurrency 1, 4, 16,
 and 64. The framework:
 
@@ -40,8 +45,8 @@ and 64. The framework:
 - writes a concise Markdown comparison beside it.
 
 The Kubernetes target uses a local Service port-forward, while the Lampyr URL
-uses its configured ingress. Record that path difference when interpreting
-results. The result metadata records both paths. The framework monitors the
+uses its configured ingress. Record that network difference when interpreting
+results. The result metadata records both network paths. The framework monitors the
 port-forward and stops if it exits, but the tunnel can still limit high
 concurrency results. This framework is for repeatable comparisons, not a claim
 that the two network paths have identical overhead.

@@ -730,6 +730,27 @@ def safe_url(value):
     return urllib.parse.urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
 
 
+def workload_url(value):
+    if any(
+        character.isspace() or ord(character) < 32 or ord(character) == 127
+        or character == "\\"
+        for character in value
+    ):
+        raise ValueError(
+            "Lampyr URL must encode whitespace and must not contain controls or backslashes"
+        )
+    parsed = urllib.parse.urlsplit(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("Lampyr URL must be an absolute HTTP or HTTPS URL")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("Lampyr URL must not contain credentials")
+    if "#" in value:
+        raise ValueError("Lampyr URL must not contain a fragment; use query parameters")
+    if parsed.port == 0:
+        raise ValueError("Lampyr URL port must be between 1 and 65535")
+    return parsed._replace(path=parsed.path or "/")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--context", required=True)
@@ -755,6 +776,7 @@ def main():
     output = Path(args.output)
     if output.suffix.lower() == ".md":
         raise ValueError("JSON and Markdown output files must be distinct; do not use .md")
+    lampyr_url = workload_url(args.lampyr_url)
     oha = Path(args.oha).resolve()
     if not oha.is_file():
         raise FileNotFoundError(f"load generator not found: {oha}")
@@ -765,7 +787,7 @@ def main():
         "service": args.service,
         "namespace": args.namespace,
         "revision": revision,
-        "lampyrUrl": safe_url(args.lampyr_url),
+        "lampyrUrl": safe_url(lampyr_url.geturl()),
         "baselineImage": args.baseline_image,
         "baselineReplicas": args.baseline_replicas,
         "duration": args.duration,
@@ -798,20 +820,21 @@ def main():
         args.context, args.baseline_image, args.baseline_replicas, args.namespace
     ) as baseline:
         metadata["baselineName"] = baseline["name"]
-        for target, url in [
-            ("lampyr", args.lampyr_url),
-            ("kubernetes", baseline["url"]),
-        ]:
+        baseline_url = urllib.parse.urlsplit(baseline["url"])._replace(
+            path=lampyr_url.path, query=lampyr_url.query, fragment=""
+        )
+        targets = (
+            ("lampyr", lampyr_url.geturl()),
+            ("kubernetes", baseline_url.geturl()),
+        )
+        for target, url in targets:
             if target == "kubernetes":
                 require_running(baseline["process"], "baseline port-forward")
             warm_target(oha, url)
         warmup_ended = datetime.datetime.now(datetime.timezone.utc).timestamp()
         time.sleep(6)
         for concurrency in concurrencies:
-            for target, url in [
-                ("lampyr", args.lampyr_url),
-                ("kubernetes", baseline["url"]),
-            ]:
+            for target, url in targets:
                 if target == "kubernetes":
                     require_running(baseline["process"], "baseline port-forward")
                 snapshot_queries = metric_queries(
