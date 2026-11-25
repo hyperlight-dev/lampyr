@@ -94,6 +94,9 @@ replicas, has a six-second autoscaling window, and keeps at most one replica.
 The runner waits for scale-to-zero without sending probe requests. Each trial
 sends exactly one request, with no retry. A failed first request stops the run.
 Images and snapshots stay cached; these are not image-download measurements.
+The runner prepares the startup Deployment once before scaling it to zero.
+Startup resources are removed before the warm targets are created, so the two
+phases do not reserve application capacity at the same time.
 
 `--startup-runs COUNT` sets the number of trials; `0` keeps only warm traffic.
 `--startup-timeout 180s` bounds each wait and first request. The JSON has a

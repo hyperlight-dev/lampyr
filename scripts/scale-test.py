@@ -541,12 +541,16 @@ def baseline_resources(context, image, replicas, namespace):
 @contextlib.contextmanager
 def baseline_server(context, image, replicas, namespace):
     with baseline_resources(context, image, replicas, namespace) as name:
-        subprocess.run([
-            "kubectl", "--context", context, "--namespace", namespace,
-            "rollout", "status", f"deployment/{name}", "--timeout=300s",
-        ], check=True)
+        wait_deployment_ready(context, namespace, name)
         with service_forward(context, namespace, name, 80, "baseline") as forward:
             yield {"name": name, **forward}
+
+
+def wait_deployment_ready(context, namespace, name):
+    subprocess.run([
+        "kubectl", "--context", context, "--namespace", namespace,
+        "rollout", "status", f"deployment/{name}", "--timeout=300s",
+    ], check=True)
 
 
 def require_separate_knative(context, lampyr_context):
@@ -863,11 +867,12 @@ def matching_url(origin, workload):
 def measure_startups(args, oha, revision, workload, ingress, result, output):
     timeout = duration_seconds(args.startup_timeout)
     with baseline_resources(
-        args.context, args.baseline_image, 0, args.namespace
+        args.context, args.baseline_image, 1, args.namespace
     ) as deployment, (
         knative_server(args.knative_context, args.baseline_image, args.namespace, min_scale=0)
         if args.knative_context else contextlib.nullcontext(None)
     ) as native:
+        wait_deployment_ready(args.context, args.namespace, deployment)
         if native:
             result["metadata"]["startupKnative"] = {
                 "service": native["name"], "revision": native["revision"],
@@ -1213,6 +1218,10 @@ def main():
         ),
     }
     result = {"schema": 1, "metadata": metadata, "scenarios": [], "startups": []}
+    if args.startup_runs:
+        measure_startups(
+            args, oha, revision, lampyr_url, knative_ingress, result, output
+        )
     with baseline_server(
         args.context, args.baseline_image, args.baseline_replicas, args.namespace
     ) as baseline, (
@@ -1245,10 +1254,6 @@ def main():
                 ))),
             }
             metadata["networkPaths"]["knative"] = "stock Knative ingress and queue-proxy"
-        if args.startup_runs:
-            measure_startups(
-                args, oha, revision, lampyr_url, knative_ingress, result, output
-            )
         metrics_endpoints = {
             context: metrics_forwards.enter_context(prometheus_server(context))
             for context in dict.fromkeys(target[2] for target in targets)
