@@ -60,8 +60,10 @@ Open `http://localhost:8080/`. The service index includes an **Observability**
 section with links to Prometheus and Jaeger. Send requests to an exposed
 service. In Prometheus, query `lampyr_router_request_duration_seconds_count`.
 In Jaeger, select `lampyr-local`, then **Find Traces**. Telemetry includes
-internal services reached through bindings. Incoming trace IDs stay the same
-across ingress and binding calls.
+internal services reached through bindings. The router preserves incoming trace
+IDs. Applications must propagate trace context, such as the `traceparent` header,
+on outgoing binding requests to keep calls in the same trace. This example
+workspace does not forward trace context.
 
 This option needs Docker, not Kubernetes. The first run downloads pinned
 Prometheus and Jaeger images. Their browser endpoints use free loopback ports,
