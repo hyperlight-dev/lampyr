@@ -609,6 +609,28 @@ class ScaleTestTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, f"counter reset.*{name}"):
                     scale.collect_metrics("test", queries, before, 42)
 
+    def test_oha_wait_flag_only_applies_to_duration_runs(self):
+        result = json.dumps({
+            "summary": {"requestsPerSec": 1},
+            "statusCodeDistribution": {"200": 1},
+            "errorDistribution": {},
+            "latencyPercentilesSuccessful": {"p95": 0.1},
+        })
+        for single in (True, False):
+            with self.subTest(single=single), mock.patch.object(
+                scale.subprocess, "check_output", return_value=result
+            ) as execute:
+                scale.run_oha(Path("/oha"), "http://example.test/", "30s", 1, single=single)
+                arguments = execute.call_args.args[0]
+                if single:
+                    self.assertEqual(arguments[arguments.index("-n") + 1], "1")
+                    self.assertNotIn("-z", arguments)
+                    self.assertNotIn("--wait-ongoing-requests-after-deadline", arguments)
+                else:
+                    self.assertEqual(arguments[arguments.index("-z") + 1], "30s")
+                    self.assertNotIn("-n", arguments)
+                    self.assertIn("--wait-ongoing-requests-after-deadline", arguments)
+
     def test_load_and_warmup_bound_stalled_requests_with_the_same_timeout(self):
         result = json.dumps({
             "summary": {"requestsPerSec": 1},
