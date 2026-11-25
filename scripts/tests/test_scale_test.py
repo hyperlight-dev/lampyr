@@ -775,6 +775,24 @@ class ScaleTestTests(unittest.TestCase):
             scale.main()
             self.assertEqual(len(write.call_args.args[0]["scenarios"]), 2)
 
+    def test_startups_finish_before_any_warm_capacity_is_created(self):
+        with self.scenario_environment(
+            [{"router-1": 420}] * 20,
+            [{"container-1": 420, "kube-state": 420}] * 20,
+            arguments=("--startup-runs", "1"),
+        ), mock.patch.object(scale, "measure_startups") as startup:
+            baseline = scale.baseline_server.return_value
+
+            def warm(*args):
+                self.assertTrue(
+                    startup.called, "warm resources started before startup measurements"
+                )
+                return baseline
+
+            scale.baseline_server.side_effect = warm
+            scale.main()
+            startup.assert_called_once()
+
     def test_warmup_and_load_use_identical_request_paths_and_queries(self):
         for lampyr, baseline in (
             ("https://example.test/", "http://localhost/"),
