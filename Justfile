@@ -362,14 +362,14 @@ release-disruption-gate service url:
         --service "{{service}}" \
         --url "{{url}}"
 
-# Build the normal Kubernetes image from the same Go source as the Lampyr example.
+# Build the container image from the same Node.js source as the Lampyr example.
 [positional-arguments]
 scale-baseline-image image:
     docker build --tag "$1" --file scripts/fixtures/scale-workload/Dockerfile .
 
-# Compare Lampyr with a normal Kubernetes Deployment using platform telemetry.
+# Compare Lampyr with a Deployment and optionally stock Knative.
 [positional-arguments]
-scale-test context service lampyr-url baseline-image duration="30s" concurrency="1,4,16,64" output="build/scale-results.json": install-oha
+scale-test context service lampyr-url baseline-image duration="30s" concurrency="1,4,16,64" output="build/scale-results.json" knative-context="" knative-ingress-url="": install-oha
     python3 scripts/scale-test.py \
         --context "$1" \
         --service "$2" \
@@ -377,7 +377,9 @@ scale-test context service lampyr-url baseline-image duration="30s" concurrency=
         --baseline-image "$4" \
         --duration "$5" \
         --concurrency "$6" \
-        --output "$7"
+        --output "$7" \
+        --knative-context "$8" \
+        --knative-ingress-url "$9"
 
 # Run the repository test suites used in CI.
 test: test-unit test-cli examples-check test-preview-release cli::test cli::test-intent helper::test azure::test kind::test k3d::test test-examples-local test-kind-integration test-k3d-integration test-existing-kind-integration test-knative-portability test-walkthrough

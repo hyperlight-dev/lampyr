@@ -97,6 +97,21 @@ class ScaleTestTests(unittest.TestCase):
                         "baselineMemoryBytes": 4 << 20,
                     },
                 },
+                {
+                    "target": "knative",
+                    "concurrency": 4,
+                    "client": {
+                        "summary": {"requestsPerSec": 15},
+                        "httpSuccessRate": 1,
+                        "successfulLatencyMs": {"p50": 2, "p95": 3, "p99": 4},
+                    },
+                    "platform": {
+                        "knativeCPU": 0.5,
+                        "knativeAppMemoryBytes": 3 << 20,
+                        "knativeQueueProxyMemoryBytes": 2 << 20,
+                        "knativeMemoryBytes": 4 << 20,
+                    },
+                },
             ],
         }
         with tempfile.TemporaryDirectory() as temporary:
@@ -105,6 +120,8 @@ class ScaleTestTests(unittest.TestCase):
             report = output.read_text()
         self.assertIn("| lampyr | 4 | 10.00", report)
         self.assertIn("| kubernetes | 4 | 20.00", report)
+        self.assertIn("| knative | 4 | 15.00", report)
+        self.assertIn("| n/a | n/a | 0.500 | 4.00 |", report)
         self.assertIn("| 0 | 0 | 0.300 | 2.50 |", report)
         self.assertIn("kubectl Service port-forward", report)
 
@@ -582,6 +599,206 @@ class ScaleTestTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     scale.main()
                 revision.assert_not_called()
+
+    def test_knative_service_uses_same_image_and_cleans_only_after_creation(self):
+        image = "example.test/node@sha256:abc"
+        status = {"status": {
+            "url": "http://native.default.example.test",
+            "latestReadyRevisionName": "native-00001",
+        }}
+        with mock.patch.object(scale, "kubectl_manifest") as manifest, mock.patch.object(
+            scale.subprocess, "run"
+        ), mock.patch.object(scale, "command", return_value=json.dumps(status)):
+            with scale.knative_server("stock", image, "default") as native:
+                self.assertEqual(native["revision"], "native-00001")
+                created = manifest.call_args.args[2]
+                template = created["spec"]["template"]
+                self.assertEqual(template["spec"]["containers"][0]["image"], image)
+                self.assertEqual(template["spec"]["containers"][0]["name"], "app")
+                self.assertEqual(template["metadata"]["annotations"], {
+                    "autoscaling.knative.dev/min-scale": "1",
+                    "autoscaling.knative.dev/max-scale": "1",
+                })
+            self.assertEqual(
+                [call.args[1] for call in manifest.call_args_list], ["create", "delete"]
+            )
+            self.assertEqual(manifest.call_args.args[2], created)
+        failure = scale.subprocess.CalledProcessError(1, ["kubectl"])
+        with mock.patch.object(
+            scale, "kubectl_manifest", side_effect=failure
+        ) as manifest:
+            with self.assertRaises(scale.subprocess.CalledProcessError):
+                with scale.knative_server("stock", image, "default"):
+                    pass
+            self.assertEqual(manifest.call_count, 1)
+        with mock.patch.object(scale, "kubectl_manifest") as manifest, mock.patch.object(
+            scale.subprocess, "run", side_effect=failure
+        ):
+            with self.assertRaises(scale.subprocess.CalledProcessError):
+                with scale.knative_server("stock", image, "default"):
+                    pass
+            self.assertEqual(
+                [call.args[1] for call in manifest.call_args_list], ["create", "delete"]
+            )
+
+    def test_knative_context_aliases_cannot_target_the_lampyr_cluster(self):
+        with mock.patch.object(
+            scale, "command", return_value=json.dumps({"metadata": {"uid": "same"}})
+        ):
+            with self.assertRaisesRegex(ValueError, "separate cluster"):
+                scale.require_separate_knative("alias", "lampyr")
+        with mock.patch.object(scale, "command", side_effect=[
+            json.dumps({"metadata": {"uid": "native"}}),
+            json.dumps({"metadata": {"uid": "lampyr"}}),
+            "configmap/lampyr-install",
+        ]):
+            with self.assertRaisesRegex(ValueError, "must not have Lampyr"):
+                scale.require_separate_knative("stock", "lampyr")
+
+    def test_knative_uses_its_own_metrics_and_matching_workload_with_ingress_host(self):
+        native = {
+            "name": "native", "revision": "native-00001",
+            "url": scale.workload_url("http://native.default.example.test"),
+        }
+        arguments = (
+            "--knative-context", "stock",
+            "--knative-ingress-url", "http://127.0.0.1:18080",
+            "--lampyr-url", "https://example.test/a%2Fb?size=64&value=a%26b",
+        )
+        with self.scenario_environment(
+            [{"router-1": 420}] * 20,
+            [{"container-1": 420}] * 20,
+            arguments=arguments,
+        ) as write, mock.patch.object(
+            scale, "require_separate_knative"
+        ), mock.patch.object(
+            scale, "knative_server", return_value=contextlib.nullcontext(native)
+        ) as server, mock.patch.object(scale, "warm_target") as warm, mock.patch.object(
+            scale, "run_oha", return_value={
+                "summary": {"requestsPerSec": 1}, "httpSuccessRate": 1,
+                "successfulLatencyMs": {"p95": 1},
+            },
+        ) as load:
+            scale.main()
+            server.assert_called_once_with(
+                "stock", "example.test/baseline@sha256:abc", "default"
+            )
+            for execute in (warm, load):
+                self.assertEqual(
+                    [call.args[1] for call in execute.call_args_list],
+                    [
+                        "https://example.test/a%2Fb?size=64&value=a%26b",
+                        "http://localhost/a%2Fb?size=64&value=a%26b",
+                        "http://127.0.0.1:18080/a%2Fb?size=64&value=a%26b",
+                    ],
+                )
+                self.assertEqual(
+                    execute.call_args.kwargs, {"host": "native.default.example.test"}
+                )
+            sample_calls = scale.resource_samples.call_args_list
+            self.assertEqual([call.args[0] for call in sample_calls], [
+                "test", "test", "test", "test", "stock", "stock",
+            ])
+            self.assertEqual(scale.router_scrapes.call_count, 4)
+            result = write.call_args.args[0]
+            self.assertEqual(
+                [scenario["target"] for scenario in result["scenarios"]],
+                ["lampyr", "kubernetes", "knative"],
+            )
+            self.assertEqual(result["metadata"]["knative"]["revision"], "native-00001")
+            self.assertTrue(all(
+                name.startswith("knative")
+                for name in result["scenarios"][-1]["platform"]
+            ))
+
+    def test_knative_resources_include_both_containers_without_fiber_router(self):
+        queries = scale.resource_sample_queries(
+            "team-a", "lampyr-00001", "baseline-owned", "knative", "native-00001"
+        )
+        inventory = {
+            "knativeApp": {("team-a", "native-00001-deployment-one")},
+            "knativeQueueProxy": {("team-a", "native-00001-deployment-one")},
+        }
+        samples = {}
+        for source in queries:
+            metric = {"scale_input": source}
+            if source.endswith(("Cpu", "Memory", "Phase")):
+                metric.update(namespace="team-a", pod="native-00001-deployment-one")
+            samples[tuple(sorted(metric.items()))] = 420
+        self.assertTrue(scale.resource_coverage(samples, queries, inventory, {}))
+        for missing in ("knativeAppMemory", "knativeQueueProxyCpu"):
+            partial = {
+                identity: timestamp for identity, timestamp in samples.items()
+                if dict(identity)["scale_input"] != missing
+            }
+            self.assertFalse(scale.resource_coverage(partial, queries, inventory, {}))
+        joined = " ".join(queries.values())
+        self.assertIn('container="app"', joined)
+        self.assertIn('container="queue-proxy"', joined)
+        self.assertNotIn("fiber-router", joined)
+
+    def test_knative_ingress_options_are_rejected_before_cluster_work(self):
+        for extra in (
+            ("--knative-ingress-url", "http://localhost:18080"),
+            ("--knative-context", "test"),
+            ("--knative-context", "stock", "--knative-ingress-url", "http://localhost/a"),
+        ):
+            with self.subTest(extra=extra), mock.patch.object(
+                scale.sys, "argv", self.main_arguments(*extra)
+            ), mock.patch.object(scale, "active_revision") as revision, mock.patch.object(
+                scale, "require_separate_knative"
+            ) as separate:
+                with self.assertRaises(ValueError):
+                    scale.main()
+                revision.assert_not_called()
+                separate.assert_not_called()
+
+    def test_stock_metrics_installer_excludes_lampyr_and_ui_resources(self):
+        source = [
+            {"kind": "Namespace", "metadata": {"name": "lampyr-observability"}},
+            {"kind": "ConfigMap", "metadata": {
+                "name": "prometheus", "namespace": "lampyr-observability",
+            }},
+            {"kind": "ClusterRole", "metadata": {
+                "name": "lampyr-observability-kube-state-metrics",
+            }},
+            {"kind": "NetworkPolicy", "metadata": {
+                "name": "prometheus", "namespace": "lampyr-system",
+            }},
+            {"kind": "NetworkPolicy", "metadata": {
+                "name": "prometheus", "namespace": "lampyr-observability",
+            }},
+            {"kind": "Deployment", "metadata": {
+                "name": "perses", "namespace": "lampyr-observability",
+            }},
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fixture = root / "resources.json"
+            fixture.write_text(json.dumps(source))
+            executable = root / "kubectl"
+            executable.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, os, pathlib, sys\n"
+                "assert sys.argv[1:3] == ['--context', 'stock']\n"
+                "if sys.argv[3] == 'create':\n"
+                "    for item in json.loads(pathlib.Path(os.environ['FIXTURE']).read_text()):\n"
+                "        print(json.dumps(item))\n"
+                "elif sys.argv[3] == 'apply':\n"
+                "    pathlib.Path(os.environ['CAPTURE']).write_text(sys.stdin.read())\n"
+            )
+            executable.chmod(0o755)
+            capture = root / "applied.json"
+            scale.subprocess.run(
+                ["bash", str(PATH.parent / "install-scale-metrics.sh"), "stock"],
+                check=True, stdout=scale.subprocess.DEVNULL,
+                env={
+                    **os.environ,
+                    "PATH": f"{root}{os.pathsep}{os.environ['PATH']}",
+                    "FIXTURE": str(fixture), "CAPTURE": str(capture),
+                },
+            )
+            self.assertEqual(json.loads(capture.read_text())["items"], source[:3])
 
     def test_scenario_rejects_missing_router_membership_at_both_endpoints(self):
         inventory = {

@@ -1,13 +1,9 @@
 # syntax=docker/dockerfile:1
-FROM golang:1.26.7-bookworm@sha256:e8c859f5632dcfde7b32d2012b4351728f6437930887c2f6a91ea242459e5514 AS build
-WORKDIR /src
-COPY docs/examples/hello-go-standalone/go.mod docs/examples/hello-go-standalone/go.sum ./
-RUN go mod download
-COPY docs/examples/hello-go-standalone/application.go docs/examples/hello-go-standalone/main.go ./
-RUN CGO_ENABLED=0 go build -mod=readonly -trimpath -ldflags="-s -w" -o /service .
-
-FROM scratch
-COPY --from=build /service /service
+FROM node:24-alpine@sha256:116b800c3754b440ee0aa3ed2f20f5bf3d99a554bfd9adeea09ea8017f6e85f5
+WORKDIR /app
+COPY docs/examples/hello-nodejs-standalone/package.json docs/examples/hello-nodejs-standalone/package-lock.json ./
+RUN npm ci --omit=dev
+COPY docs/examples/hello-nodejs-standalone/application.js docs/examples/hello-nodejs-standalone/server.js ./
 ENV PORT=8080
 USER 65532:65532
-ENTRYPOINT ["/service"]
+ENTRYPOINT ["node", "server.js"]

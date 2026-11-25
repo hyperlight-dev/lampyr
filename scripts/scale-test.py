@@ -103,10 +103,10 @@ def router_scrapes(context, evaluation_time):
     return scrapes
 
 
-def resource_inputs(namespace, revision, baseline):
+def resource_inputs(namespace, revision, baseline, knative=None):
     baseline_pods = f'namespace="{namespace}",pod=~"{baseline}-.*"'
     phase = f'kube_pod_status_phase{{namespace="{namespace}",phase="Running"}}'
-    return {
+    inputs = {
         "lampyrRouter": {
             "namespace": "lampyr-system",
             "selector": "app=fiber-router",
@@ -133,6 +133,21 @@ def resource_inputs(namespace, revision, baseline):
             "phase": phase,
         },
     }
+    if knative:
+        for prefix, container in (
+            ("knativeApp", "app"), ("knativeQueueProxy", "queue-proxy")
+        ):
+            selector = (
+                f'namespace="{namespace}",pod=~"{knative}-.*",container="{container}"'
+            )
+            inputs[prefix] = {
+                "namespace": namespace,
+                "selector": f"serving.knative.dev/revision={knative}",
+                "cpu": f"container_cpu_usage_seconds_total{{{selector}}}",
+                "memory": f"container_memory_working_set_bytes{{{selector}}}",
+                "phase": phase,
+            }
+    return inputs
 
 
 def selected_resource(selector, inputs):
@@ -144,11 +159,12 @@ def selected_resource(selector, inputs):
     return f"{selector} * on(namespace,pod) group_left() {membership}"
 
 
-def resource_sample_queries(namespace, revision, baseline, target):
-    inputs = resource_inputs(namespace, revision, baseline)
+def resource_sample_queries(namespace, revision, baseline, target, knative=None):
+    inputs = resource_inputs(namespace, revision, baseline, knative)
     prefixes = {
         "lampyr": ("lampyrRouter", "lampyrHome"),
         "kubernetes": ("baseline",),
+        "knative": ("knativeApp", "knativeQueueProxy"),
     }[target]
     queries = {
         "kubeState": (
@@ -214,11 +230,12 @@ def resource_samples(context, queries, evaluation_time):
     return samples
 
 
-def resource_inventory(context, namespace, revision, baseline, target):
-    inputs = resource_inputs(namespace, revision, baseline)
+def resource_inventory(context, namespace, revision, baseline, target, knative=None):
+    inputs = resource_inputs(namespace, revision, baseline, knative)
     prefixes = {
         "lampyr": ("lampyrRouter", "lampyrHome"),
         "kubernetes": ("lampyrRouter", "baseline"),
+        "knative": ("knativeApp", "knativeQueueProxy"),
     }[target]
     inventory = {}
     for prefix in prefixes:
@@ -256,10 +273,10 @@ def resource_coverage(samples, queries, inventory, scrapes):
         ("lampyr-system", dict(identity).get("pod"))
         for identity in scrapes
     }
-    return routers == inventory["lampyrRouter"]
+    return routers == inventory.get("lampyrRouter", set())
 
 
-def metric_queries(namespace, revision, window, baseline, window_seconds=30):
+def metric_queries(namespace, revision, window, baseline, window_seconds=30, knative=None):
     revision_match = f'namespace="{namespace}",revision="{revision}"'
     counter_series = {
         "lampyrRequests": (
@@ -299,7 +316,7 @@ def metric_queries(namespace, revision, window, baseline, window_seconds=30):
         ),
     }
     memory = {}
-    for prefix, resource in resource_inputs(namespace, revision, baseline).items():
+    for prefix, resource in resource_inputs(namespace, revision, baseline, knative).items():
         cpu = selected_resource(f'increase({resource["cpu"]}[{window}])', resource)
         memory[prefix] = f'sum({selected_resource(resource["memory"], resource)})'
         queries[f"{prefix}CPU"] = f"sum({cpu}) / {window_seconds:.3f}"
@@ -310,6 +327,15 @@ def metric_queries(namespace, revision, window, baseline, window_seconds=30):
         f'max_over_time((({memory["lampyrRouter"]}) + '
         f'({memory["lampyrHome"]}))[{window}:5s])'
     )
+    if knative:
+        queries["knativeCPU"] = (
+            f'({queries["knativeAppCPU"]}) + ({queries["knativeQueueProxyCPU"]})'
+        )
+        queries["knativeMemoryBytes"] = (
+            f'max_over_time((({memory["knativeApp"]}) + '
+            f'({memory["knativeQueueProxy"]}))[{window}:5s])'
+        )
+        return {key: value for key, value in queries.items() if key.startswith("knative")}
     return queries
 
 
@@ -392,9 +418,9 @@ def baseline_manifest(image, replicas, namespace, name):
                                     "resources": {
                                         "requests": {
                                             "cpu": "250m",
-                                            "memory": "256Mi",
+                                            "memory": "768Mi",
                                         },
-                                        "limits": {"memory": "256Mi"},
+                                        "limits": {"memory": "768Mi"},
                                     },
                                     "securityContext": {
                                         "allowPrivilegeEscalation": False,
@@ -513,13 +539,87 @@ def baseline_server(context, image, replicas, namespace):
                 print(f"warning: baseline cleanup failed: {error}", file=sys.stderr)
 
 
+def require_separate_knative(context, lampyr_context):
+    identities = [
+        json.loads(command(
+            "kubectl", "--context", target, "get", "namespace", "kube-system",
+            "--output", "json",
+        ))["metadata"]["uid"]
+        for target in (context, lampyr_context)
+    ]
+    if identities[0] == identities[1]:
+        raise ValueError("stock Knative must use a separate cluster, not a context alias")
+    if command(
+        "kubectl", "--context", context, "--namespace", "kube-system",
+        "get", "configmap", "lampyr-install", "--ignore-not-found", "--output", "name",
+    ):
+        raise ValueError("Knative target cluster must not have Lampyr installed")
+
+
+def knative_manifest(image, namespace, name):
+    container = baseline_manifest(image, 1, namespace, name)["items"][0][
+        "spec"
+    ]["template"]["spec"]["containers"][0]
+    container["ports"] = [{"containerPort": 8080}]
+    container["readinessProbe"]["httpGet"]["port"] = 8080
+    return {
+        "apiVersion": "serving.knative.dev/v1",
+        "kind": "Service",
+        "metadata": {"name": name, "namespace": namespace},
+        "spec": {"template": {
+            "metadata": {"annotations": {
+                "autoscaling.knative.dev/min-scale": "1",
+                "autoscaling.knative.dev/max-scale": "1",
+            }},
+            "spec": {"containerConcurrency": 0, "containers": [container]},
+        }},
+    }
+
+
+@contextlib.contextmanager
+def knative_server(context, image, namespace):
+    if "@sha256:" not in image:
+        raise ValueError("Knative image must be digest-pinned")
+    name = f"scale-knative-{uuid.uuid4().hex[:24]}"
+    manifest = knative_manifest(image, namespace, name)
+    created = False
+    try:
+        kubectl_manifest(context, "create", manifest)
+        created = True
+        subprocess.run([
+            "kubectl", "--context", context, "--namespace", namespace,
+            "wait", f"services.serving.knative.dev/{name}",
+            "--for=condition=Ready", "--timeout=300s",
+        ], check=True)
+        service = json.loads(command(
+            "kubectl", "--context", context, "--namespace", namespace,
+            "get", "services.serving.knative.dev", name, "--output", "json",
+        ))
+        yield {
+            "name": name,
+            "url": workload_url(service["status"]["url"]),
+            "revision": service["status"]["latestReadyRevisionName"],
+        }
+    finally:
+        original_error = sys.exc_info()[0] is not None
+        if created:
+            try:
+                kubectl_manifest(
+                    context, "delete", manifest, "--ignore-not-found=true", "--wait=true"
+                )
+            except subprocess.CalledProcessError as error:
+                if not original_error:
+                    raise
+                print(f"warning: Knative cleanup failed: {error}", file=sys.stderr)
+
+
 def require_running(process, name):
     return_code = process.poll()
     if return_code is not None:
         raise RuntimeError(f"{name} exited with status {return_code}")
 
 
-def run_oha(oha, url, duration, concurrency):
+def run_oha(oha, url, duration, concurrency, host=None):
     output = subprocess.check_output(
         [
             str(oha),
@@ -535,6 +635,7 @@ def run_oha(oha, url, duration, concurrency):
             "--output-format",
             "json",
             "--insecure",
+            *(["--host", host] if host else []),
             url,
         ],
         text=True,
@@ -567,7 +668,7 @@ def http_success_rate(client):
     return successful / total
 
 
-def warm_target(oha, url):
+def warm_target(oha, url, host=None):
     output = subprocess.check_output(
         [
             str(oha),
@@ -582,6 +683,7 @@ def warm_target(oha, url):
             "--output-format",
             "json",
             "--insecure",
+            *(["--host", host] if host else []),
             url,
         ],
         text=True,
@@ -616,6 +718,11 @@ def target_resource_names(target):
             "lampyrRouterMemoryBytes",
             "lampyrHomeMemoryBytes",
             "lampyrMemoryBytes",
+        )
+    if target == "knative":
+        return (
+            "knativeAppCPU", "knativeQueueProxyCPU", "knativeCPU",
+            "knativeAppMemoryBytes", "knativeQueueProxyMemoryBytes", "knativeMemoryBytes",
         )
     return ("baselineCPU", "baselineMemoryBytes")
 
@@ -656,6 +763,10 @@ def write_report(result, path):
         f"- Baseline image: `{result['metadata']['baselineImage']}`",
         f"- Lampyr path: {result['metadata']['networkPaths']['lampyr']}",
         f"- Kubernetes path: {result['metadata']['networkPaths']['kubernetes']}",
+        *(
+            [f"- Knative path: {result['metadata']['networkPaths']['knative']}"]
+            if "knative" in result["metadata"]["networkPaths"] else []
+        ),
         "",
         "| Target | Concurrency | Requests/s | HTTP success | p50 ms | p95 ms | p99 ms | Platform errors | Shed | CPU cores | Peak memory MiB |",
         "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
@@ -670,6 +781,11 @@ def write_report(result, path):
             memory = metrics.get("lampyrMemoryBytes")
             errors = metrics.get("lampyrErrors")
             shed = metrics.get("lampyrShed")
+        elif scenario["target"] == "knative":
+            cpu = metrics["knativeCPU"]
+            memory = metrics["knativeMemoryBytes"]
+            errors = None
+            shed = None
         else:
             cpu = metrics["baselineCPU"]
             memory = metrics["baselineMemoryBytes"]
@@ -757,6 +873,8 @@ def main():
     parser.add_argument("--service", required=True)
     parser.add_argument("--lampyr-url", required=True)
     parser.add_argument("--baseline-image", required=True)
+    parser.add_argument("--knative-context", default="")
+    parser.add_argument("--knative-ingress-url", default="")
     parser.add_argument("--namespace", default="default")
     parser.add_argument("--baseline-replicas", type=int, default=1)
     parser.add_argument("--duration", default="30s")
@@ -777,6 +895,17 @@ def main():
     if output.suffix.lower() == ".md":
         raise ValueError("JSON and Markdown output files must be distinct; do not use .md")
     lampyr_url = workload_url(args.lampyr_url)
+    knative_ingress = None
+    if args.knative_ingress_url:
+        if not args.knative_context:
+            raise ValueError("--knative-ingress-url requires --knative-context")
+        knative_ingress = workload_url(args.knative_ingress_url)
+        if knative_ingress.path != "/" or knative_ingress.query:
+            raise ValueError("Knative ingress URL must specify only an HTTP(S) origin")
+    if args.knative_context:
+        if args.knative_context == args.context:
+            raise ValueError("stock Knative must use a separate cluster context")
+        require_separate_knative(args.knative_context, args.context)
     oha = Path(args.oha).resolve()
     if not oha.is_file():
         raise FileNotFoundError(f"load generator not found: {oha}")
@@ -818,41 +947,72 @@ def main():
     result = {"schema": 1, "metadata": metadata, "scenarios": []}
     with baseline_server(
         args.context, args.baseline_image, args.baseline_replicas, args.namespace
-    ) as baseline:
+    ) as baseline, (
+        knative_server(args.knative_context, args.baseline_image, args.namespace)
+        if args.knative_context else contextlib.nullcontext(None)
+    ) as knative:
         metadata["baselineName"] = baseline["name"]
         baseline_url = urllib.parse.urlsplit(baseline["url"])._replace(
             path=lampyr_url.path, query=lampyr_url.query, fragment=""
         )
-        targets = (
-            ("lampyr", lampyr_url.geturl()),
-            ("kubernetes", baseline_url.geturl()),
-        )
-        for target, url in targets:
+        targets = [
+            ("lampyr", lampyr_url.geturl(), args.context, None),
+            ("kubernetes", baseline_url.geturl(), args.context, None),
+        ]
+        if knative:
+            route = knative["url"]
+            native_url = (knative_ingress or route)._replace(
+                path=lampyr_url.path, query=lampyr_url.query, fragment=""
+            )
+            targets.append((
+                "knative", native_url.geturl(), args.knative_context,
+                route.netloc if knative_ingress else None,
+            ))
+            metadata["knative"] = {
+                "context": args.knative_context,
+                "service": knative["name"],
+                "revision": knative["revision"],
+                "url": safe_url(native_url.geturl()),
+                "minScale": 1,
+                "maxScale": 1,
+                "nodes": node_summary(json.loads(command(
+                    "kubectl", "--context", args.knative_context,
+                    "get", "nodes", "--output", "json",
+                ))),
+            }
+            metadata["networkPaths"]["knative"] = "stock Knative ingress and queue-proxy"
+        for target, url, context, host in targets:
             if target == "kubernetes":
                 require_running(baseline["process"], "baseline port-forward")
-            warm_target(oha, url)
+            warm_target(oha, url, **({"host": host} if host else {}))
         warmup_ended = datetime.datetime.now(datetime.timezone.utc).timestamp()
         time.sleep(6)
         for concurrency in concurrencies:
-            for target, url in targets:
+            for target, url, context, host in targets:
+                native_revision = knative["revision"] if target == "knative" else None
                 if target == "kubernetes":
                     require_running(baseline["process"], "baseline port-forward")
                 snapshot_queries = metric_queries(
-                    args.namespace, revision, "1s", baseline["name"], 1
+                    args.namespace, revision, "1s", baseline["name"], 1,
+                    knative=native_revision,
                 )
                 sample_queries = resource_sample_queries(
-                    args.namespace, revision, baseline["name"], target
+                    args.namespace, revision, baseline["name"], target,
+                    knative=native_revision,
                 )
                 for wait_seconds in (0, 5, 5, 5, 5, 5, 5):
                     if wait_seconds:
                         time.sleep(wait_seconds)
                     snapshot_time = time.time()
                     before_inventory = resource_inventory(
-                        args.context, args.namespace, revision, baseline["name"], target
+                        context, args.namespace, revision, baseline["name"], target,
+                        knative=native_revision,
                     )
-                    before_scrapes = router_scrapes(args.context, snapshot_time)
+                    before_scrapes = (
+                        {} if native_revision else router_scrapes(context, snapshot_time)
+                    )
                     before_resources = resource_samples(
-                        args.context, sample_queries, snapshot_time
+                        context, sample_queries, snapshot_time
                     )
                     if resource_coverage(
                         before_resources, sample_queries, before_inventory, before_scrapes
@@ -868,17 +1028,19 @@ def main():
                         f"Prometheus did not collect fresh pre-load router and "
                         f"resource samples for {target}"
                     )
-                measurement_started = min(
+                measurement_started = min([
                     *before_scrapes.values(), *before_resources.values()
-                ) - 0.001
-                before = counter_snapshot(args.context, snapshot_queries, snapshot_time)
-                if before["lampyrRequests"] is None:
+                ]) - 0.001
+                before = counter_snapshot(context, snapshot_queries, snapshot_time)
+                if not native_revision and before["lampyrRequests"] is None:
                     raise RuntimeError(
                         "Lampyr request metrics are missing after warmup; check the "
                         "observability add-on and requested namespace"
                     )
                 started = datetime.datetime.now(datetime.timezone.utc)
-                client = run_oha(oha, url, args.duration, concurrency)
+                client = run_oha(
+                    oha, url, args.duration, concurrency, **({"host": host} if host else {})
+                )
                 load_ended = datetime.datetime.now(datetime.timezone.utc)
                 if target == "kubernetes":
                     require_running(baseline["process"], "baseline port-forward")
@@ -886,15 +1048,16 @@ def main():
                 for wait_seconds in (6, 5, 5, 5, 5, 5):
                     time.sleep(wait_seconds)
                     evaluated = time.time()
-                    scrapes = router_scrapes(args.context, evaluated)
+                    scrapes = {} if native_revision else router_scrapes(context, evaluated)
                     if scrapes.keys() != before_scrapes.keys() or any(
                         timestamp < load_ended.timestamp()
                         for timestamp in scrapes.values()
                     ):
                         continue
-                    samples = resource_samples(args.context, sample_queries, evaluated)
+                    samples = resource_samples(context, sample_queries, evaluated)
                     inventory = resource_inventory(
-                        args.context, args.namespace, revision, baseline["name"], target
+                        context, args.namespace, revision, baseline["name"], target,
+                        knative=native_revision,
                     )
                     if (
                         not resource_coverage(samples, sample_queries, inventory, scrapes)
@@ -914,16 +1077,17 @@ def main():
                         window,
                         baseline["name"],
                         measured_seconds,
+                        knative=native_revision,
                     )
                     resources = {
                         name: prometheus_query(
-                            args.context, queries[name], evaluated
+                            context, queries[name], evaluated
                         )
                         for name in target_resource_names(target)
                     }
                     if target_resources_available(target, resources):
                         platform = collect_metrics(
-                            args.context, queries, before, evaluated
+                            context, queries, before, evaluated
                         )
                         break
                 else:
