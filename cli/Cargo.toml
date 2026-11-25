@@ -52,6 +52,7 @@ getrandom = "0.3"
 git2 = { version = "0.21", default-features = false }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 zeroize = "1"
+rustls-native-certs = "0.8"
 
 [dev-dependencies]
 indicatif = { version = "0.18", features = ["in_memory"] }

@@ -161,6 +161,8 @@ pub fn run(operation: Operation, options: Options<'_>, host: &Host) -> Result<()
 struct RuntimePlan {
     #[serde(default)]
     options: serde_json::Map<String, Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    platform_mutations: Vec<Value>,
     #[serde(default)]
     before: Vec<Value>,
     #[serde(default)]
@@ -171,6 +173,9 @@ struct RuntimePlan {
 
 impl RuntimePlan {
     fn validate(&self) -> Result<()> {
+        for mutation in &self.platform_mutations {
+            crate::platform_host::validate_cert_manager_credential(mutation)?;
+        }
         for manifest in self.before.iter().chain(&self.after).chain(&self.cleanup) {
             validate_manifest(manifest)?;
         }
@@ -240,11 +245,12 @@ pub(crate) const RUNTIME_SECRET: &str = "lampyr-runtime";
 /// The installation inputs for fiberd-k8s-controller, which only the
 /// platform reads. Providers refuse configuration keys they do not know, so
 /// these never reach them, and a reinstall keeps the ones it was given.
-const CONTROLLER_INPUTS: [&str; 4] = [
+const PLATFORM_INPUTS: [&str; 5] = [
     "controllerManifest",
     "grantImage",
     "helperImage",
     "zygoteRegistries",
+    "ingress",
 ];
 
 /// Where a platform package records the controller inputs it installs when
@@ -469,11 +475,12 @@ fn existing_lifecycle(
         .settings
         .as_object_mut()
         .context("saved platform settings must be a mapping")?;
-    settings.extend(config.as_object().unwrap().clone());
+    merge_requested_settings(settings, config.as_object().unwrap());
     apply_existing_cluster_defaults(settings, data)?;
     let defaulted = fill_controller_defaults(settings, &controller_defaults(root)?);
     crate::platform_host::validate_settings(&record.settings)?;
     let install_settings = record.settings.clone();
+    record.plan = approval_runtime_plan(&kube, &record.plan, &install_settings)?;
     record.settings = without_fields(&record.settings, &defaulted);
     record.eventing |= requested_eventing == Some(json!(true));
     let provider = data
@@ -537,10 +544,11 @@ fn apply_existing_cluster_defaults(
     Ok(())
 }
 
-/// Fills each controller input the install was not given from the last
-/// install's, as fiberdImage and routerImage are.
-fn keep_controller_inputs(config: &mut Value, previous: &Value) {
-    for field in CONTROLLER_INPUTS {
+/// Fills each platform-only input the install was not given from the last
+/// install's. Providers refuse these settings because only the platform uses
+/// them.
+fn keep_platform_inputs(config: &mut Value, previous: &Value) {
+    for field in PLATFORM_INPUTS {
         if config.get(field).is_none()
             && let Some(value) = previous.get(field)
         {
@@ -549,23 +557,23 @@ fn keep_controller_inputs(config: &mut Value, previous: &Value) {
     }
 }
 
-fn without_controller_inputs(config: &Value) -> Result<Value> {
+fn without_platform_inputs(config: &Value) -> Result<Value> {
     let mut provider_config = config.clone();
     let mapping = provider_config
         .as_object_mut()
         .context("provider configuration must be a mapping")?;
-    for field in CONTROLLER_INPUTS {
+    for field in PLATFORM_INPUTS {
         mapping.remove(field);
     }
     Ok(provider_config)
 }
 
 /// What the provider is given for an operation other than install: the
-/// configuration without the controller inputs, which an uninstall may be
+/// configuration without the platform-only inputs, which an uninstall may be
 /// given in the same --provider-config as the install and the provider
 /// would refuse, and marked as a teardown for an uninstall.
 fn teardown_config(config: &Value, operation: Operation) -> Result<Value> {
-    let mut provider_config = without_controller_inputs(config)?;
+    let mut provider_config = without_platform_inputs(config)?;
     if operation == Operation::Uninstall {
         provider_config["teardown"] = true.into();
     }
@@ -598,7 +606,7 @@ fn install_config(
             "{field} must be nonempty text"
         );
     }
-    keep_controller_inputs(&mut config, previous);
+    keep_platform_inputs(&mut config, previous);
     let defaulted = fill_controller_defaults(
         config
             .as_object_mut()
@@ -668,7 +676,7 @@ fn lifecycle(
         let (config, defaulted) = install_config(config, &previous, &controller_defaults(root)?)?;
         require_template_registry(&installation.record.provider, &config)?;
         let eventing = config["eventing"] == true || previous["eventing"] == true;
-        let provider_config = without_controller_inputs(&config)?;
+        let provider_config = without_platform_inputs(&config)?;
         installation.invoke(Operation::Init, provider_config.clone(), host)?;
         let infrastructure_existed =
             installation.invoke(Operation::Inspect, provider_config.clone(), host)?["exists"]
@@ -695,18 +703,30 @@ fn lifecycle(
                 .unwrap_or(json!({})),
         )
         .context("decode provider-emitted runtime manifests")?;
+        ensure!(
+            plan.platform_mutations.is_empty(),
+            "provider runtime plans cannot predeclare installed platform mutations"
+        );
         let mut settings = plan.options.clone();
         for field in ["domain", "fiberdImage", "routerImage"] {
             settings.insert(field.into(), config[field].clone());
         }
-        for field in CONTROLLER_INPUTS {
+        for field in PLATFORM_INPUTS {
             if let Some(value) = config.get(field) {
-                settings.insert(field.into(), value.clone());
+                if field == "ingress" {
+                    merge_requested_ingress(
+                        settings.entry(field).or_insert_with(|| json!({})),
+                        value,
+                    );
+                } else {
+                    settings.insert(field.into(), value.clone());
+                }
             }
         }
         settings.entry("httpsPort").or_insert(json!(443));
         let settings = Value::Object(settings);
         crate::platform_host::validate_settings(&settings)?;
+        let plan = approval_runtime_plan(&kube, &plan, &settings)?;
         plan.validate()?;
         validate_provider_manifest_capability_for_plan(&plan, provider_manifests)?;
         if let Err(approval_error) = approve_install_manifests(installation, &plan, manifests) {
@@ -836,16 +856,111 @@ fn lifecycle(
     Ok(json!({"name":name,"uninstalled":true,"clusterRetained":!delete}))
 }
 
+fn merge_requested_settings(
+    settings: &mut serde_json::Map<String, Value>,
+    requested: &serde_json::Map<String, Value>,
+) {
+    for (field, value) in requested {
+        if field == "ingress" {
+            merge_requested_ingress(
+                settings.entry(field.clone()).or_insert_with(|| json!({})),
+                value,
+            );
+        } else {
+            settings.insert(field.clone(), value.clone());
+        }
+    }
+}
+
+fn merge_requested_ingress(generated: &mut Value, requested: &Value) {
+    let (Some(generated), Some(requested)) = (generated.as_object_mut(), requested.as_object())
+    else {
+        *generated = requested.clone();
+        return;
+    };
+    for (field, value) in requested {
+        let target = generated.entry(field.clone()).or_insert(Value::Null);
+        let mode_changed =
+            field == "tls" && target["mode"].as_str().is_some() && target["mode"] != value["mode"];
+        if mode_changed {
+            *target = value.clone();
+        } else {
+            merge_requested_value(target, value);
+        }
+    }
+}
+
+fn merge_requested_value(generated: &mut Value, requested: &Value) {
+    if let (Some(generated), Some(requested)) = (generated.as_object_mut(), requested.as_object()) {
+        for (field, value) in requested {
+            merge_requested_value(generated.entry(field.clone()).or_insert(Value::Null), value);
+        }
+    } else {
+        *generated = requested.clone();
+    }
+}
+
+fn effective_runtime_plan(plan: &RuntimePlan, settings: &Value) -> RuntimePlan {
+    let mut effective = plan.clone();
+    if let Some(ingress) = settings.get("ingress") {
+        effective.options.insert("ingress".into(), ingress.clone());
+    }
+    effective
+}
+
+fn credential_transition_mutations(effective: Option<&Value>, installed: &[Value]) -> Vec<Value> {
+    let mut mutations = Vec::new();
+    for mutation in effective.into_iter().chain(installed) {
+        if !mutations.contains(mutation) {
+            mutations.push(mutation.clone());
+        }
+    }
+    mutations
+}
+
+fn approval_runtime_plan(
+    kube: &Kube<'_>,
+    plan: &RuntimePlan,
+    settings: &Value,
+) -> Result<RuntimePlan> {
+    let mut effective = effective_runtime_plan(plan, settings);
+    let current = effective_credential_mutation(&effective)?;
+    let installed = crate::bootstrap::installed_cert_manager_credential_mutations(kube)?;
+    effective.platform_mutations = credential_transition_mutations(current.as_ref(), &installed);
+    Ok(effective)
+}
+
+fn effective_credential_mutation(plan: &RuntimePlan) -> Result<Option<Value>> {
+    plan.options
+        .get("ingress")
+        .and_then(|ingress| ingress.pointer("/tls/credential"))
+        .map(crate::platform_host::canonical_cert_manager_credential)
+        .transpose()
+}
+
 fn validate_provider_manifest_capability_for_plan(
     plan: &RuntimePlan,
     declared: bool,
 ) -> Result<()> {
-    let has_manifests =
-        !plan.before.is_empty() || !plan.after.is_empty() || !plan.cleanup.is_empty();
+    let has_manifests = !plan.before.is_empty()
+        || !plan.after.is_empty()
+        || !plan.cleanup.is_empty()
+        || !embedded_platform_mutations(plan).is_empty();
     if !has_manifests {
         return Ok(());
     }
     validate_provider_manifest_capability(declared)
+}
+
+fn embedded_platform_mutations(plan: &RuntimePlan) -> Vec<&Value> {
+    if !plan.platform_mutations.is_empty() {
+        return plan.platform_mutations.iter().collect();
+    }
+    plan.options
+        .get("ingress")
+        .and_then(|ingress| ingress.pointer("/tls/credential"))
+        .into_iter()
+        .collect()
 }
 
 fn validate_provider_manifest_capability(declared: bool) -> Result<()> {
@@ -870,18 +985,41 @@ fn approve_install_manifests_at(
     plan: &RuntimePlan,
     approval: ManifestApproval,
 ) -> Result<()> {
-    if plan.before.is_empty() && plan.after.is_empty() {
+    let platform = embedded_platform_mutations(plan);
+    if plan.before.is_empty() && plan.after.is_empty() && platform.is_empty() {
         return Ok(());
     }
     let before = directory.join("before.yaml");
     let after = directory.join("after.yaml");
     write_manifest_file(&before, &plan.before)?;
     write_manifest_file(&after, &plan.after)?;
+    let platform_path = directory.join("platform-mutations.yaml");
+    if !platform.is_empty() {
+        write_yaml_file(
+            &platform_path,
+            &Value::Array(
+                platform
+                    .iter()
+                    .map(|mutation| (*mutation).clone())
+                    .collect(),
+            ),
+        )?;
+    } else if platform_path.try_exists()? {
+        std::fs::remove_file(&platform_path)?;
+    }
     let cleanup = directory.join("cleanup.yaml");
     if cleanup.try_exists()? {
         std::fs::remove_file(cleanup)?;
     }
-    show_install_manifests(plan, &before, &after);
+    show_install_manifests(
+        plan,
+        &before,
+        &after,
+        (!platform.is_empty()).then_some(platform_path.as_path()),
+    );
+    for mutation in platform {
+        show_platform_mutations(mutation);
+    }
     require_manifest_approval(approval, "Apply these provider Kubernetes manifests?")
 }
 
@@ -901,12 +1039,34 @@ fn approve_cleanup_manifests_at(
     delete_cluster: bool,
     approval: ManifestApproval,
 ) -> Result<()> {
-    if delete_cluster || plan.cleanup.is_empty() {
+    let platform = embedded_platform_mutations(plan);
+    if delete_cluster || (plan.cleanup.is_empty() && platform.is_empty()) {
         return Ok(());
     }
     let cleanup = directory.join("cleanup.yaml");
     write_manifest_file(&cleanup, &plan.cleanup)?;
-    show_cleanup_manifests(&plan.cleanup, &cleanup);
+    let platform_path = directory.join("platform-mutations.yaml");
+    if !platform.is_empty() {
+        write_yaml_file(
+            &platform_path,
+            &Value::Array(
+                platform
+                    .iter()
+                    .map(|mutation| (*mutation).clone())
+                    .collect(),
+            ),
+        )?;
+    } else if platform_path.try_exists()? {
+        std::fs::remove_file(&platform_path)?;
+    }
+    show_cleanup_manifests(
+        &plan.cleanup,
+        &cleanup,
+        (!platform.is_empty()).then_some(platform_path.as_path()),
+    );
+    for mutation in platform {
+        show_platform_mutations(mutation);
+    }
     require_manifest_approval(approval, "Apply the provider cleanup manifests?")
 }
 
@@ -932,7 +1092,12 @@ fn approve_providerless_uninstall_manifests(
     plan: &RuntimePlan,
     approval: ManifestApproval,
 ) -> Result<()> {
-    if plan.before.is_empty() && plan.after.is_empty() && plan.cleanup.is_empty() {
+    let platform = embedded_platform_mutations(plan);
+    if plan.before.is_empty()
+        && plan.after.is_empty()
+        && plan.cleanup.is_empty()
+        && platform.is_empty()
+    {
         return Ok(());
     }
     let before = directory.join("before.yaml");
@@ -941,6 +1106,18 @@ fn approve_providerless_uninstall_manifests(
     write_manifest_file(&before, &plan.before)?;
     write_manifest_file(&after, &plan.after)?;
     write_manifest_file(&cleanup, &plan.cleanup)?;
+    let platform_path = directory.join("platform-mutations.yaml");
+    if !platform.is_empty() {
+        write_yaml_file(
+            &platform_path,
+            &Value::Array(
+                platform
+                    .iter()
+                    .map(|mutation| (*mutation).clone())
+                    .collect(),
+            ),
+        )?;
+    }
 
     eprintln!();
     eprintln!("{}", style("Provider Kubernetes resource removal", "1"));
@@ -953,11 +1130,20 @@ fn approve_providerless_uninstall_manifests(
         "36;1",
         &plan.before,
     );
+    for mutation in &platform {
+        show_platform_mutations(mutation);
+    }
     eprintln!();
     eprintln!("Files written locally:");
     eprintln!("  BEFORE  {}", style(&before.display().to_string(), "2"));
     eprintln!("  AFTER   {}", style(&after.display().to_string(), "2"));
     eprintln!("  CLEANUP {}", style(&cleanup.display().to_string(), "2"));
+    if !platform.is_empty() {
+        eprintln!(
+            "  PLATFORM {}",
+            style(&platform_path.display().to_string(), "2")
+        );
+    }
     eprintln!("Inspect these standard YAML files before continuing.");
     require_manifest_approval(
         approval,
@@ -984,7 +1170,26 @@ fn write_manifest_file(path: &Path, manifests: &[Value]) -> Result<()> {
     Ok(())
 }
 
-fn show_install_manifests(plan: &RuntimePlan, before: &Path, after: &Path) {
+fn write_yaml_file(path: &Path, value: &Value) -> Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(serde_yaml_ng::to_string(value)?.as_bytes())?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn show_install_manifests(
+    plan: &RuntimePlan,
+    before: &Path,
+    after: &Path,
+    platform: Option<&Path>,
+) {
     eprintln!();
     eprintln!("{}", style("Provider Kubernetes manifests", "1"));
     show_manifest_phase("BEFORE LAMPYR PLATFORM", "36;1", &plan.before);
@@ -993,18 +1198,55 @@ fn show_install_manifests(plan: &RuntimePlan, before: &Path, after: &Path) {
     eprintln!("Files written locally:");
     eprintln!("  BEFORE  {}", style(&before.display().to_string(), "2"));
     eprintln!("  AFTER   {}", style(&after.display().to_string(), "2"));
+    if let Some(platform) = platform {
+        eprintln!("  PLATFORM {}", style(&platform.display().to_string(), "2"));
+    }
     eprintln!("Inspect these standard YAML files or apply them manually in the phase order shown.");
 }
 
-fn show_cleanup_manifests(manifests: &[Value], cleanup: &Path) {
+fn show_cleanup_manifests(manifests: &[Value], cleanup: &Path, platform: Option<&Path>) {
     eprintln!();
     eprintln!("{}", style("Provider cleanup manifests", "1"));
     show_manifest_phase("CLEANUP", "35;1", manifests);
     eprintln!();
     eprintln!("File written locally:");
     eprintln!("  CLEANUP  {}", style(&cleanup.display().to_string(), "2"));
+    if let Some(platform) = platform {
+        eprintln!("  PLATFORM {}", style(&platform.display().to_string(), "2"));
+    }
     eprintln!(
         "Inspect this standard YAML file or apply it manually during retained-cluster cleanup."
+    );
+}
+
+fn show_platform_mutations(credential: &Value) {
+    let boundary = credential["boundary"]["items"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    show_manifest_phase("PLATFORM CREDENTIAL BOUNDARY", "33;1", boundary);
+    eprintln!();
+    eprintln!("{}", style("Platform credential mutations", "1"));
+    eprintln!(
+        "  ServiceAccount cert-manager/cert-manager patch: {}",
+        credential["serviceAccountPatch"]
+    );
+    eprintln!(
+        "  ServiceAccount cert-manager/cert-manager cleanup: {}",
+        credential["serviceAccountCleanupPatch"]
+    );
+    eprintln!(
+        "  Deployment cert-manager/cert-manager patch: {}",
+        credential["deploymentPatch"]
+    );
+    eprintln!(
+        "  Deployment cert-manager/cert-manager cleanup: {}",
+        credential["deploymentCleanupPatch"]
+    );
+    eprintln!("  Controller args: {}", credential["controllerArgs"]);
+    eprintln!(
+        "  Controller arg prefixes removed: {}",
+        credential["controllerArgPrefixes"]
     );
 }
 
@@ -1417,22 +1659,23 @@ mod tests {
     }
 
     #[test]
-    fn controller_inputs_stay_with_the_platform_across_reinstalls() {
+    fn platform_inputs_stay_with_the_platform_across_reinstalls() {
         let given = json!({
             "fiberdImage": "custom/fiberd:v1",
             "controllerManifest": "/controller.yaml",
             "grantImage": "registry/fiberd@sha256:1",
             "helperImage": "registry/helper@sha256:2",
             "zygoteRegistries": ["http://registry:5000/ci"],
+            "ingress": {"tls":{"mode":"existingSecret","secretName":"tls","secretNamespace":"security"}},
             "registryPort": 5002,
         });
         assert_eq!(
-            without_controller_inputs(&given).unwrap(),
+            without_platform_inputs(&given).unwrap(),
             json!({"fiberdImage": "custom/fiberd:v1", "registryPort": 5002})
         );
 
         let mut reinstall = json!({"grantImage": "registry/fiberd@sha256:3"});
-        keep_controller_inputs(&mut reinstall, &given);
+        keep_platform_inputs(&mut reinstall, &given);
         assert_eq!(reinstall["grantImage"], "registry/fiberd@sha256:3");
         assert_eq!(reinstall["controllerManifest"], "/controller.yaml");
         assert_eq!(reinstall["helperImage"], "registry/helper@sha256:2");
@@ -1440,10 +1683,11 @@ mod tests {
             reinstall["zygoteRegistries"],
             json!(["http://registry:5000/ci"])
         );
+        assert_eq!(reinstall["ingress"], given["ingress"]);
         assert!(reinstall.get("registryPort").is_none());
 
         let mut first = json!({});
-        keep_controller_inputs(&mut first, &json!({}));
+        keep_platform_inputs(&mut first, &json!({}));
         assert_eq!(first, json!({}));
     }
 
@@ -1456,6 +1700,7 @@ mod tests {
             "grantImage": "registry/fiberd@sha256:1",
             "helperImage": "registry/helper@sha256:2",
             "zygoteRegistries": ["http://registry:5000/ci"],
+            "ingress": {"tls":{"mode":"existingSecret","secretName":"tls","secretNamespace":"security"}},
         });
         assert_eq!(
             teardown_config(&given, Operation::Uninstall).unwrap(),
@@ -1483,7 +1728,11 @@ mod tests {
             json!([default_fiberd_image(), default_router_image()])
         );
         assert!(defaulted.is_empty());
-        for field in CONTROLLER_INPUTS {
+        for field in PLATFORM_INPUTS
+            .iter()
+            .copied()
+            .filter(|field| *field != "ingress")
+        {
             let mut missing = given.clone();
             missing.as_object_mut().unwrap().remove(field);
             // zygoteRegistries defaults to the installation's template
@@ -1628,6 +1877,159 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("provider-manifests capability")
+        );
+    }
+
+    #[test]
+    fn embedded_platform_credential_requires_manifest_capability_and_approval() {
+        let mut plan = RuntimePlan::default();
+        plan.options.insert(
+            "ingress".into(),
+            json!({"tls":{"mode":"acme","credential":{
+                "serviceAccountPatch":{"metadata":{"annotations":{"provider.example/id":"identity"}}},
+                "serviceAccountCleanupPatch":{"metadata":{"annotations":{"provider.example/id":null}}},
+                "deploymentPatch":{"spec":{"template":{"metadata":{"annotations":{"provider.example/id":"identity"}}}}},
+                "deploymentCleanupPatch":{"spec":{"template":{"metadata":{"annotations":{"provider.example/id":null}}}}},
+                "controllerArgs":["--provider-ambient=true"],
+                "controllerArgPrefixes":["--provider-ambient"],
+                "boundary":{"apiVersion":"v1","kind":"List","items":[{
+                    "apiVersion":"admissionregistration.k8s.io/v1",
+                    "kind":"ValidatingAdmissionPolicy",
+                    "metadata":{"name":"provider-boundary"}
+                }]},
+                "boundaryMessage":"provider boundary"
+            }}}),
+        );
+        assert!(
+            validate_provider_manifest_capability_for_plan(&plan, false)
+                .unwrap_err()
+                .to_string()
+                .contains("provider-manifests capability")
+        );
+        let directory = tempfile::tempdir().unwrap();
+        assert!(
+            approve_install_manifests_at(
+                directory.path(),
+                &plan,
+                ManifestApproval {
+                    approved: false,
+                    interactive: false,
+                },
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("--approve-provider-manifests")
+        );
+        let mutations =
+            std::fs::read_to_string(directory.path().join("platform-mutations.yaml")).unwrap();
+        assert!(mutations.contains("serviceAccountPatch"), "{mutations}");
+        assert!(
+            mutations.contains("ValidatingAdmissionPolicy"),
+            "{mutations}"
+        );
+    }
+
+    #[test]
+    fn requested_ingress_preserves_provider_generated_runtime_fields() {
+        let mut generated = json!({
+            "tls":{
+                "mode":"acme",
+                "email":"old@example.com",
+                "issuer":"letsencrypt-prod",
+                "solver":{"dns01":{"providerDNS":{"zone":"example.com"}}},
+                "credential":{"serviceAccountPatch":{"metadata":{"annotations":{"provider.example/id":"identity"}}}}
+            },
+            "service":{
+                "publicIpAddress":"192.0.2.1",
+                "annotations":{"service.example/address":"edge"}
+            }
+        });
+        merge_requested_ingress(
+            &mut generated,
+            &json!({"tls":{
+                "mode":"acme",
+                "email":"new@example.com",
+                "issuer":"letsencrypt-staging"
+            }}),
+        );
+        assert_eq!(generated["tls"]["email"], "new@example.com");
+        assert_eq!(generated["tls"]["issuer"], "letsencrypt-staging");
+        assert!(generated["tls"].get("solver").is_some());
+        assert!(generated["tls"].get("credential").is_some());
+        assert!(generated.get("service").is_some());
+
+        merge_requested_ingress(
+            &mut generated,
+            &json!({"tls":{
+                "mode":"existingSecret",
+                "secretName":"edge-tls",
+                "secretNamespace":"security"
+            }}),
+        );
+        assert_eq!(generated["tls"]["mode"], "existingSecret");
+        assert!(generated["tls"].get("solver").is_none());
+        assert!(generated["tls"].get("credential").is_none());
+        assert!(generated.get("service").is_some());
+    }
+
+    #[test]
+    fn providerless_approval_plan_uses_effective_ingress_settings() {
+        let mut plan = RuntimePlan::default();
+        plan.options.insert(
+            "ingress".into(),
+            json!({"tls":{"mode":"acme","credential":{"boundaryMessage":"old"}}}),
+        );
+        let settings =
+            json!({"ingress":{"tls":{"mode":"acme","credential":{"boundaryMessage":"new"}}}});
+        let effective = effective_runtime_plan(&plan, &settings);
+        assert_eq!(
+            effective
+                .options
+                .get("ingress")
+                .unwrap()
+                .pointer("/tls/credential/boundaryMessage"),
+            Some(&json!("new"))
+        );
+    }
+
+    #[test]
+    fn credential_transition_approval_includes_effective_installed_and_retiring_state() {
+        let effective = json!({"boundaryMessage":"effective"});
+        let installed = json!({"boundaryMessage":"installed"});
+        let retiring = json!({"boundaryMessage":"retiring"});
+        assert_eq!(
+            credential_transition_mutations(
+                Some(&effective),
+                &[installed.clone(), retiring.clone()]
+            ),
+            vec![effective, installed.clone(), retiring.clone()]
+        );
+        assert_eq!(
+            credential_transition_mutations(None, &[installed.clone(), retiring.clone()]),
+            vec![installed, retiring]
+        );
+
+        let requested = json!({
+            "serviceAccountPatch":{"metadata":{"annotations":{"provider.example/id":"identity"}}},
+            "serviceAccountCleanupPatch":{"metadata":{"annotations":{"provider.example/id":null}}},
+            "deploymentPatch":{"spec":{"template":{"metadata":{"annotations":{"provider.example/id":"identity"}}}}},
+            "deploymentCleanupPatch":{"spec":{"template":{"metadata":{"annotations":{"provider.example/id":null}}}}},
+            "controllerArgs":["--issuer-ambient-credentials=true"],
+            "controllerArgPrefixes":["--issuer-ambient-credentials"],
+            "boundary":{"apiVersion":"v1","kind":"List","items":[]},
+            "boundaryMessage":"provider boundary"
+        });
+        let mut plan = RuntimePlan::default();
+        plan.options.insert(
+            "ingress".into(),
+            json!({"tls":{"mode":"acme","credential":requested.clone()}}),
+        );
+        let effective = effective_credential_mutation(&plan).unwrap().unwrap();
+        let installed =
+            crate::platform_host::canonical_cert_manager_credential(&requested).unwrap();
+        assert_eq!(
+            credential_transition_mutations(Some(&effective), &[installed]),
+            vec![effective]
         );
     }
 
