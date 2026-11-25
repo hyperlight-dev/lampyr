@@ -644,7 +644,7 @@ def run_oha(oha, url, duration, concurrency, host=None, single=False):
             str(concurrency),
             "-t",
             request_timeout,
-            "--wait-ongoing-requests-after-deadline",
+            *([] if single else ["--wait-ongoing-requests-after-deadline"]),
             "--stats-success-breakdown",
             "--no-tui",
             "--output-format",
