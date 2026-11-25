@@ -60,7 +60,8 @@ Open `http://localhost:8080/`. The service index includes an **Observability**
 section with links to Prometheus and Jaeger. Send requests to an exposed
 service. In Prometheus, query `lampyr_router_request_duration_seconds_count`.
 In Jaeger, select `lampyr-local`, then **Find Traces**. Telemetry includes
-internal services reached through bindings.
+internal services reached through bindings. Incoming trace IDs stay the same
+across ingress and binding calls.
 
 This option needs Docker, not Kubernetes. The first run downloads pinned
 Prometheus and Jaeger images. Their browser endpoints use free loopback ports,
@@ -73,6 +74,7 @@ Application routes, including `/metrics`, do not change.
 Data is temporary. On exit, the supervisor flushes traces, removes its two
 containers, and deletes their configuration. Prometheus retains up to one hour
 of metrics in memory-backed storage; Jaeger retains up to 10,000 traces.
+Prometheus uses 16 MB chunk segments to keep compaction within its 128 MiB volume.
 Use `--metrics` as well if you want request text in the terminal.
 Without `--observability`, no telemetry containers or scrape listener start.
 

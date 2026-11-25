@@ -107,7 +107,8 @@ scrape_configs:
 	session.Jaeger = "http://" + jaeger["16686"]
 	prometheus, err := session.container(ctx, "prometheus", localPrometheusImage, "prometheus.yml",
 		[]string{"9090"}, "--config.file=/etc/lampyr/config", "--storage.tsdb.path=/prometheus",
-		"--storage.tsdb.retention.time=1h", "--storage.tsdb.retention.size=96MB")
+		"--storage.tsdb.retention.time=1h", "--storage.tsdb.retention.size=96MB",
+		"--storage.tsdb.max-block-chunk-segment-size=16MB")
 	if err != nil {
 		return nil, err
 	}
@@ -140,8 +141,8 @@ func (session *localObservability) container(ctx context.Context, kind, image, c
 		"--label", "lampyr.dev/local-observability=true",
 		"--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges",
 		"--user=10001:10001", "--memory=512m", "--pids-limit=128",
-		"--log-opt=max-size=1m", "--log-opt=max-file=1",
-		"--mount", "type=bind,source=" + filepath.Join(session.directory, config) + ",target=/etc/lampyr/config,readonly"}
+		"--log-driver=json-file", "--log-opt=max-size=1m", "--log-opt=max-file=1",
+		"--mount", `type=bind,"source=` + strings.ReplaceAll(filepath.Join(session.directory, config), `"`, `""`) + `",target=/etc/lampyr/config,readonly`}
 	for _, port := range ports {
 		args = append(args, "--publish", "127.0.0.1::"+port)
 	}

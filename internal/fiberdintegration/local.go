@@ -27,6 +27,7 @@ import (
 
 	consumer "github.com/Azure/fiberd/sdk/go/client"
 	"github.com/hyperlight-dev/lampyr/internal/project"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
 
 type LocalService struct {
@@ -605,6 +606,7 @@ func RunLocal(ctx context.Context, config LocalConfig) (returnErr error) {
 }
 
 func localHandler(router *Router, name, capability string) http.Handler {
+	dispatch := otelhttp.NewHandler(router, "lampyr.local")
 	return http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		if capability != "" {
 			switch {
@@ -630,10 +632,10 @@ func localHandler(router *Router, name, capability string) http.Handler {
 		// Host headers cannot select another service through this endpoint.
 		request.Host = name
 		if capability == "" {
-			localForward(router, name, w, request)
+			localForward(dispatch, name, w, request)
 			return
 		}
-		localForward(router, name, &localBindingResponseWriter{
+		localForward(dispatch, name, &localBindingResponseWriter{
 			ResponseWriter: w,
 			capability:     capability,
 			requestURL: url.URL{
@@ -691,6 +693,7 @@ func (writer *localBindingResponseWriter) rewriteLocation() {
 }
 
 func localIngressHandler(router *Router, exposed map[string]string, port string, observability ...*localObservability) http.Handler {
+	dispatch := otelhttp.NewHandler(router, "lampyr.local")
 	type serviceLink struct {
 		Name string
 		URL  string
@@ -748,7 +751,7 @@ func localIngressHandler(router *Router, exposed map[string]string, port string,
 			fmt.Fprint(w, page.String())
 			return
 		}
-		localForward(router, name, w, request)
+		localForward(dispatch, name, w, request)
 	})
 }
 
@@ -766,11 +769,11 @@ var localIndexTemplate = template.Must(template.New("services").Parse(`<!doctype
 </body></html>
 `))
 
-func localForward(router *Router, name string, w http.ResponseWriter, request *http.Request) {
+func localForward(dispatch http.Handler, name string, w http.ResponseWriter, request *http.Request) {
 	request.Header.Del("K-Original-Host")
 	request.Header.Set("Knative-Serving-Namespace", "default")
 	request.Header.Set("Knative-Serving-Revision", name)
-	router.ServeHTTP(w, request)
+	dispatch.ServeHTTP(w, request)
 }
 
 func localBindingHost() (string, error) {
