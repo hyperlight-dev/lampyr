@@ -7,6 +7,8 @@ from pathlib import Path
 import tempfile
 import unittest
 from unittest import mock
+import urllib.parse
+import urllib.request
 
 
 PATH = Path(__file__).resolve().parents[1] / "scale-test.py"
@@ -34,6 +36,33 @@ class ScaleTestTests(unittest.TestCase):
         for invalid in ("0s", "1h", "ten"):
             with self.assertRaises(ValueError):
                 scale.duration_seconds(invalid)
+
+    def test_prometheus_queries_avoid_policy_blocked_service_proxy(self):
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = json.dumps({
+            "status": "success",
+            "data": {"result": [{"value": [420, "1"]}]},
+        }).encode()
+        with mock.patch.object(
+            scale, "command",
+            side_effect=RuntimeError("NetworkPolicy blocks Service proxy traffic"),
+        ) as command, mock.patch(
+            "urllib.request.urlopen", return_value=response
+        ) as request:
+            self.assertEqual(
+                scale.prometheus_query(
+                    "http://127.0.0.1:19090", 'up{job="fiber-router"}', 420
+                ),
+                1,
+            )
+            command.assert_not_called()
+            url = urllib.parse.urlsplit(request.call_args.args[0])
+            self.assertEqual(url.netloc, "127.0.0.1:19090")
+            self.assertEqual(url.path, "/api/v1/query")
+            self.assertEqual(urllib.parse.parse_qs(url.query), {
+                "query": ['up{job="fiber-router"}'], "time": ["420.000"],
+            })
+            self.assertGreater(request.call_args.kwargs["timeout"], 0)
 
     def test_report_compares_lampyr_and_kubernetes(self):
         result = {
