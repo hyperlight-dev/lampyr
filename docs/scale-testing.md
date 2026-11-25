@@ -48,8 +48,7 @@ bash scripts/install-scale-metrics.sh KNATIVE_CONTEXT
 This script requires `kubectl` and `jq`. It selects the metrics collectors from
 the shared manifest. It does not install Lampyr, UI services, tracing services,
 or Serving controllers.
-Prometheus remains cluster-internal. The script omits the UI-only Prometheus
-NetworkPolicy so the runner can query through the Kubernetes API proxy.
+Prometheus remains cluster-internal. The script omits its UI-only NetworkPolicy.
 
 Add the Knative context to the runner:
 
@@ -99,6 +98,9 @@ Both targets use a 10-second request timeout, including warmup. Cleanup removes
 only resources this run created.
 Custom JSON output names must not use the `.md` extension.
 The context must allow read access to the measured Pods.
+It must also allow Pod port-forward access. The runner opens one local
+Prometheus port-forward per cluster and closes it on exit. This path does not
+need changes to the Lampyr add-on's Prometheus NetworkPolicy.
 
 Client latency, throughput, and HTTP success come from oha for all targets.
 CPU and memory come from each cluster's Prometheus, which scrapes kubelet

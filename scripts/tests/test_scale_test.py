@@ -1,10 +1,12 @@
 import contextlib
 import hashlib
+import http.server
 import importlib.util
 import json
 import os
 from pathlib import Path
 import tempfile
+import threading
 import unittest
 from unittest import mock
 import urllib.parse
@@ -47,7 +49,7 @@ class ScaleTestTests(unittest.TestCase):
             scale, "command",
             side_effect=RuntimeError("NetworkPolicy blocks Service proxy traffic"),
         ) as command, mock.patch(
-            "urllib.request.urlopen", return_value=response
+            "urllib.request.OpenerDirector.open", return_value=response
         ) as request:
             self.assertEqual(
                 scale.prometheus_query(
@@ -63,6 +65,94 @@ class ScaleTestTests(unittest.TestCase):
                 "query": ['up{job="fiber-router"}'], "time": ["420.000"],
             })
             self.assertGreater(request.call_args.kwargs["timeout"], 0)
+
+    def test_prometheus_queries_use_loopback_http_without_environment_proxy(self):
+        requests = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                requests.append(self.path)
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(json.dumps({
+                    "status": "success",
+                    "data": {"result": [{"value": [420, "2"]}]},
+                }).encode())
+
+            def log_message(self, *args):
+                pass
+
+        with http.server.HTTPServer(("127.0.0.1", 0), Handler) as server:
+            worker = threading.Thread(target=server.serve_forever)
+            worker.start()
+            try:
+                with mock.patch.dict(os.environ, {
+                    "http_proxy": "http://127.0.0.1:1",
+                    "HTTP_PROXY": "http://127.0.0.1:1",
+                    "no_proxy": "", "NO_PROXY": "",
+                }):
+                    self.assertEqual(scale.prometheus_query(
+                        f"http://127.0.0.1:{server.server_port}", "vector(2)", 420
+                    ), 2)
+            finally:
+                server.shutdown()
+                worker.join()
+        self.assertEqual(len(requests), 1)
+        query = urllib.parse.urlsplit(requests[0])
+        self.assertEqual(query.path, "/api/v1/query")
+        self.assertEqual(urllib.parse.parse_qs(query.query), {
+            "query": ["vector(2)"], "time": ["420.000"],
+        })
+
+    def test_prometheus_forward_uses_selected_context_and_cleans_up_on_errors(self):
+        for failure in ("none", "query", "startup"):
+            forward = mock.Mock()
+            forward.poll.return_value = 1 if failure == "startup" else None
+            with self.subTest(failure=failure), mock.patch.object(
+                scale, "free_port", return_value=19090
+            ), mock.patch.object(
+                scale.subprocess, "Popen", return_value=forward
+            ) as start, mock.patch.object(scale.socket, "socket") as socket:
+                socket.return_value.__enter__.return_value.connect_ex.return_value = 0
+
+                def query():
+                    with scale.prometheus_server("stock") as endpoint:
+                        self.assertEqual(endpoint, "http://127.0.0.1:19090")
+                        if failure == "query":
+                            raise RuntimeError("query failed")
+
+                if failure == "none":
+                    query()
+                else:
+                    message = "query failed" if failure == "query" else "exited"
+                    with self.assertRaisesRegex(RuntimeError, message):
+                        query()
+                start.assert_called_once()
+                self.assertEqual(start.call_args.args[0], [
+                    "kubectl", "--context", "stock",
+                    "--namespace", "lampyr-observability",
+                    "port-forward", "service/prometheus", "19090:9090",
+                    "--address=127.0.0.1",
+                ])
+                forward.terminate.assert_called_once()
+                forward.wait.assert_called_once_with(timeout=5)
+
+    def test_prometheus_forward_startup_timeout_kills_unresponsive_process(self):
+        forward = mock.Mock(poll=mock.Mock(return_value=None))
+        forward.wait.side_effect = [
+            scale.subprocess.TimeoutExpired("kubectl", 5), None,
+        ]
+        with mock.patch.object(
+            scale, "free_port", return_value=19090
+        ), mock.patch.object(
+            scale.subprocess, "Popen", return_value=forward
+        ), mock.patch.object(scale.time, "monotonic", side_effect=[0, 31]):
+            with self.assertRaisesRegex(RuntimeError, "did not become ready"):
+                with scale.prometheus_server("test"):
+                    self.fail("unready Prometheus forward was accepted")
+        forward.terminate.assert_called_once()
+        forward.kill.assert_called_once()
+        self.assertEqual(forward.wait.call_count, 2)
 
     def test_report_compares_lampyr_and_kubernetes(self):
         result = {
@@ -498,6 +588,9 @@ class ScaleTestTests(unittest.TestCase):
         ), mock.patch.object(
             scale, "baseline_server", return_value=contextlib.nullcontext(baseline)
         ), mock.patch.object(
+            scale, "prometheus_server",
+            side_effect=lambda context: contextlib.nullcontext(f"http://{context}.metrics"),
+        ), mock.patch.object(
             scale, "warm_target"
         ), mock.patch.object(
             scale, "run_oha", return_value=client
@@ -726,8 +819,17 @@ class ScaleTestTests(unittest.TestCase):
                 )
             sample_calls = scale.resource_samples.call_args_list
             self.assertEqual([call.args[0] for call in sample_calls], [
-                "test", "test", "test", "test", "stock", "stock",
+                "http://test.metrics", "http://test.metrics",
+                "http://test.metrics", "http://test.metrics",
+                "http://stock.metrics", "http://stock.metrics",
             ])
+            self.assertEqual(scale.prometheus_server.call_args_list, [
+                mock.call("test"), mock.call("stock"),
+            ])
+            self.assertEqual(
+                [call.args[0] for call in scale.resource_inventory.call_args_list],
+                ["test", "test", "test", "test", "stock", "stock"],
+            )
             self.assertEqual(scale.router_scrapes.call_count, 4)
             result = write.call_args.args[0]
             self.assertEqual(

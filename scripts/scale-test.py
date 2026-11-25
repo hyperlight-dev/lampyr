@@ -14,15 +14,12 @@ import sys
 import tempfile
 import time
 import urllib.parse
+import urllib.request
 import uuid
 
 
 BASELINE = "lampyr-scale-baseline"
 REQUEST_TIMEOUT = "10s"
-PROMETHEUS_PROXY = (
-    "/api/v1/namespaces/lampyr-observability/"
-    "services/http:prometheus:9090/proxy/api/v1/query"
-)
 
 
 def command(*args):
@@ -64,19 +61,21 @@ def active_revision(context, service, namespace):
     return next(iter(revisions))
 
 
-def prometheus_results(context, query, evaluation_time=None):
+def prometheus_results(endpoint, query, evaluation_time=None):
     parameters = {"query": query}
     if evaluation_time is not None:
         parameters["time"] = f"{evaluation_time:.3f}"
-    path = PROMETHEUS_PROXY + "?" + urllib.parse.urlencode(parameters)
-    result = json.loads(command("kubectl", "--context", context, "get", "--raw", path))
+    url = endpoint + "/api/v1/query?" + urllib.parse.urlencode(parameters)
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(url, timeout=30) as response:
+        result = json.loads(response.read())
     if result.get("status") != "success":
         raise RuntimeError(f"Prometheus query failed: {result}")
     return result["data"]["result"]
 
 
-def prometheus_query(context, query, evaluation_time=None):
-    values = prometheus_results(context, query, evaluation_time)
+def prometheus_query(endpoint, query, evaluation_time=None):
+    values = prometheus_results(endpoint, query, evaluation_time)
     if not values:
         return None
     if len(values) != 1:
@@ -85,9 +84,9 @@ def prometheus_query(context, query, evaluation_time=None):
     return value if math.isfinite(value) else None
 
 
-def router_scrapes(context, evaluation_time):
+def router_scrapes(endpoint, evaluation_time):
     values = prometheus_results(
-        context,
+        endpoint,
         'timestamp(up{job="fiber-router"}) * (up{job="fiber-router"} == bool 1)',
         evaluation_time,
     )
@@ -197,12 +196,12 @@ def resource_sample_queries(namespace, revision, baseline, target, knative=None)
     return queries
 
 
-def resource_samples(context, queries, evaluation_time):
+def resource_samples(endpoint, queries, evaluation_time):
     query = " or ".join(
         f'label_replace(({expression}), "scale_input", "{name}", "", "")'
         for name, expression in queries.items()
     )
-    values = prometheus_results(context, query, evaluation_time)
+    values = prometheus_results(endpoint, query, evaluation_time)
     samples = {}
     sources = set()
     containers = {}
@@ -347,19 +346,19 @@ COUNTER_METRICS = {
 }
 
 
-def counter_snapshot(context, queries, evaluation_time=None):
+def counter_snapshot(endpoint, queries, evaluation_time=None):
     return {
-        name: prometheus_query(context, query, evaluation_time)
+        name: prometheus_query(endpoint, query, evaluation_time)
         for name, query in queries.items()
         if name in COUNTER_METRICS
     }
 
 
-def collect_metrics(context, queries, before, evaluation_time):
+def collect_metrics(endpoint, queries, before, evaluation_time):
     collected = {}
     reset_metrics = {f"{name}Resets": name for name in COUNTER_METRICS}
     for name, query in queries.items():
-        value = prometheus_query(context, query, evaluation_time)
+        value = prometheus_query(endpoint, query, evaluation_time)
         if name in reset_metrics:
             counter = reset_metrics[name]
             if value is None and before[counter] is not None:
@@ -464,13 +463,57 @@ def free_port():
 
 
 @contextlib.contextmanager
+def service_forward(context, namespace, name, remote_port, label):
+    port = free_port()
+    with tempfile.TemporaryFile(mode="w+") as log:
+        forward = subprocess.Popen(
+            [
+                "kubectl", "--context", context, "--namespace", namespace,
+                "port-forward", f"service/{name}", f"{port}:{remote_port}",
+                "--address=127.0.0.1",
+            ],
+            stdout=log,
+            stderr=log,
+        )
+        try:
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline:
+                if forward.poll() is not None:
+                    log.seek(0)
+                    raise RuntimeError(
+                        f"{label} port-forward exited before becoming ready: {log.read()}"
+                    )
+                with socket.socket() as connection:
+                    if connection.connect_ex(("127.0.0.1", port)) == 0:
+                        break
+                time.sleep(0.1)
+            else:
+                raise RuntimeError(f"{label} port-forward did not become ready")
+            yield {"url": f"http://127.0.0.1:{port}/", "process": forward}
+        finally:
+            forward.terminate()
+            try:
+                forward.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                forward.kill()
+                forward.wait()
+
+
+@contextlib.contextmanager
+def prometheus_server(context):
+    with service_forward(
+        context, "lampyr-observability", "prometheus", 9090, "Prometheus"
+    ) as forward:
+        yield forward["url"].rstrip("/")
+
+
+@contextlib.contextmanager
 def baseline_server(context, image, replicas, namespace):
     if "@sha256:" not in image:
         raise ValueError("baseline image must be digest-pinned")
     name = f"{BASELINE}-{uuid.uuid4().hex}"
     manifest = baseline_manifest(image, replicas, namespace, name)
     created = []
-    forward = None
     try:
         for resource in manifest["items"]:
             kubectl_manifest(context, "create", resource)
@@ -489,41 +532,10 @@ def baseline_server(context, image, replicas, namespace):
             ],
             check=True,
         )
-        port = free_port()
-        forward = subprocess.Popen(
-            [
-                "kubectl",
-                "--context",
-                context,
-                "--namespace",
-                namespace,
-                "port-forward",
-                f"service/{name}",
-                f"{port}:80",
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        deadline = time.time() + 30
-        while time.time() < deadline:
-            if forward.poll() is not None:
-                raise RuntimeError("baseline port-forward exited before becoming ready")
-            with socket.socket() as connection:
-                if connection.connect_ex(("127.0.0.1", port)) == 0:
-                    break
-            time.sleep(0.1)
-        else:
-            raise RuntimeError("baseline port-forward did not become ready")
-        yield {"name": name, "url": f"http://127.0.0.1:{port}/", "process": forward}
+        with service_forward(context, namespace, name, 80, "baseline") as forward:
+            yield {"name": name, **forward}
     finally:
         original_error = sys.exc_info()[0] is not None
-        if forward is not None:
-            forward.terminate()
-            try:
-                forward.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                forward.kill()
-                forward.wait()
         if created:
             try:
                 kubectl_manifest(
@@ -950,7 +962,7 @@ def main():
     ) as baseline, (
         knative_server(args.knative_context, args.baseline_image, args.namespace)
         if args.knative_context else contextlib.nullcontext(None)
-    ) as knative:
+    ) as knative, contextlib.ExitStack() as metrics_forwards:
         metadata["baselineName"] = baseline["name"]
         baseline_url = urllib.parse.urlsplit(baseline["url"])._replace(
             path=lampyr_url.path, query=lampyr_url.query, fragment=""
@@ -981,6 +993,10 @@ def main():
                 ))),
             }
             metadata["networkPaths"]["knative"] = "stock Knative ingress and queue-proxy"
+        metrics_endpoints = {
+            context: metrics_forwards.enter_context(prometheus_server(context))
+            for context in dict.fromkeys(target[2] for target in targets)
+        }
         for target, url, context, host in targets:
             if target == "kubernetes":
                 require_running(baseline["process"], "baseline port-forward")
@@ -989,6 +1005,7 @@ def main():
         time.sleep(6)
         for concurrency in concurrencies:
             for target, url, context, host in targets:
+                metrics_endpoint = metrics_endpoints[context]
                 native_revision = knative["revision"] if target == "knative" else None
                 if target == "kubernetes":
                     require_running(baseline["process"], "baseline port-forward")
@@ -1009,10 +1026,10 @@ def main():
                         knative=native_revision,
                     )
                     before_scrapes = (
-                        {} if native_revision else router_scrapes(context, snapshot_time)
+                        {} if native_revision else router_scrapes(metrics_endpoint, snapshot_time)
                     )
                     before_resources = resource_samples(
-                        context, sample_queries, snapshot_time
+                        metrics_endpoint, sample_queries, snapshot_time
                     )
                     if resource_coverage(
                         before_resources, sample_queries, before_inventory, before_scrapes
@@ -1031,7 +1048,7 @@ def main():
                 measurement_started = min([
                     *before_scrapes.values(), *before_resources.values()
                 ]) - 0.001
-                before = counter_snapshot(context, snapshot_queries, snapshot_time)
+                before = counter_snapshot(metrics_endpoint, snapshot_queries, snapshot_time)
                 if not native_revision and before["lampyrRequests"] is None:
                     raise RuntimeError(
                         "Lampyr request metrics are missing after warmup; check the "
@@ -1048,13 +1065,13 @@ def main():
                 for wait_seconds in (6, 5, 5, 5, 5, 5):
                     time.sleep(wait_seconds)
                     evaluated = time.time()
-                    scrapes = {} if native_revision else router_scrapes(context, evaluated)
+                    scrapes = {} if native_revision else router_scrapes(metrics_endpoint, evaluated)
                     if scrapes.keys() != before_scrapes.keys() or any(
                         timestamp < load_ended.timestamp()
                         for timestamp in scrapes.values()
                     ):
                         continue
-                    samples = resource_samples(context, sample_queries, evaluated)
+                    samples = resource_samples(metrics_endpoint, sample_queries, evaluated)
                     inventory = resource_inventory(
                         context, args.namespace, revision, baseline["name"], target,
                         knative=native_revision,
@@ -1081,13 +1098,13 @@ def main():
                     )
                     resources = {
                         name: prometheus_query(
-                            context, queries[name], evaluated
+                            metrics_endpoint, queries[name], evaluated
                         )
                         for name in target_resource_names(target)
                     }
                     if target_resources_available(target, resources):
                         platform = collect_metrics(
-                            context, queries, before, evaluated
+                            metrics_endpoint, queries, before, evaluated
                         )
                         break
                 else:
