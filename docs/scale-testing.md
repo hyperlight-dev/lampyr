@@ -64,8 +64,8 @@ python3 scripts/scale-test.py \
 The runner creates a temporary Knative Service with the same image digest as
 the Deployment. Both use a 768 MiB application memory limit. Knative uses
 `min-scale=1` and `max-scale=1`; the client controls request concurrency.
-The runner removes only the Service it created. This is a warm, fixed-capacity
-comparison, not a cold-start or autoscaling test.
+The runner removes only the Service it created. This target is for the warm,
+fixed-capacity phase. The startup phase uses a separate scale-to-zero Service.
 
 The Knative Service URL must be reachable from the load generator. For local
 ingress exposed on a different address or port, add
@@ -75,13 +75,39 @@ the Lampyr request path and query for both warmup and load.
 
 ## Measurements
 
+The runner first measures startup three times for each target:
+
+- Lampyr: wait for zero Fibers, keep the same Ready home, and time one request.
+- Knative: wait for zero Revision Pods and zero actual and desired scale, then
+  time one request through its ingress and activator.
+- Deployment: wait for zero Pods, then time the scale request to one Ready Pod.
+  This is Pod startup, not request-triggered activation.
+
+The Lampyr check reads the home's fiberd audit records. It rejects missing or
+invalid records, a home restart, and a request that does not create exactly one
+new Fiber. A zero busy-Fiber metric alone is not proof of zero Fibers.
+Use a Service with no other traffic. The context must allow `exec` in its
+fiberd container to read the audit file.
+
+The startup Knative Service is separate from the warm target. It permits zero
+replicas, has a six-second autoscaling window, and keeps at most one replica.
+The runner waits for scale-to-zero without sending probe requests. Each trial
+sends exactly one request, with no retry. A failed first request stops the run.
+Images and snapshots stay cached; these are not image-download measurements.
+
+`--startup-runs COUNT` sets the number of trials; `0` keeps only warm traffic.
+`--startup-timeout 180s` bounds each wait and first request. The JSON has a
+separate `startups` array, and Markdown has a separate startup table. Startup
+durations do not enter the warm latency or throughput statistics.
+
 The default sweep runs each target for 30 seconds at concurrency 1, 4, 16,
-and 64. The framework:
+and 64. Lampyr's default fresh execution mode still creates a Fiber for each
+request. Warm traffic does not imply live-Fiber reuse. The framework:
 
 - creates a temporary one-replica Deployment and Service with unique names;
 - creates a stock Knative Service when a Knative context is supplied;
-- warms both targets;
-- runs the same client against Lampyr and Kubernetes;
+- warms all targets;
+- runs the same client against each selected target;
 - queries Prometheus for request, Fiber, CPU, and memory measurements;
 - writes `build/scale-results.json` after every scenario; and
 - writes a concise Markdown comparison beside it.

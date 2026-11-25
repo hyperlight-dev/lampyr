@@ -17,6 +17,8 @@ import urllib.parse
 import urllib.request
 import uuid
 
+import fiberd_grants
+
 
 BASELINE = "lampyr-scale-baseline"
 REQUEST_TIMEOUT = "10s"
@@ -508,7 +510,7 @@ def prometheus_server(context):
 
 
 @contextlib.contextmanager
-def baseline_server(context, image, replicas, namespace):
+def baseline_resources(context, image, replicas, namespace):
     if "@sha256:" not in image:
         raise ValueError("baseline image must be digest-pinned")
     name = f"{BASELINE}-{uuid.uuid4().hex}"
@@ -518,22 +520,7 @@ def baseline_server(context, image, replicas, namespace):
         for resource in manifest["items"]:
             kubectl_manifest(context, "create", resource)
             created.append(resource)
-        subprocess.run(
-            [
-                "kubectl",
-                "--context",
-                context,
-                "--namespace",
-                namespace,
-                "rollout",
-                "status",
-                f"deployment/{name}",
-                "--timeout=300s",
-            ],
-            check=True,
-        )
-        with service_forward(context, namespace, name, 80, "baseline") as forward:
-            yield {"name": name, **forward}
+        yield name
     finally:
         original_error = sys.exc_info()[0] is not None
         if created:
@@ -549,6 +536,17 @@ def baseline_server(context, image, replicas, namespace):
                 if not original_error:
                     raise
                 print(f"warning: baseline cleanup failed: {error}", file=sys.stderr)
+
+
+@contextlib.contextmanager
+def baseline_server(context, image, replicas, namespace):
+    with baseline_resources(context, image, replicas, namespace) as name:
+        subprocess.run([
+            "kubectl", "--context", context, "--namespace", namespace,
+            "rollout", "status", f"deployment/{name}", "--timeout=300s",
+        ], check=True)
+        with service_forward(context, namespace, name, 80, "baseline") as forward:
+            yield {"name": name, **forward}
 
 
 def require_separate_knative(context, lampyr_context):
@@ -568,7 +566,7 @@ def require_separate_knative(context, lampyr_context):
         raise ValueError("Knative target cluster must not have Lampyr installed")
 
 
-def knative_manifest(image, namespace, name):
+def knative_manifest(image, namespace, name, min_scale=1):
     container = baseline_manifest(image, 1, namespace, name)["items"][0][
         "spec"
     ]["template"]["spec"]["containers"][0]
@@ -580,8 +578,9 @@ def knative_manifest(image, namespace, name):
         "metadata": {"name": name, "namespace": namespace},
         "spec": {"template": {
             "metadata": {"annotations": {
-                "autoscaling.knative.dev/min-scale": "1",
+                "autoscaling.knative.dev/min-scale": str(min_scale),
                 "autoscaling.knative.dev/max-scale": "1",
+                **({"autoscaling.knative.dev/window": "6s"} if min_scale == 0 else {}),
             }},
             "spec": {"containerConcurrency": 0, "containers": [container]},
         }},
@@ -589,11 +588,11 @@ def knative_manifest(image, namespace, name):
 
 
 @contextlib.contextmanager
-def knative_server(context, image, namespace):
+def knative_server(context, image, namespace, min_scale=1):
     if "@sha256:" not in image:
         raise ValueError("Knative image must be digest-pinned")
     name = f"scale-knative-{uuid.uuid4().hex[:24]}"
-    manifest = knative_manifest(image, namespace, name)
+    manifest = knative_manifest(image, namespace, name, min_scale)
     created = False
     try:
         kubectl_manifest(context, "create", manifest)
@@ -631,16 +630,16 @@ def require_running(process, name):
         raise RuntimeError(f"{name} exited with status {return_code}")
 
 
-def run_oha(oha, url, duration, concurrency, host=None):
+def run_oha(oha, url, duration, concurrency, host=None, single=False):
+    request_timeout = duration if single else REQUEST_TIMEOUT
     output = subprocess.check_output(
         [
             str(oha),
-            "-z",
-            duration,
+            *(["-n", "1"] if single else ["-z", duration]),
             "-c",
             str(concurrency),
             "-t",
-            REQUEST_TIMEOUT,
+            request_timeout,
             "--wait-ongoing-requests-after-deadline",
             "--stats-success-breakdown",
             "--no-tui",
@@ -651,7 +650,10 @@ def run_oha(oha, url, duration, concurrency, host=None):
             url,
         ],
         text=True,
-        timeout=duration_seconds(duration) + duration_seconds(REQUEST_TIMEOUT) + 5,
+        timeout=(
+            duration_seconds(request_timeout) + 5 if single else
+            duration_seconds(duration) + duration_seconds(request_timeout) + 5
+        ),
     )
     result = json.loads(output)
     client = {
@@ -666,6 +668,233 @@ def run_oha(oha, url, duration, concurrency, host=None):
     }
     client["httpSuccessRate"] = http_success_rate(client)
     return client
+
+
+def startup_pods(context, namespace, selector, timeout=15):
+    return json.loads(fiberd_grants.kubectl(
+        context, "get", "pods", "--selector", selector, "--output", "json",
+        namespace=namespace, timeout=min(15, timeout),
+    ))["items"]
+
+
+def wait_startup_state(check, timeout, description):
+    deadline = time.monotonic() + timeout
+    while (remaining := deadline - time.monotonic()) > 0:
+        state = check(remaining)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        if state is not None:
+            return state
+        time.sleep(min(0.5, remaining))
+    raise RuntimeError(f"startup timed out waiting for {description}")
+
+
+def startup_remaining(deadline):
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise RuntimeError("startup observation timed out")
+    return remaining
+
+
+def ready_pod(pods):
+    if len(pods) != 1:
+        return None
+    pod = pods[0]
+    if "deletionTimestamp" in pod["metadata"] or not any(
+        item["type"] == "Ready" and item["status"] == "True"
+        for item in pod.get("status", {}).get("conditions", [])
+    ):
+        return None
+    return pod
+
+
+def lampyr_startup_state(context, namespace, revision, timeout=60):
+    deadline = time.monotonic() + timeout
+    pod = ready_pod(startup_pods(
+        context, namespace,
+        f"lampyr.dev/home=true,serving.knative.dev/revision={revision}",
+        timeout=startup_remaining(deadline),
+    ))
+    if pod is None:
+        raise RuntimeError("startup requires one Ready Lampyr home that stays running")
+    statuses = [
+        item for item in pod["status"]["containerStatuses"] if item["name"] == "fiberd"
+    ]
+    if len(statuses) != 1 or "running" not in statuses[0]["state"]:
+        raise RuntimeError("startup requires a running fiberd container")
+    home = fiberd_grants.Home(pod["metadata"]["name"], pod["metadata"]["uid"])
+    records = fiberd_grants.audit_records(
+        context, home, namespace=namespace, strict=True,
+        timeout=startup_remaining(deadline),
+    )
+    live = fiberd_grants.live_fibers(records)
+    startup_remaining(deadline)
+    return {
+        "home": {
+            "name": home.name, "uid": home.uid,
+            "containerStartedAt": statuses[0]["state"]["running"]["startedAt"],
+            "restartCount": statuses[0]["restartCount"],
+        },
+        "epoch": fiberd_grants.epoch(records),
+        "fiberCount": len(live),
+        "auditSeq": max(record["seq"] for record in records),
+    }, records
+
+
+def first_request(oha, url, timeout, host=None):
+    client = run_oha(oha, url, f"{timeout}s", 1, host=host, single=True)
+    count = sum(client["statusCodeDistribution"].values()) + sum(
+        client["errorDistribution"].values()
+    )
+    if count != 1 or client["httpSuccessRate"] != 1:
+        raise RuntimeError(
+            "startup first request failed; no retry was made: "
+            f"statuses={client['statusCodeDistribution']} errors={client['errorDistribution']}"
+        )
+    return client
+
+
+def lampyr_startup(oha, context, namespace, revision, url, timeout):
+    initial, _ = lampyr_startup_state(context, namespace, revision, timeout=timeout)
+
+    def zero(remaining):
+        state, _ = lampyr_startup_state(context, namespace, revision, timeout=remaining)
+        if state["home"] != initial["home"] or state["epoch"] != initial["epoch"]:
+            raise RuntimeError("Lampyr home restarted while waiting for zero Fibers")
+        return state if state["fiberCount"] == 0 else None
+
+    before = wait_startup_state(zero, timeout, "zero Lampyr Fibers")
+    client = first_request(oha, url, timeout)
+    after, records = lampyr_startup_state(context, namespace, revision, timeout=timeout)
+    if after["home"] != before["home"] or after["epoch"] != before["epoch"]:
+        raise RuntimeError("Lampyr home restarted during the startup request")
+    starts = [
+        record for record in records
+        if record["seq"] > before["auditSeq"] and record["event"] in fiberd_grants.STARTS
+    ]
+    if len(starts) != 1 or starts[0]["event"] != "create":
+        raise RuntimeError("startup request must create exactly one fresh Lampyr Fiber")
+    return {
+        "target": "lampyr", "measurement": "zero Fibers to first response",
+        "durationMs": client["summary"]["average"] * 1000,
+        "before": before, "after": after, "client": client,
+    }
+
+
+def deployment_startup(context, namespace, name, timeout):
+    selector = f"app={name}"
+    fiberd_grants.kubectl(
+        context, "scale", f"deployment/{name}", "--replicas=0",
+        namespace=namespace, timeout=15,
+    )
+    wait_startup_state(
+        lambda remaining: {"podCount": 0} if not startup_pods(
+            context, namespace, selector, timeout=remaining
+        ) else None,
+        timeout, "zero Deployment Pods",
+    )
+    started = time.monotonic()
+    fiberd_grants.kubectl(
+        context, "scale", f"deployment/{name}", "--replicas=1",
+        namespace=namespace, timeout=15,
+    )
+    pod = wait_startup_state(
+        lambda remaining: ready_pod(startup_pods(
+            context, namespace, selector, timeout=remaining
+        )),
+        timeout, "Deployment Pod Ready",
+    )
+    return {
+        "target": "kubernetes", "measurement": "scale from zero to Pod Ready",
+        "durationMs": (time.monotonic() - started) * 1000,
+        "before": {"podCount": 0},
+        "after": {
+            "podCount": 1, "pod": pod["metadata"]["name"],
+            "uid": pod["metadata"]["uid"], "createdAt": pod["metadata"]["creationTimestamp"],
+        },
+    }
+
+
+def knative_startup(oha, context, namespace, native, url, host, timeout):
+    revision = native["revision"]
+    selector = f"serving.knative.dev/revision={revision}"
+
+    def zero(remaining):
+        deadline = time.monotonic() + remaining
+        autoscaler = json.loads(fiberd_grants.kubectl(
+            context, "get", "podautoscalers.autoscaling.internal.knative.dev", revision,
+            "--output", "json", namespace=namespace,
+            timeout=min(15, startup_remaining(deadline)),
+        ))
+        status = autoscaler.get("status", {})
+        if (
+            status.get("actualScale") == 0 and status.get("desiredScale") == 0
+            and not startup_pods(
+                context, namespace, selector, timeout=startup_remaining(deadline)
+            )
+        ):
+            return {"podCount": 0, "actualScale": 0, "desiredScale": 0}
+        return None
+
+    before = wait_startup_state(zero, timeout, "Knative scale-to-zero")
+    client = first_request(oha, url, timeout, host)
+    pod = wait_startup_state(
+        lambda remaining: ready_pod(startup_pods(
+            context, namespace, selector, timeout=remaining
+        )),
+        timeout, "activated Knative Pod Ready",
+    )
+    return {
+        "target": "knative", "measurement": "zero replicas to first response",
+        "durationMs": client["summary"]["average"] * 1000,
+        "before": before,
+        "after": {"podCount": 1, "uid": pod["metadata"]["uid"]},
+        "client": client,
+    }
+
+
+def matching_url(origin, workload):
+    return origin._replace(
+        path=workload.path, query=workload.query, fragment=""
+    ).geturl()
+
+
+def measure_startups(args, oha, revision, workload, ingress, result, output):
+    timeout = duration_seconds(args.startup_timeout)
+    with baseline_resources(
+        args.context, args.baseline_image, 0, args.namespace
+    ) as deployment, (
+        knative_server(args.knative_context, args.baseline_image, args.namespace, min_scale=0)
+        if args.knative_context else contextlib.nullcontext(None)
+    ) as native:
+        if native:
+            result["metadata"]["startupKnative"] = {
+                "service": native["name"], "revision": native["revision"],
+                "minScale": 0, "maxScale": 1, "window": "6s",
+            }
+        for trial in range(1, args.startup_runs + 1):
+            targets = [
+                ("lampyr", lambda: lampyr_startup(
+                    oha, args.context, args.namespace, revision, workload.geturl(), timeout
+                )),
+                ("kubernetes", lambda: deployment_startup(
+                    args.context, args.namespace, deployment, timeout
+                )),
+            ]
+            if native:
+                targets.append(("knative", lambda: knative_startup(
+                    oha, args.knative_context, args.namespace, native,
+                    matching_url(ingress or native["url"], workload),
+                    native["url"].netloc if ingress else None, timeout,
+                )))
+            for target, measure in targets:
+                value = measure()
+                value["trial"] = trial
+                result["startups"].append(value)
+                write_json(result, output)
+                write_report(result, output.with_suffix(".md"))
+                print(f"{target} startup trial={trial} duration={value['durationMs']:.2f}ms")
 
 
 def http_success_rate(client):
@@ -780,6 +1009,26 @@ def write_report(result, path):
             if "knative" in result["metadata"]["networkPaths"] else []
         ),
         "",
+    ]
+    if result.get("startups"):
+        lines += [
+            "## Startup",
+            "",
+            "Lampyr keeps its home running with zero Fibers. Knative starts from zero",
+            "replicas. Deployment timing starts before its scale request and ends when",
+            "one Pod is Ready; it is not request-triggered activation.",
+            "Images and snapshots are not removed from node caches.",
+            "",
+            "| Target | Trial | Measurement | Duration ms |",
+            "|---|---:|---|---:|",
+        ]
+        for startup in result["startups"]:
+            lines.append(
+                f"| {startup['target']} | {startup['trial']} | "
+                f"{startup['measurement']} | {startup['durationMs']:.2f} |"
+            )
+        lines += ["", "## Warm traffic", ""]
+    lines += [
         "| Target | Concurrency | Requests/s | HTTP success | p50 ms | p95 ms | p99 ms | Platform errors | Shed | CPU cores | Peak memory MiB |",
         "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
@@ -891,6 +1140,8 @@ def main():
     parser.add_argument("--baseline-replicas", type=int, default=1)
     parser.add_argument("--duration", default="30s")
     parser.add_argument("--concurrency", default="1,4,16,64")
+    parser.add_argument("--startup-runs", type=int, default=3)
+    parser.add_argument("--startup-timeout", default="180s")
     parser.add_argument("--oha", default="build/tools/oha")
     parser.add_argument("--output", default="build/scale-results.json")
     args = parser.parse_args()
@@ -903,6 +1154,9 @@ def main():
         raise ValueError("concurrency values must be positive integers")
     if args.baseline_replicas != 1:
         raise ValueError("baseline must use one replica with Service port-forward")
+    if args.startup_runs < 0:
+        raise ValueError("startup runs must be zero or a positive integer")
+    duration_seconds(args.startup_timeout)
     output = Path(args.output)
     if output.suffix.lower() == ".md":
         raise ValueError("JSON and Markdown output files must be distinct; do not use .md")
@@ -934,6 +1188,8 @@ def main():
         "duration": args.duration,
         "requestTimeout": REQUEST_TIMEOUT,
         "concurrency": concurrencies,
+        "startupRuns": args.startup_runs,
+        "startupTimeout": args.startup_timeout,
         "commit": command("git", "rev-parse", "HEAD"),
         "dirty": bool(command("git", "status", "--porcelain")),
         "ohaVersion": command(str(oha), "--version"),
@@ -956,7 +1212,7 @@ def main():
             )
         ),
     }
-    result = {"schema": 1, "metadata": metadata, "scenarios": []}
+    result = {"schema": 1, "metadata": metadata, "scenarios": [], "startups": []}
     with baseline_server(
         args.context, args.baseline_image, args.baseline_replicas, args.namespace
     ) as baseline, (
@@ -964,27 +1220,23 @@ def main():
         if args.knative_context else contextlib.nullcontext(None)
     ) as knative, contextlib.ExitStack() as metrics_forwards:
         metadata["baselineName"] = baseline["name"]
-        baseline_url = urllib.parse.urlsplit(baseline["url"])._replace(
-            path=lampyr_url.path, query=lampyr_url.query, fragment=""
-        )
+        baseline_url = matching_url(urllib.parse.urlsplit(baseline["url"]), lampyr_url)
         targets = [
             ("lampyr", lampyr_url.geturl(), args.context, None),
-            ("kubernetes", baseline_url.geturl(), args.context, None),
+            ("kubernetes", baseline_url, args.context, None),
         ]
         if knative:
             route = knative["url"]
-            native_url = (knative_ingress or route)._replace(
-                path=lampyr_url.path, query=lampyr_url.query, fragment=""
-            )
+            native_url = matching_url(knative_ingress or route, lampyr_url)
             targets.append((
-                "knative", native_url.geturl(), args.knative_context,
+                "knative", native_url, args.knative_context,
                 route.netloc if knative_ingress else None,
             ))
             metadata["knative"] = {
                 "context": args.knative_context,
                 "service": knative["name"],
                 "revision": knative["revision"],
-                "url": safe_url(native_url.geturl()),
+                "url": safe_url(native_url),
                 "minScale": 1,
                 "maxScale": 1,
                 "nodes": node_summary(json.loads(command(
@@ -993,6 +1245,10 @@ def main():
                 ))),
             }
             metadata["networkPaths"]["knative"] = "stock Knative ingress and queue-proxy"
+        if args.startup_runs:
+            measure_startups(
+                args, oha, revision, lampyr_url, knative_ingress, result, output
+            )
         metrics_endpoints = {
             context: metrics_forwards.enter_context(prometheus_server(context))
             for context in dict.fromkeys(target[2] for target in targets)

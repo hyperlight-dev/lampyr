@@ -5,6 +5,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import sys
 import tempfile
 import threading
 import unittest
@@ -14,6 +15,7 @@ import urllib.request
 
 
 PATH = Path(__file__).resolve().parents[1] / "scale-test.py"
+sys.path.insert(0, str(PATH.parent))
 SPEC = importlib.util.spec_from_file_location("scale_test", PATH)
 scale = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(scale)
@@ -29,6 +31,7 @@ class ScaleTestTests(unittest.TestCase):
             "--baseline-image", "example.test/baseline@sha256:abc",
             "--oha", str(PATH),
             "--concurrency", "1",
+            "--startup-runs", "0",
             *extra,
         ]
 
@@ -38,6 +41,120 @@ class ScaleTestTests(unittest.TestCase):
         for invalid in ("0s", "1h", "ten"):
             with self.assertRaises(ValueError):
                 scale.duration_seconds(invalid)
+
+    def test_lampyr_startup_waits_for_idle_fibers_and_keeps_home_running(self):
+        home = {"uid": "home", "containerStartedAt": "now", "restartCount": 0}
+        busy = {"home": home, "epoch": 1, "fiberCount": 1, "auditSeq": 2}
+        zero = {**busy, "fiberCount": 0, "auditSeq": 3}
+        after = {**zero, "auditSeq": 5}
+        records = [{"seq": 4, "event": "create"}, {"seq": 5, "event": "release"}]
+        client = {"summary": {"average": 0.25}}
+        with mock.patch.object(scale, "lampyr_startup_state", side_effect=[
+            (busy, []), (busy, []), (zero, []), (after, records),
+        ]) as observe, mock.patch.object(
+            scale, "first_request", return_value=client
+        ) as request, mock.patch.object(scale.time, "sleep") as sleep:
+            result = scale.lampyr_startup(
+                "oha", "test", "team-a", "revision", "https://app.test/a?b=1", 180
+            )
+        self.assertEqual(result["durationMs"], 250)
+        self.assertEqual(result["before"]["fiberCount"], 0)
+        request.assert_called_once_with("oha", "https://app.test/a?b=1", 180)
+        self.assertEqual(observe.call_count, 4)
+        sleep.assert_called_once_with(0.5)
+
+    def test_lampyr_startup_rejects_home_restart_or_extra_fiber(self):
+        zero = {
+            "home": {"uid": "home", "restartCount": 0},
+            "epoch": 1, "fiberCount": 0, "auditSeq": 1,
+        }
+        for after, records, error in (
+            ({**zero, "home": {"uid": "replacement"}}, [], "home restarted"),
+            ({**zero, "epoch": 2}, [], "home restarted"),
+            (zero, [{"seq": 2, "event": "resume"}], "exactly one fresh"),
+            (zero, [{"seq": 2, "event": "create"}, {"seq": 3, "event": "create"}],
+             "exactly one fresh"),
+        ):
+            with self.subTest(error=error), mock.patch.object(
+                scale, "lampyr_startup_state",
+                side_effect=[(zero, []), (zero, []), (after, records)],
+            ), mock.patch.object(scale, "first_request"):
+                with self.assertRaisesRegex(RuntimeError, error):
+                    scale.lampyr_startup("oha", "test", "default", "revision", "url", 180)
+
+    def test_deployment_startup_requires_no_pods_before_scaling_up(self):
+        old = {"metadata": {"name": "terminating", "deletionTimestamp": "now"}}
+        ready = {
+            "metadata": {"name": "new", "uid": "new-uid", "creationTimestamp": "now"},
+            "status": {"conditions": [{"type": "Ready", "status": "True"}]},
+        }
+        with mock.patch.object(
+            scale, "startup_pods", side_effect=[[old], [], [], [ready]]
+        ), mock.patch.object(scale.fiberd_grants, "kubectl") as kubectl, mock.patch.object(
+            scale.time, "sleep"
+        ):
+            result = scale.deployment_startup("test", "team-a", "owned", 180)
+        self.assertEqual(result["after"]["uid"], "new-uid")
+        self.assertEqual(
+            [call.args[3] for call in kubectl.call_args_list], ["--replicas=0", "--replicas=1"]
+        )
+        self.assertTrue(all(
+            call.kwargs["namespace"] == "team-a" for call in kubectl.call_args_list
+        ))
+
+    def test_knative_startup_waits_for_actual_zero_without_http_probes(self):
+        ready = {
+            "metadata": {"uid": "activated"},
+            "status": {"conditions": [{"type": "Ready", "status": "True"}]},
+        }
+        client = {"summary": {"average": 1.25}}
+        activating = {
+            **ready, "status": {"conditions": [{"type": "Ready", "status": "False"}]},
+        }
+        with mock.patch.object(
+            scale.fiberd_grants, "kubectl", side_effect=[
+                '{"status":{"desiredScale":0}}',
+                '{"status":{"desiredScale":0,"actualScale":1}}',
+                '{"status":{"desiredScale":0,"actualScale":0}}',
+                '{"status":{"desiredScale":0,"actualScale":0}}',
+            ],
+        ), mock.patch.object(
+            scale, "startup_pods", side_effect=[[ready], [], [activating], [ready]]
+        ), mock.patch.object(
+            scale, "first_request", return_value=client
+        ) as request, mock.patch.object(scale.time, "sleep"):
+            result = scale.knative_startup(
+                "oha", "stock", "team-a", {"revision": "native"},
+                "http://127.0.0.1/a%2Fb?size=64", "native.test", 180,
+            )
+        self.assertEqual(result["durationMs"], 1250)
+        self.assertEqual(result["before"]["actualScale"], 0)
+        request.assert_called_once_with(
+            "oha", "http://127.0.0.1/a%2Fb?size=64", 180, "native.test"
+        )
+        annotations = scale.knative_manifest("image", "team-a", "name", min_scale=0)[
+            "spec"
+        ]["template"]["metadata"]["annotations"]
+        self.assertEqual(annotations["autoscaling.knative.dev/min-scale"], "0")
+
+    def test_startup_wait_rejects_an_observation_that_finishes_after_deadline(self):
+        check = mock.Mock(return_value={"podCount": 0})
+        with mock.patch.object(scale.time, "monotonic", side_effect=[0, 0, 61]):
+            with self.assertRaisesRegex(RuntimeError, "timed out"):
+                scale.wait_startup_state(check, 1, "zero Pods")
+        check.assert_called_once_with(1)
+
+    def test_startup_first_request_does_not_retry_a_failed_request(self):
+        failed = {
+            "statusCodeDistribution": {"503": 1},
+            "errorDistribution": {}, "httpSuccessRate": 0,
+        }
+        with mock.patch.object(scale, "run_oha", return_value=failed) as request:
+            with self.assertRaisesRegex(RuntimeError, "no retry was made"):
+                scale.first_request("oha", "http://app.test/", 180)
+        request.assert_called_once_with(
+            "oha", "http://app.test/", "180s", 1, host=None, single=True
+        )
 
     def test_prometheus_queries_avoid_policy_blocked_service_proxy(self):
         response = mock.MagicMock()

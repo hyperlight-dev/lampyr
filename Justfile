@@ -369,7 +369,7 @@ scale-baseline-image image:
 
 # Compare Lampyr with a Deployment and optionally stock Knative.
 [positional-arguments]
-scale-test context service lampyr-url baseline-image duration="30s" concurrency="1,4,16,64" output="build/scale-results.json" knative-context="" knative-ingress-url="": install-oha
+scale-test context service lampyr-url baseline-image duration="30s" concurrency="1,4,16,64" output="build/scale-results.json" knative-context="" knative-ingress-url="" startup-runs="3" startup-timeout="180s": install-oha
     python3 scripts/scale-test.py \
         --context "$1" \
         --service "$2" \
@@ -379,7 +379,9 @@ scale-test context service lampyr-url baseline-image duration="30s" concurrency=
         --concurrency "$6" \
         --output "$7" \
         --knative-context "$8" \
-        --knative-ingress-url "$9"
+        --knative-ingress-url "$9" \
+        --startup-runs "${10}" \
+        --startup-timeout "${11}"
 
 # Run the repository test suites used in CI.
 test: test-unit test-cli examples-check test-preview-release cli::test cli::test-intent helper::test azure::test kind::test k3d::test test-examples-local test-kind-integration test-k3d-integration test-existing-kind-integration test-knative-portability test-walkthrough

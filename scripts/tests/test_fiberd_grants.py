@@ -124,8 +124,44 @@ class FiberdGrantsTest(unittest.TestCase):
         kubectl.assert_called_once_with(
             "kind-test", "exec", "pod/home", "--container", "fiberd", "--",
             "cat", fiberd_grants.AUDIT_SPOOL,
+            namespace="default",
+            timeout=60,
         )
         self.assertEqual([record["fence"]["GrantUID"] for record in records], ["pod-2"])
+
+    def test_live_fibers_include_idle_fibers_and_only_the_current_epoch(self):
+        records = [
+            {"event": "admit", "fence": {"Epoch": 1}},
+            {"event": "create", "fiber_id": "one", "fence": {"Epoch": 1}},
+            {"event": "create", "fiber_id": "idle", "fence": {"Epoch": 1}},
+            {"event": "release", "fiber_id": "one", "fence": {"Epoch": 1}},
+        ]
+        self.assertEqual(fiberd_grants.live_fibers(records), {"idle"})
+        records.append({"event": "admit", "fence": {"Epoch": 2}})
+        self.assertEqual(fiberd_grants.live_fibers(records), set())
+        with self.assertRaisesRegex(RuntimeError, "admission audit is missing"):
+            fiberd_grants.live_fibers([])
+        with self.assertRaisesRegex(RuntimeError, "Fiber ID is missing"):
+            fiberd_grants.live_fibers([
+                {"event": "admit", "fence": {"Epoch": 1}},
+                {"event": "create", "fence": {"Epoch": 1}},
+            ])
+
+    def test_strict_audit_rejects_gaps_torn_records_and_missing_sequence(self):
+        admission = {
+            "seq": 1, "event": "admit", "fence": {"GrantUID": "home", "Epoch": 1},
+        }
+        complete = json.dumps(admission)
+        self.assertEqual(
+            fiberd_grants.grant_records(complete, "home", strict=True), [admission]
+        )
+        for raw in (
+            complete + "\n{torn",
+            complete + "\n" + json.dumps({"seq": 2, "event": "gap"}),
+            json.dumps({**admission, "seq": 2}),
+        ):
+            with self.subTest(raw=raw), self.assertRaisesRegex(RuntimeError, "cannot verify"):
+                fiberd_grants.grant_records(raw, "home", strict=True)
 
     def test_busy_fibers_are_the_revision_series_of_the_router_gauge(self):
         metrics = "\n".join([
