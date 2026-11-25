@@ -59,6 +59,9 @@ Uninstall disables fiber-router trace export before it removes Jaeger.
 Remove the add-on before `ly cluster uninstall` when retaining the Kubernetes
 cluster; the platform uninstall does not remove optional add-ons.
 
+The [scale framework](scale-testing.md) uses these metrics for repeatable
+Lampyr and Kubernetes comparisons.
+
 ## Platform metrics
 
 | Metric | Type | Meaning |

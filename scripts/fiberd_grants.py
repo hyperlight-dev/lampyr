@@ -130,25 +130,60 @@ def home_pod(context, resource):
     return running_home(pods)
 
 
-def audit_records(context, home):
+def audit_records(context, home, namespace="default", strict=False, timeout=60):
     """fiberd's audit records for the grant Pod `home`."""
     raw = kubectl(context, "exec", f"pod/{home.name}", "--container", "fiberd", "--",
-        "cat", AUDIT_SPOOL)
-    return grant_records(raw, home.uid)
+        "cat", AUDIT_SPOOL, namespace=namespace, timeout=timeout)
+    return grant_records(raw, home.uid, strict=strict)
 
 
-def grant_records(raw, pod_uid):
+def grant_records(raw, pod_uid, strict=False):
     """The records of `raw` that fiberd stamped with the grant Pod's UID.
     fiberd's Fence has no JSON tags, so its fields keep their Go names."""
     records = []
+    sequence = 0
     for line in raw.splitlines():
         try:
             record = json.loads(line)
         except json.JSONDecodeError:
+            if strict:
+                raise RuntimeError("cannot verify zero Fibers: invalid audit record")
             continue
+        if strict:
+            if not isinstance(record, dict) or record.get("seq") != sequence + 1:
+                raise RuntimeError("cannot verify zero Fibers: incomplete audit sequence")
+            sequence = record["seq"]
+        if strict and record.get("event") == "gap":
+            raise RuntimeError("cannot verify zero Fibers: audit records are missing")
         if record.get("fence", {}).get("GrantUID") == pod_uid:
             records.append(record)
     return records
+
+
+def live_fibers(records):
+    current_epoch = epoch(records)
+    current = [
+        record for record in records
+        if record.get("fence", {}).get("Epoch") == current_epoch
+    ]
+    if not current_epoch or not any(record["event"] == "admit" for record in current):
+        raise RuntimeError("cannot verify zero Fibers: home admission audit is missing")
+    live = set()
+    ended = {"release", "park", "oom", "exit", "signal", "yield", "scope-revoked", "orphan"}
+    for record in current:
+        event = record["event"]
+        fiber = record.get("fiber_id")
+        if event in STARTS:
+            if not fiber:
+                raise RuntimeError("cannot verify zero Fibers: audit Fiber ID is missing")
+            live.add(fiber)
+        elif event in ended:
+            if not fiber:
+                raise RuntimeError("cannot verify zero Fibers: audit Fiber ID is missing")
+            live.discard(fiber)
+        elif fiber:
+            raise RuntimeError(f"cannot verify zero Fibers: unknown audit event {event}")
+    return live
 
 
 def fibers_started(records):
